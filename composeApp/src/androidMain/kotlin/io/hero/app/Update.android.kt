@@ -16,14 +16,13 @@ var appContext: Context? = null
 
 actual fun updateAssetSuffix(): String = ".apk"
 
-actual suspend fun installUpdate(info: UpdateInfo, token: String): String {
+actual suspend fun installUpdate(info: UpdateInfo): String {
     val ctx = appContext ?: return "no app context"
     val client = HttpClient()
     try {
         val out = File(ctx.cacheDir, "hero-update.apk")
-        client.prepareGet(info.asset.url) {
+        client.prepareGet(info.downloadUrl) {
             header("Accept", "application/octet-stream")
-            if (token.isNotBlank()) header("Authorization", "Bearer $token")
         }.execute { resp ->
             out.outputStream().use { fo -> resp.bodyAsChannel().copyTo(fo) }
         }

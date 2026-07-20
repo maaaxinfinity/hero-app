@@ -23,7 +23,22 @@ jobs:
           distribution: temurin
           java-version: "17"
       # ubuntu-latest ships the Android SDK (ANDROID_HOME set, licenses accepted).
+      # Signing secrets come from repo secrets, never the tree. Set:
+      #   KEYSTORE_BASE64  = base64 of the release keystore (.jks)
+      #   KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
+      # Without them the build falls back to debug signing (unsuitable for a
+      # public release, but keeps the workflow from failing on a fork).
+      - name: Materialize keystore
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > composeApp/keystore.jks
       - name: Build signed APK
+        env:
+          KEYSTORE_FILE: keystore.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           chmod +x gradlew
           ./gradlew :composeApp:assembleRelease --no-daemon

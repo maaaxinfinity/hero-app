@@ -1,3 +1,4 @@
+import java.util.Properties
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 
 plugins {
@@ -52,21 +53,43 @@ android {
         applicationId = "io.hero.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
     }
+    // Signing secrets never live in the repo. Locally, put them in a gitignored
+    // keystore.properties at the project root; in CI, provide them via env
+    // (release.yml materializes the keystore + passwords from GitHub secrets).
+    // When nothing is configured, release falls back to debug signing so an
+    // unconfigured checkout still builds.
+    val keystoreProps = Properties().apply {
+        val f = rootProject.file("keystore.properties")
+        if (f.exists()) f.inputStream().use { load(it) }
+    }
+    fun secret(propKey: String, envKey: String): String? =
+        keystoreProps.getProperty(propKey) ?: System.getenv(envKey)
+
     signingConfigs {
         create("release") {
-            storeFile = file("keystore.jks")
-            storePassword = "heroapp"
-            keyAlias = "heroapp"
-            keyPassword = "heroapp"
+            val storePath = secret("storeFile", "KEYSTORE_FILE") ?: "keystore.jks"
+            val sf = file(storePath)
+            if (sf.exists()) {
+                storeFile = sf
+                storePassword = secret("storePassword", "KEYSTORE_PASSWORD")
+                keyAlias = secret("keyAlias", "KEY_ALIAS")
+                keyPassword = secret("keyPassword", "KEY_PASSWORD")
+            }
         }
     }
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            val releaseSigning = signingConfigs.getByName("release")
+            signingConfig = if (releaseSigning.storeFile?.exists() == true) {
+                releaseSigning
+            } else {
+                logger.warn("no release keystore configured; signing the release build with the debug key")
+                signingConfigs.getByName("debug")
+            }
         }
     }
     compileOptions {

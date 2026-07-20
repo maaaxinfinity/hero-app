@@ -5,3 +5,7 @@ build/
 .kotlin/
 local.properties
 captures/
+
+# signing secrets — never commit
+composeApp/keystore.jks
+keystore.properties

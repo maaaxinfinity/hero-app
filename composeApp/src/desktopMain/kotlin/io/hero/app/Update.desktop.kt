@@ -19,13 +19,12 @@ actual fun updateAssetSuffix(): String {
     return "$tag.jar"
 }
 
-actual suspend fun installUpdate(info: UpdateInfo, token: String): String {
+actual suspend fun installUpdate(info: UpdateInfo): String {
     val client = HttpClient()
     try {
         val out = File(System.getProperty("java.io.tmpdir"), "hero-app-${info.version}.jar")
-        client.prepareGet(info.asset.url) {
+        client.prepareGet(info.downloadUrl) {
             header("Accept", "application/octet-stream")
-            if (token.isNotBlank()) header("Authorization", "Bearer $token")
         }.execute { resp ->
             out.outputStream().use { fo -> resp.bodyAsChannel().copyTo(fo) }
         }

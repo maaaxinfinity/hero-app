@@ -7,6 +7,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -51,19 +54,25 @@ import kotlinx.coroutines.launch
 fun App() {
     HeroTheme {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            var api by remember { mutableStateOf<Api?>(null) }
-            val current = api
-            if (current == null) {
-                LoginScreen(onLogin = { api = it })
-            } else {
-                MainScreen(current, onSignOut = { api = null })
+            // Edge-to-edge: the Surface paints under the system bars (set up by
+            // enableEdgeToEdge in MainActivity); this keeps content inside the safe
+            // area. On desktop system-bar insets are zero, so it is a no-op there.
+            Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.systemBars)) {
+                var api by remember { mutableStateOf<Api?>(null) }
+                var me by remember { mutableStateOf(Me()) }
+                val current = api
+                if (current == null) {
+                    LoginScreen(onLogin = { a, m -> api = a; me = m })
+                } else {
+                    MainScreen(current, me, onSignOut = { api = null; me = Me() })
+                }
             }
         }
     }
 }
 
 @Composable
-private fun LoginScreen(onLogin: (Api) -> Unit) {
+private fun LoginScreen(onLogin: (Api, Me) -> Unit) {
     val scope = rememberCoroutineScope()
     var url by remember { mutableStateOf("http://127.0.0.1:7801") }
     var user by remember { mutableStateOf("") }
@@ -126,7 +135,10 @@ private fun LoginScreen(onLogin: (Api) -> Unit) {
                             scope.launch {
                                 try {
                                     val a = Api(url.trimEnd('/'))
-                                    if (a.login(user, pass)) onLogin(a) else error = "Invalid credentials"
+                                    if (a.login(user, pass)) {
+                                        val m = runCatching { a.me() }.getOrDefault(Me(user = user))
+                                        onLogin(a, m)
+                                    } else error = "Invalid credentials"
                                 } catch (e: Throwable) {
                                     error = e.message ?: "login failed"
                                 } finally {
@@ -152,32 +164,28 @@ private fun LoginScreen(onLogin: (Api) -> Unit) {
 @Composable
 private fun UpdatePanel() {
     val scope = rememberCoroutineScope()
-    var token by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("v$AppVersion") }
     var pending by remember { mutableStateOf<UpdateInfo?>(null) }
 
+    // No token: updates come from the project's PUBLIC releases, checked and
+    // downloaded anonymously (see Update.kt).
     OutlinedCard(Modifier.fillMaxWidth().widthIn(max = 380.dp)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Updates", style = MaterialTheme.typography.titleSmall)
-            OutlinedTextField(
-                token, { token = it }, Modifier.fillMaxWidth(),
-                label = { Text("GitHub token (private repo)") }, singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = {
                     scope.launch {
                         status = "checking…"
-                        val info = runCatching { checkForUpdate(token, updateAssetSuffix()) }.getOrNull()
+                        val info = runCatching { checkForUpdate(updateAssetSuffix()) }.getOrNull()
                         if (info == null) {
                             status = "up to date (v$AppVersion)"; pending = null
                         } else {
                             status = "update available: v${info.version}"; pending = info
                         }
                     }
-                }) { Text("Check") }
+                }) { Text("Check for updates") }
                 pending?.let { info ->
-                    Button(onClick = { scope.launch { status = installUpdate(info, token) } }) { Text("Update") }
+                    Button(onClick = { scope.launch { status = installUpdate(info) } }) { Text("Update") }
                 }
             }
             Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -185,91 +193,116 @@ private fun UpdatePanel() {
     }
 }
 
+// Section is the top-level navigation target within MainScreen.
+enum class Section(val label: String, val adminOnly: Boolean) {
+    Sessions("Sessions", false), Nodes("Nodes", false), Users("Users", true), Audit("Audit", true)
+}
+
 @Composable
-private fun MainScreen(api: Api, onSignOut: () -> Unit) {
+private fun MainScreen(api: Api, me: Me, onSignOut: () -> Unit) {
+    var section by remember { mutableStateOf(Section.Sessions) }
+    // Back from a non-Sessions tab returns to Sessions (SessionsScreen registers
+    // its own inner handler for closing an open session, which wins first).
+    PredictiveBack(enabled = section != Section.Sessions) { section = Section.Sessions }
+    Column(Modifier.fillMaxSize()) {
+        HeroTopBar(me, section, onSelect = { section = it }, onSignOut = onSignOut)
+        when (section) {
+            Section.Sessions -> SessionsScreen(api)
+            Section.Nodes -> NodesScreen(api, me)
+            Section.Users -> UsersScreen(api, me)
+            Section.Audit -> AuditScreen(api)
+        }
+    }
+}
+
+@Composable
+private fun SessionsScreen(api: Api) {
     val scope = rememberCoroutineScope()
     var nodes by remember { mutableStateOf<List<NodeView>>(emptyList()) }
     var sessions by remember { mutableStateOf<List<Session>>(emptyList()) }
     var events by remember { mutableStateOf<List<String>>(emptyList()) }
+    var pend by remember { mutableStateOf<List<Pending>>(emptyList()) }
     var node by remember { mutableStateOf<String?>(null) }
     var session by remember { mutableStateOf<String?>(null) }
-    var sessionTitle by remember { mutableStateOf<String?>(null) }
     var input by remember { mutableStateOf("") }
     var nodesLoading by remember { mutableStateOf(true) }
     var sessionsLoading by remember { mutableStateOf(false) }
+    var showStart by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
-        runCatching { nodes = api.nodes() }
+        runCatching { nodes = api.nodes().filter { it.connected } }
         nodesLoading = false
     }
-
     LaunchedEffect(node) {
         val n = node ?: return@LaunchedEffect
         events = emptyList()
-        api.events(n).catch { }.collect { ev -> events = (events + renderEvent(ev)).takeLast(500) }
+        api.events(n).catch { }.collect { ev ->
+            if (session == null || ev.session_id.isEmpty() || ev.session_id == session) {
+                events = (events + renderEvent(ev)).takeLast(500)
+            }
+        }
+    }
+    // Poll pending permission requests for the open session.
+    LaunchedEffect(node, session) {
+        while (node != null && session != null) {
+            runCatching { pend = api.pending(node!!).filter { it.session_id == session } }
+            kotlinx.coroutines.delay(3000)
+        }
+        pend = emptyList()
     }
 
-    Column(Modifier.fillMaxSize()) {
-        HeroTopBar(node, sessionTitle ?: session, onSignOut)
-        Row(Modifier.fillMaxSize()) {
-            Surface(
-                Modifier.width(248.dp).fillMaxHeight(),
-                color = MaterialTheme.colorScheme.surface,
-                tonalElevation = 1.dp,
-            ) {
-                Column(Modifier.padding(horizontal = 10.dp, vertical = 12.dp)) {
-                    SectionLabel("NODES")
-                    if (nodesLoading) {
-                        PaneLoader()
-                    } else if (nodes.isEmpty()) {
-                        HintText("No nodes online")
-                    } else {
-                        nodes.forEach { n ->
-                            NavItem("${n.node_id}  ·  ${n.scope}", selected = node == n.node_id) {
-                                node = n.node_id; session = null; sessionTitle = null
-                                sessions = emptyList(); sessionsLoading = true
-                                scope.launch {
-                                    runCatching { sessions = api.sessions(n.node_id) }
-                                    sessionsLoading = false
-                                }
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(14.dp))
-                    SectionLabel("SESSIONS")
-                    if (sessionsLoading) {
-                        PaneLoader()
-                    } else if (node != null && sessions.isEmpty()) {
-                        HintText("No sessions")
-                    } else {
-                        sessions.forEach { s ->
-                            val label = if (s.title.isNotEmpty()) s.title else s.id
-                            NavItem(label, selected = session == s.id) {
-                                session = s.id; sessionTitle = label
-                            }
-                        }
+    if (showStart && node != null) {
+        StartSessionDialog(api, node!!, onDismiss = { showStart = false }) {
+            showStart = false
+            scope.launch { runCatching { sessions = api.sessions(node!!) } }
+        }
+    }
+
+    // Back closes the open session (returns to the session list) before the
+    // outer tab handler runs.
+    PredictiveBack(enabled = session != null) { session = null; events = emptyList() }
+
+    Row(Modifier.fillMaxSize()) {
+        Surface(Modifier.width(248.dp).fillMaxHeight(), color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
+            Column(Modifier.padding(horizontal = 10.dp, vertical = 12.dp)) {
+                SectionLabel("NODES")
+                if (nodesLoading) PaneLoader()
+                else if (nodes.isEmpty()) HintText("No nodes online")
+                else nodes.forEach { n ->
+                    NavItem("${n.node_id}  ·  ${n.scope}", selected = node == n.node_id) {
+                        node = n.node_id; session = null; sessions = emptyList(); sessionsLoading = true; events = emptyList()
+                        scope.launch { runCatching { sessions = api.sessions(n.node_id) }; sessionsLoading = false }
                     }
                 }
+                Spacer(Modifier.height(14.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    SectionLabel("SESSIONS")
+                    Spacer(Modifier.weight(1f))
+                    if (node != null) TextButton(onClick = { showStart = true }) { Text("+ New") }
+                }
+                if (sessionsLoading) PaneLoader()
+                else if (node != null && sessions.isEmpty()) HintText("No sessions")
+                else sessions.forEach { s ->
+                    val label = if (s.title.isNotEmpty()) s.title else s.id
+                    NavItem(label, selected = session == s.id) { session = s.id; events = emptyList() }
+                }
             }
-            Box(Modifier.width(1.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outlineVariant))
-            Column(Modifier.fillMaxSize()) {
-                if (session == null) {
-                    EmptyState()
-                } else {
-                    val listState = rememberLazyListState()
-                    LaunchedEffect(events.size) {
-                        if (events.isNotEmpty()) listState.animateScrollToItem(events.size - 1)
-                    }
-                    LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp), state = listState) {
-                        items(events) { line -> EventRow(line) }
-                    }
-                    InputBar(input, { input = it }) {
-                        val n = node; val s = session; val t = input.trim()
-                        if (n != null && s != null && t.isNotEmpty()) {
-                            input = ""
-                            scope.launch { runCatching { api.send(n, s, t) } }
-                        }
-                    }
+        }
+        Box(Modifier.width(1.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outlineVariant))
+        Column(Modifier.fillMaxSize()) {
+            if (session == null) EmptyState()
+            else {
+                val listState = rememberLazyListState()
+                LaunchedEffect(events.size) { if (events.isNotEmpty()) listState.animateScrollToItem(events.size - 1) }
+                LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp), state = listState) {
+                    items(events) { line -> EventRow(line) }
+                }
+                pend.forEach { p ->
+                    PendingBar(p) { behavior -> scope.launch { runCatching { api.respond(node!!, p.id, behavior) } } }
+                }
+                InputBar(input, { input = it }) {
+                    val n = node; val s = session; val t = input.trim()
+                    if (n != null && s != null && t.isNotEmpty()) { input = ""; scope.launch { runCatching { api.send(n, s, t) } } }
                 }
             }
         }
@@ -277,26 +310,44 @@ private fun MainScreen(api: Api, onSignOut: () -> Unit) {
 }
 
 @Composable
-private fun HeroTopBar(node: String?, session: String?, onSignOut: () -> Unit) {
+private fun PendingBar(p: Pending, onRespond: (String) -> Unit) {
+    Surface(color = MaterialTheme.colorScheme.tertiaryContainer, tonalElevation = 2.dp) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Permission: ${p.tool_name.ifEmpty { p.event.ifEmpty { "request" } }}",
+                style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f),
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            TextButton(onClick = { onRespond("allow") }) { Text("Allow") }
+            TextButton(onClick = { onRespond("deny") }) { Text("Deny") }
+        }
+    }
+}
+
+@Composable
+private fun HeroTopBar(me: Me, section: Section, onSelect: (Section) -> Unit, onSignOut: () -> Unit) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             LogoMark(Modifier.size(26.dp), tint = MaterialTheme.colorScheme.onSurface)
             Spacer(Modifier.width(8.dp))
             Text("HERO", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, letterSpacing = 3.sp)
-            if (node != null) {
-                Spacer(Modifier.width(12.dp))
-                Text(
-                    buildString { append(node); if (session != null) append("  /  $session") },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-            } else {
-                Spacer(Modifier.weight(1f))
+            Spacer(Modifier.width(16.dp))
+            Section.entries.filter { !it.adminOnly || me.admin }.forEach { s ->
+                TabButton(s.label, selected = s == section) { onSelect(s) }
+            }
+            Spacer(Modifier.weight(1f))
+            if (me.user.isNotEmpty()) {
+                Identicon(me.user, size = 22.dp)
+                Spacer(Modifier.width(6.dp))
+                Text(me.user, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (me.admin) {
+                    Spacer(Modifier.width(6.dp))
+                    Text("admin", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                }
+                Spacer(Modifier.width(8.dp))
             }
             TextButton(onClick = onSignOut) { Text("Sign out") }
         }
@@ -304,7 +355,24 @@ private fun HeroTopBar(node: String?, session: String?, onSignOut: () -> Unit) {
 }
 
 @Composable
-private fun SectionLabel(text: String) {
+private fun TabButton(label: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(6.dp),
+        modifier = Modifier.padding(horizontal = 2.dp).clickable(onClick = onClick),
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+        )
+    }
+}
+
+@Composable
+internal fun SectionLabel(text: String) {
     Text(
         text,
         style = MaterialTheme.typography.labelSmall,
@@ -315,7 +383,7 @@ private fun SectionLabel(text: String) {
 }
 
 @Composable
-private fun HintText(text: String) {
+internal fun HintText(text: String) {
     Text(
         text,
         style = MaterialTheme.typography.bodySmall,
@@ -342,7 +410,7 @@ private fun NavItem(label: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun PaneLoader() {
+internal fun PaneLoader() {
     Box(Modifier.fillMaxWidth().height(72.dp), contentAlignment = Alignment.Center) {
         ParticleLoader(tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(64.dp))
     }

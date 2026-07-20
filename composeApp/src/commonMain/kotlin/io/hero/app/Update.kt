@@ -12,34 +12,34 @@ import kotlinx.serialization.json.Json
 
 // AppVersion is compared against the latest GitHub release tag. Bump it before
 // tagging a release so the running app can tell it is out of date.
-const val AppVersion = "0.2.0"
+const val AppVersion = "0.3.0"
 const val Repo = "maaaxinfinity/hero-app"
 
 @Serializable
-data class GhAsset(val name: String = "", val url: String = "")
+data class GhAsset(val name: String = "", val browser_download_url: String = "")
 
 @Serializable
 data class GhRelease(val tag_name: String = "", val assets: List<GhAsset> = emptyList())
 
-data class UpdateInfo(val version: String, val asset: GhAsset)
+data class UpdateInfo(val version: String, val downloadUrl: String)
 
 private val updaterJson = Json { ignoreUnknownKeys = true }
 
 // checkForUpdate queries the latest release and returns an UpdateInfo when it is
 // newer than AppVersion and has an asset ending in assetSuffix (.apk / os.jar).
-// token authenticates against the private repo (via the GitHub API asset URL).
-suspend fun checkForUpdate(token: String, assetSuffix: String): UpdateInfo? {
+// No credentials: the release is PUBLIC, so the app hits the anonymous GitHub
+// API and downloads via the public browser_download_url — no token to manage.
+suspend fun checkForUpdate(assetSuffix: String): UpdateInfo? {
     val client = HttpClient { install(ContentNegotiation) { json(updaterJson) } }
     try {
         val r = client.get("https://api.github.com/repos/$Repo/releases/latest") {
             header("Accept", "application/vnd.github+json")
-            if (token.isNotBlank()) header("Authorization", "Bearer $token")
         }
         if (!r.status.isSuccess()) return null
         val rel: GhRelease = r.body()
         if (!isNewer(rel.tag_name, AppVersion)) return null
-        val asset = rel.assets.firstOrNull { it.name.endsWith(assetSuffix) } ?: return null
-        return UpdateInfo(rel.tag_name.removePrefix("v"), asset)
+        val asset = rel.assets.firstOrNull { it.name.endsWith(assetSuffix) && it.browser_download_url.isNotEmpty() } ?: return null
+        return UpdateInfo(rel.tag_name.removePrefix("v"), asset.browser_download_url)
     } finally {
         client.close()
     }
@@ -58,9 +58,9 @@ fun isNewer(tag: String, current: String): Boolean {
     return false
 }
 
-// installUpdate downloads the asset (with token auth) and applies it: Android
-// launches the package installer; desktop saves the OS jar and prints how to run.
-expect suspend fun installUpdate(info: UpdateInfo, token: String): String
+// installUpdate downloads the public asset and applies it: Android launches the
+// package installer; desktop saves the OS jar and prints how to run it.
+expect suspend fun installUpdate(info: UpdateInfo): String
 
 // updateAssetSuffix is the release-asset name suffix this platform installs.
 expect fun updateAssetSuffix(): String
