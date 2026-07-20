@@ -3,7 +3,7 @@ package io.hero.app
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.plugins.cookies.HttpCookies
+import io.ktor.client.plugins.defaultRequest
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
@@ -13,6 +13,7 @@ import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.contentType
 import io.ktor.http.encodeURLPathPart
 import io.ktor.http.isSuccess
@@ -28,15 +29,35 @@ import kotlinx.serialization.json.JsonObject
 // Api is a thin client over the v1 control-plane API. The engine (CIO on
 // desktop/Android, Darwin on iOS) is picked up from the platform source set's
 // classpath, so common code just constructs HttpClient { }.
-class Api(private val baseUrl: String) {
+// Api is a thin client over the v1 control-plane API. The session cookie is
+// managed explicitly (not via the HttpCookies plugin) so it can be persisted for
+// "remember me" and restored on the next launch. Pass initialCookie to resume a
+// saved session. followRedirects is off so login can read Set-Cookie off the 303.
+class Api(private val baseUrl: String, initialCookie: String? = null) {
     private val json = Json { ignoreUnknownKeys = true }
+
+    /** The current hero_cp_session cookie value; null until login succeeds. */
+    var sessionCookie: String? = initialCookie
+        private set
 
     private val client = HttpClient {
         install(ContentNegotiation) { json(json) }
-        install(HttpCookies) // keeps the session cookie set by /login
+        followRedirects = false
+        defaultRequest {
+            sessionCookie?.let { headers.append(HttpHeaders.Cookie, "hero_cp_session=$it") }
+        }
     }
 
-    /** login posts the form; success is a 2xx or the 303 redirect the server sends. */
+    /** probe validates a base URL is a reachable HERO control plane by hitting the
+     *  unauthenticated auth-methods endpoint (200 + JSON = it's really HERO). */
+    suspend fun probe(): Boolean = try {
+        client.get("$baseUrl/api/auth/methods").status.value == 200
+    } catch (_: Throwable) {
+        false
+    }
+
+    /** login posts the form (redirects off) and captures the session cookie from
+     *  the 303's Set-Cookie header. Success = a cookie was issued. */
     suspend fun login(user: String, password: String): Boolean {
         val resp = client.submitForm(
             url = "$baseUrl/login",
@@ -45,7 +66,11 @@ class Api(private val baseUrl: String) {
                 append("password", password)
             },
         )
-        return resp.status.isSuccess() || resp.status.value == 303
+        if (resp.status.value != 303 && !resp.status.isSuccess()) return false
+        val setCookie = resp.headers.getAll(HttpHeaders.SetCookie).orEmpty()
+        val hero = setCookie.firstOrNull { it.startsWith("hero_cp_session=") } ?: return false
+        sessionCookie = hero.substringAfter('=').substringBefore(';')
+        return sessionCookie!!.isNotEmpty()
     }
 
     suspend fun nodes(): List<NodeView> =
@@ -61,7 +86,11 @@ class Api(private val baseUrl: String) {
         }
     }
 
-    suspend fun me(): Me = client.get("$baseUrl/api/me").body()
+    suspend fun me(): Me {
+        val r = client.get("$baseUrl/api/me")
+        if (r.status.value != 200) throw IllegalStateException("not authenticated (${r.status.value})")
+        return r.body()
+    }
 
     // ---- sessions ----
     suspend fun startSession(node: String, req: StartSessionReq): String {

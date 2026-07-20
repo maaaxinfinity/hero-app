@@ -1,7 +1,16 @@
 package io.hero.app
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,19 +61,68 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun App() {
-    HeroTheme {
+    val settings = remember { Settings() }
+    var themeMode by remember { mutableStateOf(ThemeMode.from(settings.getString(Keys.ThemeMode))) }
+    val dark = when (themeMode) {
+        ThemeMode.System -> isSystemInDarkTheme()
+        ThemeMode.Light -> false
+        ThemeMode.Dark -> true
+    }
+    HeroTheme(dark = dark) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            // Edge-to-edge: the Surface paints under the system bars (set up by
-            // enableEdgeToEdge in MainActivity); this keeps content inside the safe
-            // area. On desktop system-bar insets are zero, so it is a no-op there.
+            // Edge-to-edge: the Surface paints under the system bars; this keeps
+            // content inside the safe area. Desktop insets are zero (no-op).
             Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.systemBars)) {
                 var api by remember { mutableStateOf<Api?>(null) }
                 var me by remember { mutableStateOf(Me()) }
-                val current = api
-                if (current == null) {
-                    LoginScreen(onLogin = { a, m -> api = a; me = m })
-                } else {
-                    MainScreen(current, me, onSignOut = { api = null; me = Me() })
+                var showSettings by remember { mutableStateOf(false) }
+                var booting by remember { mutableStateOf(true) }
+
+                // Silent re-login: if "remember me" saved a session cookie, try it.
+                LaunchedEffect(Unit) {
+                    val url = settings.getString(Keys.ServerUrl)
+                    val cookie = settings.getString(Keys.Cookie)
+                    if (settings.getString(Keys.Remember) == "1" && !url.isNullOrBlank() && !cookie.isNullOrBlank()) {
+                        val a = Api(url, cookie)
+                        val m = runCatching { a.me() }.getOrNull()
+                        if (m != null) { api = a; me = m }
+                    }
+                    booting = false
+                }
+
+                val screen = when {
+                    booting -> "boot"
+                    showSettings -> "settings"
+                    api == null -> "login"
+                    else -> "main"
+                }
+                // Gentle crossfade between top-level screens — subtle, ink-quiet.
+                Crossfade(targetState = screen, animationSpec = tween(260), label = "screen") { s ->
+                    when (s) {
+                        "boot" -> BootSplash()
+                        "settings" -> SettingsScreen(
+                            settings = settings,
+                            themeMode = themeMode,
+                            onThemeMode = { themeMode = it; settings.putString(Keys.ThemeMode, it.id) },
+                            onForget = {
+                                settings.remove(Keys.Cookie); settings.remove(Keys.Remember); settings.remove(Keys.Username)
+                            },
+                            onClose = { showSettings = false },
+                        )
+                        "login" -> LoginScreen(
+                            settings = settings,
+                            onLogin = { a, m -> api = a; me = m },
+                            onOpenSettings = { showSettings = true },
+                        )
+                        else -> MainScreen(
+                            api!!, me,
+                            onSignOut = {
+                                api = null; me = Me()
+                                settings.remove(Keys.Cookie); settings.remove(Keys.Remember)
+                            },
+                            onOpenSettings = { showSettings = true },
+                        )
+                    }
                 }
             }
         }
@@ -72,123 +130,124 @@ fun App() {
 }
 
 @Composable
-private fun LoginScreen(onLogin: (Api, Me) -> Unit) {
+private fun BootSplash() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        ParticleLoader(tint = MaterialTheme.colorScheme.onBackground, modifier = Modifier.size(148.dp))
+    }
+}
+
+// LoginScreen is a two-step flow: enter the control-plane URL and validate it
+// (reachable + really a HERO plane) before asking for credentials. Server + user
+// (and, with "remember me", the session cookie) are persisted for next launch.
+@Composable
+private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSettings: () -> Unit) {
     val scope = rememberCoroutineScope()
-    var url by remember { mutableStateOf("http://127.0.0.1:7801") }
-    var user by remember { mutableStateOf("") }
+    var step by remember { mutableStateOf(0) } // 0 = URL, 1 = credentials
+    var url by remember { mutableStateOf(settings.getString(Keys.ServerUrl) ?: "https://") }
+    var user by remember { mutableStateOf(settings.getString(Keys.Username) ?: "") }
     var pass by remember { mutableStateOf("") }
+    var remember by remember { mutableStateOf(settings.getString(Keys.Remember) == "1") }
+    var checkedApi by remember { mutableStateOf<Api?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
-    var showAdvanced by remember { mutableStateOf(false) }
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
-            Modifier
-                .widthIn(max = 380.dp)
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(24.dp),
+            Modifier.widthIn(max = 380.dp).fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            ParticleLoader(
-                tint = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.size(184.dp),
-            )
-            Text(
-                "HERO",
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 8.sp,
-            )
+            ParticleLoader(tint = MaterialTheme.colorScheme.onBackground, modifier = Modifier.size(184.dp))
+            Text("HERO", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, letterSpacing = 8.sp)
             Spacer(Modifier.height(2.dp))
-            Text(
-                "Harness Everything Routing Orchestrator",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Text("Harness Everything Routing Orchestrator", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(24.dp))
 
             OutlinedCard(Modifier.fillMaxWidth()) {
-                Column(
-                    Modifier.padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    OutlinedTextField(
-                        url, { url = it }, Modifier.fillMaxWidth(),
-                        label = { Text("Control-plane URL") }, singleLine = true,
-                    )
-                    OutlinedTextField(
-                        user, { user = it }, Modifier.fillMaxWidth(),
-                        label = { Text("User") }, singleLine = true,
-                    )
-                    OutlinedTextField(
-                        pass, { pass = it }, Modifier.fillMaxWidth(),
-                        label = { Text("Password") }, singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                    )
-                    error?.let {
-                        Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                    }
-                    Button(
-                        onClick = {
-                            busy = true; error = null
-                            scope.launch {
-                                try {
-                                    val a = Api(url.trimEnd('/'))
-                                    if (a.login(user, pass)) {
-                                        val m = runCatching { a.me() }.getOrDefault(Me(user = user))
-                                        onLogin(a, m)
-                                    } else error = "Invalid credentials"
-                                } catch (e: Throwable) {
-                                    error = e.message ?: "login failed"
-                                } finally {
-                                    busy = false
-                                }
+                // Slide + fade between the two steps; direction follows step order.
+                AnimatedContent(
+                    targetState = step,
+                    transitionSpec = {
+                        val forward = targetState > initialState
+                        val dir = if (forward) 1 else -1
+                        (slideInHorizontally(tween(280)) { w -> dir * w } + fadeIn(tween(280)))
+                            .togetherWith(slideOutHorizontally(tween(240)) { w -> -dir * w } + fadeOut(tween(180)))
+                    },
+                    label = "loginStep",
+                ) { s ->
+                    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        if (s == 0) {
+                            OutlinedTextField(
+                                url, { url = it; error = null }, Modifier.fillMaxWidth(),
+                                label = { Text("Control-plane URL") }, singleLine = true,
+                            )
+                            error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                            Button(
+                                onClick = {
+                                    busy = true; error = null
+                                    scope.launch {
+                                        val a = Api(url.trim().trimEnd('/'))
+                                        if (a.probe()) { checkedApi = a; step = 1 }
+                                        else error = "Not reachable, or not a HERO control plane."
+                                        busy = false
+                                    }
+                                },
+                                enabled = !busy && url.isNotBlank(),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) { Text(if (busy) "Checking…" else "Continue") }
+                        } else {
+                            Text(url.trim().trimEnd('/'), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            OutlinedTextField(
+                                user, { user = it }, Modifier.fillMaxWidth(),
+                                label = { Text("User") }, singleLine = true,
+                            )
+                            OutlinedTextField(
+                                pass, { pass = it }, Modifier.fillMaxWidth(),
+                                label = { Text("Password") }, singleLine = true,
+                                visualTransformation = PasswordVisualTransformation(),
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                androidx.compose.material3.Checkbox(remember, { remember = it })
+                                Text("Remember me on this device", style = MaterialTheme.typography.bodySmall)
                             }
-                        },
-                        enabled = !busy,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) { Text(if (busy) "Signing in…" else "Sign in") }
+                            error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                            Button(
+                                onClick = {
+                                    busy = true; error = null
+                                    scope.launch {
+                                        try {
+                                            val a = checkedApi ?: Api(url.trim().trimEnd('/'))
+                                            if (a.login(user, pass)) {
+                                                val m = runCatching { a.me() }.getOrDefault(Me(user = user))
+                                                settings.putString(Keys.ServerUrl, url.trim().trimEnd('/'))
+                                                settings.putString(Keys.Username, user)
+                                                if (remember) {
+                                                    settings.putString(Keys.Remember, "1")
+                                                    a.sessionCookie?.let { settings.putString(Keys.Cookie, it) }
+                                                } else {
+                                                    settings.remove(Keys.Remember); settings.remove(Keys.Cookie)
+                                                }
+                                                onLogin(a, m)
+                                            } else error = "Invalid credentials"
+                                        } catch (e: Throwable) {
+                                            error = e.message ?: "sign-in failed"
+                                        } finally {
+                                            busy = false
+                                        }
+                                    }
+                                },
+                                enabled = !busy && user.isNotBlank() && pass.isNotBlank(),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) { Text(if (busy) "Signing in…" else "Sign in") }
+                            TextButton(onClick = { step = 0; error = null }, modifier = Modifier.fillMaxWidth()) {
+                                Text("‹  Change server")
+                            }
+                        }
+                    }
                 }
             }
 
             Spacer(Modifier.height(12.dp))
-            TextButton(onClick = { showAdvanced = !showAdvanced }) {
-                Text(if (showAdvanced) "Hide advanced" else "Advanced · Updates")
-            }
-            if (showAdvanced) UpdatePanel()
-        }
-    }
-}
-
-@Composable
-private fun UpdatePanel() {
-    val scope = rememberCoroutineScope()
-    var status by remember { mutableStateOf("v$AppVersion") }
-    var pending by remember { mutableStateOf<UpdateInfo?>(null) }
-
-    // No token: updates come from the project's PUBLIC releases, checked and
-    // downloaded anonymously (see Update.kt).
-    OutlinedCard(Modifier.fillMaxWidth().widthIn(max = 380.dp)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Updates", style = MaterialTheme.typography.titleSmall)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = {
-                    scope.launch {
-                        status = "checking…"
-                        val info = runCatching { checkForUpdate(updateAssetSuffix()) }.getOrNull()
-                        if (info == null) {
-                            status = "up to date (v$AppVersion)"; pending = null
-                        } else {
-                            status = "update available: v${info.version}"; pending = info
-                        }
-                    }
-                }) { Text("Check for updates") }
-                pending?.let { info ->
-                    Button(onClick = { scope.launch { status = installUpdate(info) } }) { Text("Update") }
-                }
-            }
-            Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            TextButton(onClick = onOpenSettings) { Text("Settings") }
         }
     }
 }
@@ -199,13 +258,13 @@ enum class Section(val label: String, val adminOnly: Boolean) {
 }
 
 @Composable
-private fun MainScreen(api: Api, me: Me, onSignOut: () -> Unit) {
+private fun MainScreen(api: Api, me: Me, onSignOut: () -> Unit, onOpenSettings: () -> Unit) {
     var section by remember { mutableStateOf(Section.Sessions) }
     // Back from a non-Sessions tab returns to Sessions (SessionsScreen registers
     // its own inner handler for closing an open session, which wins first).
     PredictiveBack(enabled = section != Section.Sessions) { section = Section.Sessions }
     Column(Modifier.fillMaxSize()) {
-        HeroTopBar(me, section, onSelect = { section = it }, onSignOut = onSignOut)
+        HeroTopBar(me, section, onSelect = { section = it }, onSignOut = onSignOut, onOpenSettings = onOpenSettings)
         when (section) {
             Section.Sessions -> SessionsScreen(api)
             Section.Nodes -> NodesScreen(api, me)
@@ -325,7 +384,7 @@ private fun PendingBar(p: Pending, onRespond: (String) -> Unit) {
 }
 
 @Composable
-private fun HeroTopBar(me: Me, section: Section, onSelect: (Section) -> Unit, onSignOut: () -> Unit) {
+private fun HeroTopBar(me: Me, section: Section, onSelect: (Section) -> Unit, onSignOut: () -> Unit, onOpenSettings: () -> Unit) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
@@ -349,6 +408,7 @@ private fun HeroTopBar(me: Me, section: Section, onSelect: (Section) -> Unit, on
                 }
                 Spacer(Modifier.width(8.dp))
             }
+            TextButton(onClick = onOpenSettings) { Text("Settings") }
             TextButton(onClick = onSignOut) { Text("Sign out") }
         }
     }
