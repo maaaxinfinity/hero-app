@@ -255,7 +255,7 @@ private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSe
 
 // Section is the top-level navigation target within MainScreen.
 enum class Section(val label: String, val adminOnly: Boolean) {
-    Sessions("Sessions", false), Nodes("Nodes", false), Users("Users", true), Audit("Audit", true)
+    Sessions("Sessions", false), Nodes("Nodes", false), Users("Users", true), Updates("Updates", true), Audit("Audit", true)
 }
 
 @Composable
@@ -270,6 +270,7 @@ private fun MainScreen(api: Api, me: Me, onSignOut: () -> Unit, onOpenSettings: 
             Section.Sessions -> SessionsScreen(api)
             Section.Nodes -> NodesScreen(api, me)
             Section.Users -> UsersScreen(api, me)
+            Section.Updates -> UpdatesScreen(api)
             Section.Audit -> AuditScreen(api)
         }
     }

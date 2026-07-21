@@ -514,6 +514,90 @@ internal fun AuditScreen(api: Api) {
 }
 
 // ============================================================================
+// Updates (admin) — the HERO CONTROL-PLANE binary. Nodes/harnesses are managed
+// elsewhere; this updates the control plane itself (manual + auto).
+// ============================================================================
+@Composable
+internal fun UpdatesScreen(api: Api) {
+    val scope = rememberCoroutineScope()
+    var fleet by remember { mutableStateOf<HeroFleet?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var reload by remember { mutableStateOf(0) }
+    var status by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+
+    LaunchedEffect(reload) {
+        loading = true
+        runCatching { fleet = api.fleetHero() }.onFailure { status = it.message }
+        loading = false
+    }
+
+    Column(Modifier.fillMaxSize().padding(20.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Updates", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            OutlinedButton(onClick = { reload++ }) { Text("Refresh") }
+        }
+        Text("Update the HERO control-plane binary. Publish new builds with `hero control-publish`.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        status?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        Spacer(Modifier.height(12.dp))
+        if (loading) PaneLoader()
+        else fleet?.let { f ->
+            val running = f.running.ifEmpty { "unknown" }
+            val target = f.version
+            val upToDate = f.defined && target == running
+            OutlinedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Control plane", fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.width(8.dp))
+                        Pill(running, MaterialTheme.colorScheme.secondary)
+                        if (f.defined && !upToDate) { Spacer(Modifier.width(6.dp)); Pill("→ $target", MaterialTheme.colorScheme.primary) }
+                        if (upToDate) { Spacer(Modifier.width(6.dp)); Pill("up to date", MaterialTheme.colorScheme.primary) }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        if (f.defined) "Published target: $target" else "Nothing published yet — run `hero control-publish`.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedButton(
+                        enabled = f.defined && !upToDate && !busy,
+                        onClick = {
+                            scope.launch {
+                                busy = true
+                                runCatching { api.controlSelfUpdate() }.onSuccess { status = it }.onFailure { status = it.message }
+                                busy = false
+                                reload++ // it drains + restarts; refetch shows the new running version
+                            }
+                        },
+                    ) { Text(if (busy) "Updating…" else "Update control plane") }
+                    Spacer(Modifier.height(14.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = f.auto_update,
+                            enabled = f.defined,
+                            onCheckedChange = { want ->
+                                scope.launch {
+                                    runCatching { api.setFleetHeroAuto(want) }.onSuccess { reload++ }.onFailure { status = it.message }
+                                }
+                            },
+                        )
+                        Text("Auto-update the control plane when a new version is published", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    if (f.platforms.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text("Published binaries: " + f.platforms.keys.sorted().joinToString(", "),
+                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                    }
+                }
+            }
+        } ?: HintText("No update info.")
+    }
+}
+
+// ============================================================================
 // Start session dialog (used by SessionsScreen)
 // ============================================================================
 @Composable

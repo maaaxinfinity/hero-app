@@ -241,3 +241,23 @@ data class StartSessionReq(val cwd: String = "", val initial_message: String = "
 data class RespondReq(val behavior: String)
 @Serializable
 data class MessageResult(val message: String = "")
+
+// ---- control-plane self-update (the CP binary itself; nodes/harnesses are
+// managed separately). Mirrors GET/PUT /api/fleet/hero. ----
+@Serializable
+data class HeroFleet(
+    val version: String = "",                        // published target version
+    val running: String = "",                        // the control plane's own running version
+    val auto_update: Boolean = false,
+    val defined: Boolean = false,                    // something has been published
+    val platforms: Map<String, HeroBinEntry> = emptyMap(),
+)
+
+@Serializable
+data class HeroBinEntry(val sha256: String = "", val size: Long = 0)
+
+@Serializable
+data class AutoUpdateReq(val auto_update: Boolean)
+
+@Serializable
+data class AutoUpdateResp(val auto_update: Boolean = false, val version: String = "")
