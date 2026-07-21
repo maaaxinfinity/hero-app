@@ -107,13 +107,13 @@ fun turnKey(t: Turn): Any = t.uuid ?: "${t.role}:${t.ts}:${t.content?.length ?: 
 // ---- rendering ----
 
 @Composable
-fun TurnView(turn: Turn, backend: String) {
+fun TurnView(turn: Turn, backend: String, onOpenChild: ((String) -> Unit)? = null) {
     when (turn.role) {
         "user" -> UserBubble(turn)
-        "assistant" -> AssistantTurn(turn, backend)
+        "assistant" -> AssistantTurn(turn, backend, onOpenChild)
         "system" -> SystemMarker(turn)
         "error" -> ErrorLine(turn)
-        else -> AssistantTurn(turn, backend) // graceful default for a future role
+        else -> AssistantTurn(turn, backend, onOpenChild) // graceful default for a future role
     }
 }
 
@@ -131,7 +131,7 @@ private fun UserBubble(turn: Turn) {
 }
 
 @Composable
-private fun AssistantTurn(turn: Turn, backend: String) {
+private fun AssistantTurn(turn: Turn, backend: String, onOpenChild: ((String) -> Unit)?) {
     Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             BackendMark(backend, Modifier.size(15.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -146,7 +146,7 @@ private fun AssistantTurn(turn: Turn, backend: String) {
         if (turn.parts.isEmpty()) {
             Text("…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         } else {
-            turn.parts.forEach { PartView(it) }
+            turn.parts.forEach { PartView(it, onOpenChild) }
         }
     }
 }
@@ -179,16 +179,16 @@ private fun ErrorLine(turn: Turn) {
 }
 
 @Composable
-fun PartView(part: TurnPart) {
+fun PartView(part: TurnPart, onOpenChild: ((String) -> Unit)? = null) {
     when (part.type) {
         "text" -> MarkdownText(part.content, Modifier.fillMaxWidth().padding(vertical = 2.dp))
-        "tool" -> ToolCard(part)
+        "tool" -> ToolCard(part, onOpenChild)
         else -> MonoBlock(part.content) // DEFAULT: an unknown kind still renders legibly
     }
 }
 
 @Composable
-private fun ToolCard(part: TurnPart) {
+private fun ToolCard(part: TurnPart, onOpenChild: ((String) -> Unit)?) {
     val expandDefault = part.toolName?.let { it.equals("Edit", true) || it.equals("Write", true) } == true
     var expanded by rememberSaveable(part.toolName, part.toolTarget) { mutableStateOf(expandDefault) }
     OutlinedCard(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
@@ -205,6 +205,18 @@ private fun ToolCard(part: TurnPart) {
                     it, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
+            }
+        }
+        // Agent-team drill-in: open the spawned subagent's own transcript.
+        val child = part.childSessionId
+        if (child != null && onOpenChild != null) {
+            Row(
+                Modifier.fillMaxWidth().clickable { onOpenChild(child) }.padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("↳ Open subagent transcript", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.weight(1f))
+                Text("›", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
             }
         }
         if (expanded && part.content.isNotEmpty()) MonoBlock(part.content)

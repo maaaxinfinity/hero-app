@@ -288,13 +288,19 @@ private fun SessionsScreen(api: Api) {
     var pend by remember { mutableStateOf<List<Pending>>(emptyList()) }
     var node by remember { mutableStateOf<String?>(null) }
     var session by remember { mutableStateOf<String?>(null) }
+    // drill is the stack of subagent child sessions opened on top of `session`
+    // (agent-team drill-in). The active, rendered session is its top, else `session`.
+    var drill by remember { mutableStateOf<List<String>>(emptyList()) }
     var input by remember { mutableStateOf("") }
     var nodesLoading by remember { mutableStateOf(true) }
     var sessionsLoading by remember { mutableStateOf(false) }
     var showStart by remember { mutableStateOf(false) }
 
     // Backend tag for the open session — drives the harness icon only, never parsing.
+    // Subagents share their parent's harness, so the root session's tag applies.
     val backend = sessions.firstOrNull { it.id == session }?.backend.orEmpty()
+    val active = drill.lastOrNull() ?: session
+    val readonly = drill.isNotEmpty()
 
     LaunchedEffect(Unit) {
         runCatching { nodes = api.nodes().filter { it.connected } }
@@ -303,13 +309,14 @@ private fun SessionsScreen(api: Api) {
     // Seed the newest transcript page, then subscribe the grouped live tail and
     // reconcile it. Keyed on (node, session) so it cancels + restarts on switch;
     // the live loop reconnects with backoff (SSE drops are routine).
-    LaunchedEffect(node, session) {
-        val n = node; val s = session
+    LaunchedEffect(node, active) {
+        val n = node; val s = active
         if (n == null || s == null) { convo = ConvoState(); return@LaunchedEffect }
         convo = ConvoState()
         runCatching { api.transcript(n, s, TRANSCRIPT_PAGE) }.getOrNull()?.let { page ->
             convo = ConvoState(turns = page.turns, cursor = Cursor(page.total, page.start, TRANSCRIPT_PAGE))
         }
+        if (readonly) return@LaunchedEffect // subagent transcripts are complete + read-only
         while (isActive) {
             runCatching {
                 api.liveFrames(n, s).collect { frame -> convo = convo.reduce(frame) }
@@ -318,10 +325,10 @@ private fun SessionsScreen(api: Api) {
             delay(1500)
         }
     }
-    // Poll pending permission requests for the open session.
-    LaunchedEffect(node, session) {
-        while (node != null && session != null) {
-            runCatching { pend = api.pending(node!!).filter { it.session_id == session } }
+    // Poll pending permission requests for the (root) open session only.
+    LaunchedEffect(node, active, readonly) {
+        while (node != null && active != null && !readonly) {
+            runCatching { pend = api.pending(node!!).filter { it.session_id == active } }
             delay(3000)
         }
         pend = emptyList()
@@ -334,9 +341,12 @@ private fun SessionsScreen(api: Api) {
         }
     }
 
-    // Back closes the open session (returns to the session list) before the
-    // outer tab handler runs.
-    PredictiveBack(enabled = session != null) { session = null; convo = ConvoState() }
+    // Back pops a subagent drill-in first, then closes the open session (returns
+    // to the session list) before the outer tab handler runs.
+    PredictiveBack(enabled = session != null) {
+        if (drill.isNotEmpty()) drill = drill.dropLast(1)
+        else { session = null; convo = ConvoState() }
+    }
 
     Row(Modifier.fillMaxSize()) {
         Surface(Modifier.width(248.dp).fillMaxHeight(), color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
@@ -346,7 +356,7 @@ private fun SessionsScreen(api: Api) {
                 else if (nodes.isEmpty()) HintText("No nodes online")
                 else nodes.forEach { n ->
                     NavItem("${n.node_id}  ·  ${n.scope}", selected = node == n.node_id) {
-                        node = n.node_id; session = null; sessions = emptyList(); sessionsLoading = true; convo = ConvoState()
+                        node = n.node_id; session = null; drill = emptyList(); sessions = emptyList(); sessionsLoading = true; convo = ConvoState()
                         scope.launch { runCatching { sessions = api.sessions(n.node_id) }; sessionsLoading = false }
                     }
                 }
@@ -360,7 +370,7 @@ private fun SessionsScreen(api: Api) {
                 else if (node != null && sessions.isEmpty()) HintText("No sessions")
                 else sessions.forEach { s ->
                     val label = if (s.title.isNotEmpty()) s.title else s.id
-                    NavItem(label, selected = session == s.id) { session = s.id; convo = ConvoState() }
+                    NavItem(label, selected = session == s.id) { session = s.id; drill = emptyList(); convo = ConvoState() }
                 }
             }
         }
@@ -368,11 +378,12 @@ private fun SessionsScreen(api: Api) {
         Column(Modifier.fillMaxSize()) {
             if (session == null) EmptyState()
             else {
+                if (readonly) SubagentBar { drill = drill.dropLast(1) }
                 val listState = rememberLazyListState()
                 // Stick to the bottom only when already there — don't yank a user
                 // who scrolled up to read history. React to new turns AND the open
                 // turn growing parts (streaming appends don't change list size).
-                val atBottom by remember {
+                val atBottom by remember(active) {
                     derivedStateOf {
                         val info = listState.layoutInfo
                         val last = info.visibleItemsInfo.lastOrNull()
@@ -383,20 +394,42 @@ private fun SessionsScreen(api: Api) {
                     if (atBottom && convo.turns.isNotEmpty()) listState.animateScrollToItem(convo.turns.lastIndex)
                 }
                 LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp), state = listState) {
-                    items(convo.turns, key = { turnKey(it) }) { turn -> TurnView(turn, backend) }
+                    items(convo.turns, key = { turnKey(it) }) { turn ->
+                        TurnView(turn, backend, onOpenChild = { childId -> drill = drill + childId })
+                    }
                 }
-                pend.forEach { p ->
-                    PendingBar(p) { behavior -> scope.launch { runCatching { api.respond(node!!, p.id, behavior) } } }
-                }
-                InputBar(input, { input = it }) {
-                    val n = node; val s = session; val t = input.trim()
-                    if (n != null && s != null && t.isNotEmpty()) {
-                        input = ""
-                        convo = convo.optimisticUser(t)
-                        scope.launch { runCatching { api.send(n, s, t) } }
+                if (!readonly) {
+                    pend.forEach { p ->
+                        PendingBar(p) { behavior -> scope.launch { runCatching { api.respond(node!!, p.id, behavior) } } }
+                    }
+                    InputBar(input, { input = it }) {
+                        val n = node; val s = session; val t = input.trim()
+                        if (n != null && s != null && t.isNotEmpty()) {
+                            input = ""
+                            convo = convo.optimisticUser(t)
+                            scope.launch { runCatching { api.send(n, s, t) } }
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+// SubagentBar heads a drilled-in subagent transcript: tap (or Back) returns to
+// the parent. Subagent transcripts are read-only, so there's no composer below.
+@Composable
+private fun SubagentBar(onBack: () -> Unit) {
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant, tonalElevation = 1.dp) {
+        Row(
+            Modifier.fillMaxWidth().clickable(onClick = onBack).padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "‹  Subagent transcript (read-only)",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
