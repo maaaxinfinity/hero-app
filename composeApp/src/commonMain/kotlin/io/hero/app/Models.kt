@@ -1,6 +1,7 @@
 package io.hero.app
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 
 // v1 control-plane API types (see the backend's docs/control-plane-api.md).
@@ -35,6 +36,86 @@ data class Event(
     val type: String = "",
     val raw: JsonElement? = null,
 )
+
+// ---- structured "display window" (mirrors the node's jsonl.Turn / jsonl.TurnPart) ----
+// These are the harness-NEUTRAL projection both backends normalize into (the
+// "narrow waist"). The app renders these; it never parses raw jsonl. `type` and
+// `role` are deliberately plain String (not enums) so a future kind emitted by a
+// newer node deserializes fine and falls through to the renderer's default branch.
+
+@Serializable
+data class TurnPart(
+    val type: String = "text",              // open set: "text" | "tool" | <future>
+    val content: String = "",               // markdown source (text) or tool output
+    val toolName: String? = null,
+    val toolTarget: String? = null,
+    val childSessionId: String? = null,     // P1a: subagent/agent-team drill-in target
+)
+
+@Serializable
+data class Turn(
+    val role: String = "",                  // "user" | "assistant" | "system" (+ client-only "error")
+    val content: String? = null,            // user / system turns
+    val parts: List<TurnPart> = emptyList(),// assistant turns
+    val ts: String = "",
+    val model: String? = null,
+    val uuid: String? = null,               // assistant fork-point; stable list key
+)
+
+// LiveFrame is the typed form of one grouped SSE frame, decoded from Event by
+// decodeLiveFrame. Not @Serializable — the discriminator lives on Event.type and
+// the body shape varies per type, so it is mapped by hand.
+sealed interface LiveFrame {
+    data class Part(val part: TurnPart, val ts: String?, val model: String?) : LiveFrame
+    data class UserTurn(val content: String, val ts: String?) : LiveFrame
+    data class Delta(val text: String) : LiveFrame
+    data class Status(val status: String) : LiveFrame
+    data class Exit(val reason: String?, val assistantUuid: String?, val assistantTs: String?) : LiveFrame
+    data class Runtime(val model: String?, val contextWindow: Int?) : LiveFrame
+    data class ErrorFrame(val message: String) : LiveFrame
+    data object TurnActive : LiveFrame
+    data object TurnIdle : LiveFrame
+    data class Unknown(val type: String) : LiveFrame   // forward-compat sink; never breaks the stream
+}
+
+// Body DTOs for the grouped frame payloads (Event.raw). snake_case matches the
+// wire keys — the house style in this file.
+@Serializable private data class PartBody(val ts: String? = null, val model: String? = null, val part: TurnPart)
+@Serializable private data class UserBody(val content: String = "", val ts: String? = null)
+@Serializable private data class DeltaBody(val delta: String = "")
+@Serializable private data class StatusBody(val status: String = "")
+@Serializable private data class ExitBody(val reason: String? = null, val assistant_uuid: String? = null, val assistant_ts: String? = null)
+@Serializable private data class RuntimeBody(val model: String? = null, val context_window: Int? = null)
+@Serializable private data class ErrorBody(val message: String = "")
+
+/**
+ * decodeLiveFrame maps one node event envelope to a typed LiveFrame. The
+ * discriminator is [Event.type], the payload is [Event.raw]. An unknown type maps
+ * to [LiveFrame.Unknown]; a malformed body returns null — neither ever throws, so
+ * one bad frame can't tear down the live stream. Pure (no I/O) for unit testing.
+ */
+internal fun decodeLiveFrame(ev: Event, json: Json): LiveFrame? {
+    val raw = ev.raw
+    return runCatching {
+        when (ev.type) {
+            "part" -> raw?.let { json.decodeFromJsonElement(PartBody.serializer(), it) }
+                ?.let { LiveFrame.Part(it.part, it.ts, it.model) }
+            "turn.user" -> raw?.let { json.decodeFromJsonElement(UserBody.serializer(), it) }
+                ?.let { LiveFrame.UserTurn(it.content, it.ts) }
+            "part.delta" -> raw?.let { LiveFrame.Delta(json.decodeFromJsonElement(DeltaBody.serializer(), it).delta) }
+            "turn.status" -> raw?.let { LiveFrame.Status(json.decodeFromJsonElement(StatusBody.serializer(), it).status) }
+            "subprocess.exit" -> (raw?.let { json.decodeFromJsonElement(ExitBody.serializer(), it) } ?: ExitBody())
+                .let { LiveFrame.Exit(it.reason, it.assistant_uuid, it.assistant_ts) }
+            "session.runtime" -> raw?.let { json.decodeFromJsonElement(RuntimeBody.serializer(), it) }
+                ?.let { LiveFrame.Runtime(it.model, it.context_window) }
+            "error" -> LiveFrame.ErrorFrame(raw?.let { json.decodeFromJsonElement(ErrorBody.serializer(), it).message } ?: "error")
+            "turn.active" -> LiveFrame.TurnActive
+            "turn.idle" -> LiveFrame.TurnIdle
+            "subprocess.started" -> null    // no grouped-view effect
+            else -> LiveFrame.Unknown(ev.type)
+        }
+    }.getOrNull()
+}
 
 @Serializable
 data class SendReq(val text: String)

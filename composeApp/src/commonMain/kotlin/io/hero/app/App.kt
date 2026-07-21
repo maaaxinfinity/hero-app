@@ -43,6 +43,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,13 +51,13 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 @Composable
@@ -274,12 +275,16 @@ private fun MainScreen(api: Api, me: Me, onSignOut: () -> Unit, onOpenSettings: 
     }
 }
 
+// TRANSCRIPT_PAGE is the turns-per-page the app requests (newest page on open;
+// "load earlier" prepends further pages — wiring is a follow-up).
+private const val TRANSCRIPT_PAGE = 40
+
 @Composable
 private fun SessionsScreen(api: Api) {
     val scope = rememberCoroutineScope()
     var nodes by remember { mutableStateOf<List<NodeView>>(emptyList()) }
     var sessions by remember { mutableStateOf<List<Session>>(emptyList()) }
-    var events by remember { mutableStateOf<List<String>>(emptyList()) }
+    var convo by remember { mutableStateOf(ConvoState()) }
     var pend by remember { mutableStateOf<List<Pending>>(emptyList()) }
     var node by remember { mutableStateOf<String?>(null) }
     var session by remember { mutableStateOf<String?>(null) }
@@ -288,24 +293,36 @@ private fun SessionsScreen(api: Api) {
     var sessionsLoading by remember { mutableStateOf(false) }
     var showStart by remember { mutableStateOf(false) }
 
+    // Backend tag for the open session — drives the harness icon only, never parsing.
+    val backend = sessions.firstOrNull { it.id == session }?.backend.orEmpty()
+
     LaunchedEffect(Unit) {
         runCatching { nodes = api.nodes().filter { it.connected } }
         nodesLoading = false
     }
-    LaunchedEffect(node) {
-        val n = node ?: return@LaunchedEffect
-        events = emptyList()
-        api.events(n).catch { }.collect { ev ->
-            if (session == null || ev.session_id.isEmpty() || ev.session_id == session) {
-                events = (events + renderEvent(ev)).takeLast(500)
+    // Seed the newest transcript page, then subscribe the grouped live tail and
+    // reconcile it. Keyed on (node, session) so it cancels + restarts on switch;
+    // the live loop reconnects with backoff (SSE drops are routine).
+    LaunchedEffect(node, session) {
+        val n = node; val s = session
+        if (n == null || s == null) { convo = ConvoState(); return@LaunchedEffect }
+        convo = ConvoState()
+        runCatching { api.transcript(n, s, TRANSCRIPT_PAGE) }.getOrNull()?.let { page ->
+            convo = ConvoState(turns = page.turns, cursor = Cursor(page.total, page.start, TRANSCRIPT_PAGE))
+        }
+        while (isActive) {
+            runCatching {
+                api.liveFrames(n, s).collect { frame -> convo = convo.reduce(frame) }
             }
+            if (!isActive) break
+            delay(1500)
         }
     }
     // Poll pending permission requests for the open session.
     LaunchedEffect(node, session) {
         while (node != null && session != null) {
             runCatching { pend = api.pending(node!!).filter { it.session_id == session } }
-            kotlinx.coroutines.delay(3000)
+            delay(3000)
         }
         pend = emptyList()
     }
@@ -319,7 +336,7 @@ private fun SessionsScreen(api: Api) {
 
     // Back closes the open session (returns to the session list) before the
     // outer tab handler runs.
-    PredictiveBack(enabled = session != null) { session = null; events = emptyList() }
+    PredictiveBack(enabled = session != null) { session = null; convo = ConvoState() }
 
     Row(Modifier.fillMaxSize()) {
         Surface(Modifier.width(248.dp).fillMaxHeight(), color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
@@ -329,7 +346,7 @@ private fun SessionsScreen(api: Api) {
                 else if (nodes.isEmpty()) HintText("No nodes online")
                 else nodes.forEach { n ->
                     NavItem("${n.node_id}  ·  ${n.scope}", selected = node == n.node_id) {
-                        node = n.node_id; session = null; sessions = emptyList(); sessionsLoading = true; events = emptyList()
+                        node = n.node_id; session = null; sessions = emptyList(); sessionsLoading = true; convo = ConvoState()
                         scope.launch { runCatching { sessions = api.sessions(n.node_id) }; sessionsLoading = false }
                     }
                 }
@@ -343,7 +360,7 @@ private fun SessionsScreen(api: Api) {
                 else if (node != null && sessions.isEmpty()) HintText("No sessions")
                 else sessions.forEach { s ->
                     val label = if (s.title.isNotEmpty()) s.title else s.id
-                    NavItem(label, selected = session == s.id) { session = s.id; events = emptyList() }
+                    NavItem(label, selected = session == s.id) { session = s.id; convo = ConvoState() }
                 }
             }
         }
@@ -352,16 +369,32 @@ private fun SessionsScreen(api: Api) {
             if (session == null) EmptyState()
             else {
                 val listState = rememberLazyListState()
-                LaunchedEffect(events.size) { if (events.isNotEmpty()) listState.animateScrollToItem(events.size - 1) }
+                // Stick to the bottom only when already there — don't yank a user
+                // who scrolled up to read history. React to new turns AND the open
+                // turn growing parts (streaming appends don't change list size).
+                val atBottom by remember {
+                    derivedStateOf {
+                        val info = listState.layoutInfo
+                        val last = info.visibleItemsInfo.lastOrNull()
+                        last == null || last.index >= info.totalItemsCount - 1
+                    }
+                }
+                LaunchedEffect(convo.turns.size, convo.turns.lastOrNull()?.parts?.size) {
+                    if (atBottom && convo.turns.isNotEmpty()) listState.animateScrollToItem(convo.turns.lastIndex)
+                }
                 LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp), state = listState) {
-                    items(events) { line -> EventRow(line) }
+                    items(convo.turns, key = { turnKey(it) }) { turn -> TurnView(turn, backend) }
                 }
                 pend.forEach { p ->
                     PendingBar(p) { behavior -> scope.launch { runCatching { api.respond(node!!, p.id, behavior) } } }
                 }
                 InputBar(input, { input = it }) {
                     val n = node; val s = session; val t = input.trim()
-                    if (n != null && s != null && t.isNotEmpty()) { input = ""; scope.launch { runCatching { api.send(n, s, t) } } }
+                    if (n != null && s != null && t.isNotEmpty()) {
+                        input = ""
+                        convo = convo.optimisticUser(t)
+                        scope.launch { runCatching { api.send(n, s, t) } }
+                    }
                 }
             }
         }
@@ -477,17 +510,6 @@ internal fun PaneLoader() {
 }
 
 @Composable
-private fun EventRow(line: String) {
-    Text(
-        line,
-        style = MaterialTheme.typography.bodySmall,
-        fontFamily = FontFamily.Monospace,
-        color = MaterialTheme.colorScheme.onSurface,
-        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
-    )
-}
-
-@Composable
 private fun EmptyState() {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -522,10 +544,3 @@ private fun InputBar(value: String, onChange: (String) -> Unit, onSend: () -> Un
     }
 }
 
-// renderEvent is a readable one-line summary; rich per-harness rendering (the
-// web console's markdown/tool cards) is the next step here too.
-private fun renderEvent(ev: Event): String {
-    val role = ev.type.ifEmpty { "?" }
-    val body = ev.raw?.toString()?.take(200).orEmpty()
-    return "[$role] $body"
-}

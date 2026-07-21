@@ -7,6 +7,7 @@ import io.ktor.client.plugins.defaultRequest
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
+import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.prepareGet
 import io.ktor.client.request.put
@@ -21,7 +22,9 @@ import io.ktor.http.parameters
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.utils.io.readUTF8Line
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -103,6 +106,32 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun pending(node: String): List<Pending> =
         client.get("$baseUrl/api/nodes/${node.enc()}/pending").body()
 
+    // ---- conversation: structured window (history + grouped live tail) ----
+
+    /** transcript fetches one grouped display page. offset=null → newest page; the
+     *  X-Transcript-* headers carry the cursor for prepending older pages. */
+    suspend fun transcript(node: String, id: String, limit: Int, offset: Int? = null): TranscriptPage {
+        val resp = client.get("$baseUrl/api/nodes/${node.enc()}/sessions/${id.enc()}/transcript") {
+            parameter("limit", limit)
+            if (offset != null) parameter("offset", offset)
+        }
+        val turns: List<Turn> = resp.body()
+        val h = resp.headers
+        return TranscriptPage(
+            turns = turns,
+            total = h["X-Transcript-Total"]?.toIntOrNull() ?: turns.size,
+            start = h["X-Transcript-Start"]?.toIntOrNull() ?: 0,
+            hasMore = h["X-Transcript-Has-More"].equals("true", ignoreCase = true),
+        )
+    }
+
+    /** liveFrames is the grouped, typed live tail for one session: the /parts SSE
+     *  (structured frames only — no raw jsonl), filtered to this session and decoded. */
+    fun liveFrames(node: String, session: String): Flow<LiveFrame> =
+        sseFrames("$baseUrl/api/nodes/${node.enc()}/parts")
+            .filter { it.session_id.isEmpty() || it.session_id == session }
+            .mapNotNull { decodeLiveFrame(it, json) }
+
     suspend fun respond(node: String, id: String, behavior: String) {
         client.post("$baseUrl/api/nodes/${node.enc()}/pending/${id.enc()}/respond") {
             contentType(ContentType.Application.Json); setBody(RespondReq(behavior))
@@ -180,9 +209,12 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun audit(limit: Int = 200): List<AuditRecord> =
         client.get("$baseUrl/api/audit?limit=$limit").body()
 
-    /** events streams a session's SSE feed, parsing `data:` frames into Events. */
-    fun events(node: String): Flow<Event> = flow {
-        client.prepareGet("$baseUrl/api/nodes/${node.enc()}/events").execute { resp ->
+    /** events streams the node's raw+grouped SSE feed (all sessions). */
+    fun events(node: String): Flow<Event> = sseFrames("$baseUrl/api/nodes/${node.enc()}/events")
+
+    /** sseFrames reads an SSE endpoint, parsing each `data:` frame into an Event. */
+    private fun sseFrames(url: String): Flow<Event> = flow {
+        client.prepareGet(url).execute { resp ->
             val ch = resp.bodyAsChannel()
             while (true) {
                 val line = ch.readUTF8Line() ?: break
@@ -196,5 +228,13 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
         }
     }
 }
+
+/** TranscriptPage fuses a transcript page body with its X-Transcript-* cursor. */
+data class TranscriptPage(
+    val turns: List<Turn>,
+    val total: Int,
+    val start: Int,
+    val hasMore: Boolean,
+)
 
 private fun String.enc(): String = this.encodeURLPathPart()
