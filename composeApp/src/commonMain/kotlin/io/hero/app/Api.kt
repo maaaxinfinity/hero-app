@@ -209,6 +209,20 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun audit(limit: Int = 200): List<AuditRecord> =
         client.get("$baseUrl/api/audit?limit=$limit").body()
 
+    // ---- control-plane self-update (the CP binary; nodes/harnesses are separate) ----
+    suspend fun fleetHero(): HeroFleet =
+        client.get("$baseUrl/api/fleet/hero").body()
+
+    /** setFleetHeroAuto toggles fleet-wide auto-update (re-signs the manifest); returns the new state. */
+    suspend fun setFleetHeroAuto(auto: Boolean): Boolean =
+        client.put("$baseUrl/api/fleet/hero") {
+            contentType(ContentType.Application.Json); setBody(AutoUpdateReq(auto))
+        }.body<AutoUpdateResp>().auto_update
+
+    /** controlSelfUpdate updates the control plane to the published target; it drains + restarts. */
+    suspend fun controlSelfUpdate(): String =
+        client.post("$baseUrl/api/control/self-update").body<MessageResult>().message
+
     /** events streams the node's raw+grouped SSE feed (all sessions). */
     fun events(node: String): Flow<Event> = sseFrames("$baseUrl/api/nodes/${node.enc()}/events")
 
