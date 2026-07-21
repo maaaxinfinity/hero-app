@@ -50,7 +50,23 @@ data class TurnPart(
     val toolName: String? = null,
     val toolTarget: String? = null,
     val childSessionId: String? = null,     // P1a: subagent/agent-team drill-in target
+    val workflow: WorkflowInfo? = null,     // P1b: dynamic-workflow summary (Claude "Workflow" tool)
 )
+
+@Serializable
+data class WorkflowInfo(
+    val name: String = "",
+    val summary: String = "",
+    val status: String = "",                // running | completed | failed | …
+    val phases: List<WorkflowPhase> = emptyList(),
+    val agentCount: Int = 0,
+    val totalTokens: Long = 0,
+    val totalToolCalls: Int = 0,
+    val runId: String = "",
+)
+
+@Serializable
+data class WorkflowPhase(val title: String = "")
 
 @Serializable
 data class Turn(

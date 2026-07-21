@@ -180,11 +180,80 @@ private fun ErrorLine(turn: Turn) {
 
 @Composable
 fun PartView(part: TurnPart, onOpenChild: ((String) -> Unit)? = null) {
-    when (part.type) {
-        "text" -> MarkdownText(part.content, Modifier.fillMaxWidth().padding(vertical = 2.dp))
-        "tool" -> ToolCard(part, onOpenChild)
+    when {
+        part.workflow != null -> WorkflowCard(part.workflow) // P1b — a Workflow tool part
+        part.type == "text" -> MarkdownText(part.content, Modifier.fillMaxWidth().padding(vertical = 2.dp))
+        part.type == "tool" -> ToolCard(part, onOpenChild)
         else -> MonoBlock(part.content) // DEFAULT: an unknown kind still renders legibly
     }
+}
+
+// WorkflowCard renders a dynamic-workflow run: name + status, the phase
+// breadcrumb, a one-line summary, and fleet totals. Fits the monochrome ink theme.
+@Composable
+private fun WorkflowCard(wf: WorkflowInfo) {
+    OutlinedCard(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("⌘ Workflow", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    wf.name.ifEmpty { "workflow" },
+                    fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+                )
+                if (wf.status.isNotEmpty()) StatusChip(wf.status)
+            }
+            if (wf.phases.isNotEmpty()) {
+                Spacer(Modifier.size(6.dp))
+                Text(
+                    wf.phases.joinToString("  ›  ") { it.title },
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (wf.summary.isNotEmpty()) {
+                Spacer(Modifier.size(6.dp))
+                Text(
+                    wf.summary, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 3, overflow = TextOverflow.Ellipsis,
+                )
+            }
+            val metrics = buildList {
+                if (wf.agentCount > 0) add("${wf.agentCount} agents")
+                if (wf.totalToolCalls > 0) add("${wf.totalToolCalls} tools")
+                if (wf.totalTokens > 0) add("${fmtCount(wf.totalTokens)} tokens")
+            }
+            if (metrics.isNotEmpty()) {
+                Spacer(Modifier.size(6.dp))
+                Text(
+                    metrics.joinToString("  ·  "),
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusChip(status: String) {
+    val done = status.equals("completed", true)
+    val failed = status.equals("failed", true) || status.equals("error", true)
+    val fg = when {
+        failed -> MaterialTheme.colorScheme.error
+        done -> MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.primary // running / other = active
+    }
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(6.dp)) {
+        Text(status, style = MaterialTheme.typography.labelSmall, color = fg, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
+    }
+}
+
+// fmtCount renders a count compactly (2321785 -> "2.3M") without String.format,
+// which isn't in the common stdlib.
+private fun fmtCount(n: Long): String = when {
+    n >= 1_000_000 -> "${n / 1_000_000}.${(n / 100_000) % 10}M"
+    n >= 1_000 -> "${n / 1_000}.${(n / 100) % 10}k"
+    else -> n.toString()
 }
 
 @Composable
