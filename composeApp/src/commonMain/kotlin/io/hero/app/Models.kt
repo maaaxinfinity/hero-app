@@ -248,7 +248,9 @@ data class JoinReq(val node_id: String = "", val ttl_seconds: Int = 3600)
 @Serializable
 data class BackendReq(val backend: String = "")
 @Serializable
-data class StartSessionReq(val cwd: String = "", val initial_message: String = "", val model: String = "")
+// backend pins the harness explicitly; "" lets the node infer it from the
+// model (legacy behavior — wrong on dual-harness nodes with a blank model).
+data class StartSessionReq(val cwd: String = "", val initial_message: String = "", val model: String = "", val backend: String = "")
 @Serializable
 data class RespondReq(val behavior: String)
 @Serializable

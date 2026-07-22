@@ -371,7 +371,7 @@ private fun NodeInspector(
     var harness by remember(n.node_id) { mutableStateOf<HarnessState?>(null) }
     LaunchedEffect(n.node_id, n.connected) {
         if (n.connected && n.scope == "admin") {
-            runCatching { harness = api.harness(n.node_id) }
+            runCatching { harness = api.harness(n.node_id).also { FleetCache.harness[n.node_id] = it } }
                 .onFailure { status = it.message ?: "harness load failed" }
         }
     }
@@ -467,7 +467,7 @@ private fun HarnessConfigPanel(api: Api, nodeId: String, backend: String, onBack
     var status by remember(nodeId, backend) { mutableStateOf<String?>(null) }
     var reload by remember(nodeId, backend) { mutableStateOf(0) }
     LaunchedEffect(nodeId, backend, reload) {
-        runCatching { st = api.harness(nodeId) }
+        runCatching { st = api.harness(nodeId).also { FleetCache.harness[nodeId] = it } }
             .onFailure { status = it.message ?: "harness load failed" }
     }
     Column(
@@ -696,12 +696,20 @@ private fun HarnessBackendCard(
                         val next = buildMergedConfig(api, nodeId, b.backend, model, if (cat.supports_effort) effort else "", autoUpd)
                         runCatching {
                             api.setHarnessConfig(nodeId, next)
+                            // The cached snapshot is now stale — drop it so the
+                            // composer/new-session pickers re-read the node.
+                            FleetCache.harness.remove(nodeId)
                             onResult(api.harnessApply(nodeId, b.backend))
                         }.onFailure { onResult(it.message ?: "error") }
                     }
                 }) { Text("Save + apply") }
                 OutlinedButton(onClick = {
-                    scope.launch { runCatching { onResult(api.harnessInstall(nodeId, b.backend)) }.onFailure { onResult(it.message ?: "error") } }
+                    scope.launch {
+                        runCatching {
+                            FleetCache.harness.remove(nodeId)
+                            onResult(api.harnessInstall(nodeId, b.backend))
+                        }.onFailure { onResult(it.message ?: "error") }
+                    }
                 }) { Text(if (b.version_status == "missing") "Install" else "Reinstall") }
             }
         }
@@ -1189,13 +1197,17 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
     var modelMenu by remember { mutableStateOf(false) }
     var cwdMenu by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
+    var defaultsByBackend by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     LaunchedEffect(node) {
         val hs = FleetCache.harness[node]
             ?: runCatching { api.harness(node) }.getOrNull()?.also { FleetCache.harness[node] = it }
-        val bs = hs?.backends.orEmpty()
+        // Only enabled harnesses are offerable — a disabled backend in the DTO is
+        // management surface (install/enable it in Nodes), not a launch target.
+        val bs = hs?.backends.orEmpty().filter { it.enabled }
         backends = bs.map { it.backend }
         modelsByBackend = bs.associate { it.backend to it.catalog.models.filter { m -> !m.hidden } }
-        if (backend.isEmpty()) backend = backends.firstOrNull().orEmpty()
+        defaultsByBackend = bs.associate { it.backend to it.catalog.default }
+        if (backend.isEmpty() || backend !in backends) backend = backends.firstOrNull().orEmpty()
         // Recent working directories from this node's existing sessions — a derived
         // pick-list, not a filesystem browse (HERO never browses the machine). Free
         // text still works for a brand-new path.
@@ -1246,7 +1258,9 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
                 Spacer(Modifier.height(8.dp))
                 // Model — filtered to the chosen harness, with its logo + friendly label.
                 Box {
-                    OutlinedTextField(model, { model = it }, Modifier.fillMaxWidth(), label = { Text("Model (blank = default)") }, singleLine = true,
+                    val defHint = defaultsByBackend[backend].orEmpty()
+                    OutlinedTextField(model, { model = it }, Modifier.fillMaxWidth(),
+                        label = { Text(if (defHint.isEmpty()) "Model (blank = $backend default)" else "Model (blank = $defHint)") }, singleLine = true,
                         trailingIcon = { IconButton(onClick = { modelMenu = true }) { Icon(Icons.Filled.ArrowDropDown, contentDescription = "Pick model") } })
                     DropdownMenu(expanded = modelMenu, onDismissRequest = { modelMenu = false }) {
                         if (models.isEmpty()) {
@@ -1279,7 +1293,7 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
                 onClick = {
                     scope.launch {
                         status = null
-                        runCatching { api.startSession(node, StartSessionReq(cwd.trim(), msg, model)) }
+                        runCatching { api.startSession(node, StartSessionReq(cwd.trim(), msg, model, backend)) }
                             .onSuccess { if (it.isNotEmpty()) onStarted(it) else status = "create failed" }
                             .onFailure { status = it.message }
                     }

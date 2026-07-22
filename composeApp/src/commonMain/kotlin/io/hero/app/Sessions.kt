@@ -173,7 +173,9 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         catModels = emptyList(); catEffortLevels = emptyList()
         val n = sel.node
         if (n != null && backend.isNotEmpty()) {
-            // Cache-first so opening a session is instant; refresh in the background.
+            // Cache-first so opening a session is instant. The cache is refilled
+            // by the Nodes inspector and invalidated on Save+apply/Install; a hit
+            // here deliberately skips the heavy status RPC.
             val hs = FleetCache.harness[n]
                 ?: runCatching { api.harness(n) }.getOrNull()?.also { FleetCache.harness[n] = it }
             hs?.backends?.firstOrNull { it.backend == backend }?.catalog?.let { c ->

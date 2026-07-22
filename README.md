@@ -66,9 +66,14 @@ each machine's CPU/MEM/DISK meters when the node reports them (control-plane
 Node and session rows carry the harness marks (claude / codex glyphs),
 connection dots and status; the conversation header shows the runtime model, a
 pulsing row signals thinking/stalled, and "Load earlier" pages the transcript
-backwards. Desktop niceties: hover states, tooltips, right-click menus,
-`Ctrl/Cmd+1..5` section jumps, `Ctrl/Cmd+K` quick switcher, Enter-to-send
-(Shift+Enter for newline).
+backwards. The composer has a model + effort switcher (the session's own
+backend catalog; applies to the next message), and the new-session dialog
+offers an explicit harness selector (enabled backends only — the choice is
+sent to the node, so blank model means *that* harness's default), a
+recent-working-directory picker derived from the node's sessions, and a model
+list filtered to the chosen harness. Desktop niceties: hover states, tooltips,
+right-click menus, `Ctrl/Cmd+1..5` section jumps, `Ctrl/Cmd+K` quick switcher,
+Enter-to-send (Shift+Enter for newline).
 
 ## Build & run
 
