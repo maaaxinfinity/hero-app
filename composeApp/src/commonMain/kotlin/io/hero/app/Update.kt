@@ -1,7 +1,7 @@
 package io.hero.app
 
-import io.ktor.client.HttpClient
 import io.ktor.client.call.body
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.client.request.header
@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
 
 // AppVersion is compared against the latest GitHub release tag. Bump it before
 // tagging a release so the running app can tell it is out of date.
-const val AppVersion = "0.5.9"
+const val AppVersion = "0.5.10"
 const val Repo = "maaaxinfinity/hero-app"
 
 @Serializable
@@ -33,7 +33,12 @@ private val updaterJson = Json { ignoreUnknownKeys = true }
 // rate limit, missing asset) THROWS so the UI can say "check failed" instead
 // of lying with "up to date".
 suspend fun checkForUpdate(assetSuffix: String): UpdateInfo? {
-    val client = HttpClient { install(ContentNegotiation) { json(updaterJson) } }
+    // Unary metadata call, so a 30s bound is safe; the download itself runs on
+    // the platform installUpdate client, which sets no request timeout.
+    val client = heroHttpClient {
+        install(ContentNegotiation) { json(updaterJson) }
+        install(HttpTimeout) { requestTimeoutMillis = 30_000 }
+    }
     try {
         val r = client.get("https://api.github.com/repos/$Repo/releases/latest") {
             header("Accept", "application/vnd.github+json")

@@ -8,6 +8,18 @@
 # code paths are never taken on desktop (the JVM's default TLS is used).
 -dontwarn okhttp3.**
 -dontwarn okio.**
+
+# The engine is constructed explicitly (heroHttpClient actuals), but the uber
+# jar still carries META-INF/services entries pointing at the OkHttp engine —
+# keep the whole transport so ServiceLoader discovery can never resolve to a
+# stripped class again (v0.5.7 crashed exactly that way).
+-keep class io.ktor.client.engine.okhttp.** { *; }
+-keep class okhttp3.** { *; }
+-keep class okio.** { *; }
+# Same ServiceLoader trap, different service: ContentNegotiation's json()
+# discovers KotlinxSerializationExtensionProvider implementations; stripping
+# the provider behind its surviving services entry crashes Api's constructor.
+-keep class io.ktor.serialization.kotlinx.** { *; }
 -dontwarn org.conscrypt.**
 -dontwarn org.bouncycastle.**
 -dontwarn org.openjsse.**

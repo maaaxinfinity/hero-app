@@ -1,6 +1,5 @@
 package io.hero.app
 
-import io.ktor.client.HttpClient
 import io.ktor.client.request.header
 import io.ktor.client.request.prepareGet
 import io.ktor.client.statement.bodyAsChannel
@@ -27,7 +26,8 @@ actual fun updateAssetSuffix(): String {
 // relaunch can't start (unusual java.home layouts), it falls back to telling
 // you how to run the downloaded jar.
 actual suspend fun installUpdate(info: UpdateInfo, onProgress: (Long, Long?) -> Unit): String {
-    val client = HttpClient()
+    // No HttpTimeout: the download is progress-streamed and may take minutes.
+    val client = heroHttpClient()
     try {
         val out = File(System.getProperty("java.io.tmpdir"), "hero-app-${info.version}.jar")
         client.prepareGet(info.downloadUrl) {

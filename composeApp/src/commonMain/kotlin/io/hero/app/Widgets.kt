@@ -133,10 +133,12 @@ fun KeyHandler(handler: (KeyEvent) -> Boolean) {
 
 /** ConfirmButton arms on the first click (error-colored "Confirm — …") and
  *  fires on the second; disarms after 3s untouched. Two deliberate clicks for
- *  destructive actions, without a modal. */
+ *  destructive actions, without a modal. targetKey names the entity the click
+ *  would destroy: a target switch inside the 3s window disarms instantly, so
+ *  the confirm can never fire against a different target than the one armed. */
 @Composable
-internal fun ConfirmButton(label: String, onConfirm: () -> Unit) {
-    var armed by remember { mutableStateOf(false) }
+internal fun ConfirmButton(label: String, targetKey: Any? = null, onConfirm: () -> Unit) {
+    var armed by remember(targetKey) { mutableStateOf(false) }
     LaunchedEffect(armed) {
         if (armed) { delay(3000); armed = false }
     }

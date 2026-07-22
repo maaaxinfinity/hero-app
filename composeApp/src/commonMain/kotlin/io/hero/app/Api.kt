@@ -1,9 +1,11 @@
 package io.hero.app
 
-import io.ktor.client.HttpClient
 import io.ktor.client.call.body
+import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.HttpTimeoutConfig
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.defaultRequest
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
@@ -12,6 +14,7 @@ import io.ktor.client.request.post
 import io.ktor.client.request.prepareGet
 import io.ktor.client.request.put
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
@@ -30,9 +33,6 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 
-// Api is a thin client over the v1 control-plane API. The engine (CIO on
-// desktop/Android, Darwin on iOS) is picked up from the platform source set's
-// classpath, so common code just constructs HttpClient { }.
 // Api is a thin client over the v1 control-plane API. The session cookie is
 // managed explicitly (not via the HttpCookies plugin) so it can be persisted for
 // "remember me" and restored on the next launch. Pass initialCookie to resume a
@@ -44,12 +44,26 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     var sessionCookie: String? = initialCookie
         private set
 
-    private val client = HttpClient {
+    private val client = heroHttpClient {
         install(ContentNegotiation) { json(json) }
+        // Bounds unary calls (the engine's socket read timeout is 0 so SSE can
+        // idle); sseFrames raises its own request timeout to infinite.
+        install(HttpTimeout) { requestTimeoutMillis = 30_000 }
         followRedirects = false
         defaultRequest {
             sessionCookie?.let { headers.append(HttpHeaders.Cookie, "hero_cp_session=$it") }
         }
+    }
+
+    // orThrow surfaces non-2xx responses on calls whose body is otherwise
+    // ignored or decodes error JSON into an all-defaults DTO (which would read
+    // as success — dialogs closing, lists refreshing, nothing changed).
+    private suspend fun HttpResponse.orThrow(): HttpResponse {
+        if (!status.isSuccess()) {
+            val msg = runCatching { bodyAsText() }.getOrNull()?.trim()?.take(300)?.ifBlank { null }
+            throw IllegalStateException(msg ?: "HTTP ${status.value}")
+        }
+        return this
     }
 
     /** probe validates a base URL is a reachable HERO control plane by hitting the
@@ -87,7 +101,7 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
         client.post("$baseUrl/api/nodes/${node.enc()}/sessions/${id.enc()}/send") {
             contentType(ContentType.Application.Json)
             setBody(SendReq(text, model, effort))
-        }
+        }.orThrow()
     }
 
     suspend fun me(): Me {
@@ -142,7 +156,7 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun respond(node: String, id: String, behavior: String) {
         client.post("$baseUrl/api/nodes/${node.enc()}/pending/${id.enc()}/respond") {
             contentType(ContentType.Application.Json); setBody(RespondReq(behavior))
-        }
+        }.orThrow()
     }
 
     // ---- node management ----
@@ -152,25 +166,25 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun addShare(node: String, user: String) {
         client.post("$baseUrl/api/nodes/${node.enc()}/shares") {
             contentType(ContentType.Application.Json); setBody(ShareReq(user))
-        }
+        }.orThrow()
     }
 
     suspend fun removeShare(node: String, user: String) {
-        client.delete("$baseUrl/api/nodes/${node.enc()}/shares/${user.enc()}")
+        client.delete("$baseUrl/api/nodes/${node.enc()}/shares/${user.enc()}").orThrow()
     }
 
     suspend fun setOwner(node: String, user: String) {
         client.put("$baseUrl/api/nodes/${node.enc()}/owner") {
             contentType(ContentType.Application.Json); setBody(ShareReq(user))
-        }
+        }.orThrow()
     }
 
     suspend fun removeNode(node: String) {
-        client.delete("$baseUrl/api/nodes/${node.enc()}")
+        client.delete("$baseUrl/api/nodes/${node.enc()}").orThrow()
     }
 
     suspend fun mintJoin(req: JoinReq): JoinResult =
-        client.post("$baseUrl/api/join") { contentType(ContentType.Application.Json); setBody(req) }.body()
+        client.post("$baseUrl/api/join") { contentType(ContentType.Application.Json); setBody(req) }.orThrow().body()
 
     // ---- harness management ----
     suspend fun harness(node: String): HarnessState =
@@ -179,38 +193,38 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun setHarnessConfig(node: String, config: JsonElement) {
         client.put("$baseUrl/api/nodes/${node.enc()}/harness/config") {
             contentType(ContentType.Application.Json); setBody(config)
-        }
+        }.orThrow()
     }
 
     suspend fun harnessApply(node: String, backend: String): String =
         client.post("$baseUrl/api/nodes/${node.enc()}/harness/apply") {
             contentType(ContentType.Application.Json); setBody(BackendReq(backend))
-        }.body<MessageResult>().message
+        }.orThrow().body<MessageResult>().message
 
     suspend fun harnessInstall(node: String, backend: String): String =
         client.post("$baseUrl/api/nodes/${node.enc()}/harness/install") {
             contentType(ContentType.Application.Json); setBody(BackendReq(backend))
-        }.body<MessageResult>().message
+        }.orThrow().body<MessageResult>().message
 
     // ---- users (admin) ----
     suspend fun users(): List<UserInfo> = client.get("$baseUrl/api/users").body()
 
     suspend fun createUser(req: CreateUserReq) {
-        client.post("$baseUrl/api/users") { contentType(ContentType.Application.Json); setBody(req) }
+        client.post("$baseUrl/api/users") { contentType(ContentType.Application.Json); setBody(req) }.orThrow()
     }
 
-    suspend fun deleteUser(user: String) { client.delete("$baseUrl/api/users/${user.enc()}") }
+    suspend fun deleteUser(user: String) { client.delete("$baseUrl/api/users/${user.enc()}").orThrow() }
 
     suspend fun setPassword(user: String, password: String) {
         client.put("$baseUrl/api/users/${user.enc()}/password") {
             contentType(ContentType.Application.Json); setBody(PasswordReq(password))
-        }
+        }.orThrow()
     }
 
     suspend fun setAdmin(user: String, admin: Boolean) {
         client.put("$baseUrl/api/users/${user.enc()}/admin") {
             contentType(ContentType.Application.Json); setBody(AdminReq(admin))
-        }
+        }.orThrow()
     }
 
     suspend fun audit(limit: Int = 200): List<AuditRecord> =
@@ -224,18 +238,22 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun setFleetHeroAuto(auto: Boolean): Boolean =
         client.put("$baseUrl/api/fleet/hero") {
             contentType(ContentType.Application.Json); setBody(AutoUpdateReq(auto))
-        }.body<AutoUpdateResp>().auto_update
+        }.orThrow().body<AutoUpdateResp>().auto_update
 
     /** controlSelfUpdate updates the control plane to the published target; it drains + restarts. */
     suspend fun controlSelfUpdate(): String =
-        client.post("$baseUrl/api/control/self-update").body<MessageResult>().message
+        client.post("$baseUrl/api/control/self-update").orThrow().body<MessageResult>().message
 
     /** events streams the node's raw+grouped SSE feed (all sessions). */
     fun events(node: String): Flow<Event> = sseFrames("$baseUrl/api/nodes/${node.enc()}/events")
 
     /** sseFrames reads an SSE endpoint, parsing each `data:` frame into an Event. */
     private fun sseFrames(url: String): Flow<Event> = flow {
-        client.prepareGet(url).execute { resp ->
+        client.prepareGet(url) {
+            // A quiet stream is not a stuck request — the client's unary 30s
+            // bound must not apply here (reconnect loops live in the callers).
+            timeout { requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS }
+        }.execute { resp ->
             val ch = resp.bodyAsChannel()
             while (true) {
                 val line = ch.readUTF8Line() ?: break

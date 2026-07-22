@@ -50,6 +50,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -178,12 +179,16 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
                 nodeId != null -> {
                     val n = nodes.firstOrNull { it.node_id == nodeId }
                     if (n == null) Box(Modifier.padding(12.dp)) { HintText("Node not found.") }
-                    else NodeInspector(
-                        api, n,
-                        onConfigureHarness = { configBackend = it },
-                        onChanged = { reload++ },
-                        onRemoved = { selected = null; reload++ },
-                    )
+                    // key() drops ALL per-entity inspector state (text fields,
+                    // status lines, armed confirms) the moment selection moves.
+                    else key(nodeId) {
+                        NodeInspector(
+                            api, n,
+                            onConfigureHarness = { configBackend = it },
+                            onChanged = { reload++ },
+                            onRemoved = { selected = null; reload++ },
+                        )
+                    }
                 }
             }
         },
@@ -418,7 +423,7 @@ private fun NodeInspector(
                 }
             }
             PanelSection("Danger") {
-                ConfirmButton("Remove node") {
+                ConfirmButton("Remove node", targetKey = n.node_id) {
                     scope.launch {
                         runCatching { api.removeNode(n.node_id) }
                             .onSuccess { onRemoved() }
@@ -810,12 +815,16 @@ internal fun UsersScreen(api: Api, me: Me, onOpenNode: (String) -> Unit) {
             else selected?.let { id ->
                 val u = users.firstOrNull { it.user == id }
                 if (u == null) Box(Modifier.padding(12.dp)) { HintText("User not found.") }
-                else UserInspector(
-                    api, u, me,
-                    onOpenNode = onOpenNode,
-                    onChanged = { reload++ },
-                    onDeleted = { selected = null; reload++ },
-                )
+                // key() drops ALL per-entity inspector state (text fields,
+                // status lines, armed confirms) the moment selection moves.
+                else key(id) {
+                    UserInspector(
+                        api, u, me,
+                        onOpenNode = onOpenNode,
+                        onChanged = { reload++ },
+                        onDeleted = { selected = null; reload++ },
+                    )
+                }
             }
         },
     )
@@ -921,7 +930,7 @@ private fun UserInspector(
         }
         if (u.user != me.user) {
             PanelSection("Danger") {
-                ConfirmButton("Delete user") {
+                ConfirmButton("Delete user", targetKey = u.user) {
                     scope.launch {
                         runCatching { api.deleteUser(u.user) }
                             .onSuccess { onDeleted() }
@@ -987,12 +996,17 @@ internal fun AuditScreen(api: Api) {
     // new limit) in the background.
     var recs by remember { mutableStateOf(FleetCache.audit.value.orEmpty()) }
     var loading by remember { mutableStateOf(FleetCache.audit.value == null) }
+    var error by remember { mutableStateOf<String?>(null) }
     var reload by remember { mutableStateOf(0) }
     var query by remember { mutableStateOf("") }
     var limit by remember { mutableStateOf(300) }
     LaunchedEffect(reload, limit) {
         if (recs.isEmpty()) loading = true
-        runCatching { api.audit(limit) }.onSuccess { recs = it; FleetCache.audit.value = it }
+        // A failed fetch must not masquerade as an empty log: keep whatever was
+        // last shown and surface the error instead.
+        runCatching { api.audit(limit) }
+            .onSuccess { recs = it; FleetCache.audit.value = it; error = null }
+            .onFailure { error = it.message ?: "audit fetch failed" }
         loading = false
     }
     val filtered = remember(recs, query) { filterAudit(recs, query) }
@@ -1005,10 +1019,15 @@ internal fun AuditScreen(api: Api) {
                 Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
+        error?.let { ErrorRow(it, onRetry = { reload++ }) }
         when {
             loading -> PaneLoader()
-            filtered.isEmpty() -> Box(Modifier.padding(12.dp)) {
-                HintText(if (recs.isEmpty()) "No audit records yet." else "No matches.")
+            filtered.isEmpty() -> when {
+                recs.isNotEmpty() -> Box(Modifier.padding(12.dp)) { HintText("No matches.") }
+                // "No records" is only a fact when a fetch succeeded with zero
+                // records; on failure the ErrorRow above is the whole truth.
+                error == null -> Box(Modifier.padding(12.dp)) { HintText("No audit records yet.") }
+                else -> {}
             }
             else -> LazyColumn(
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),

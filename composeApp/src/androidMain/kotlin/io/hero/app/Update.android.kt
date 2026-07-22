@@ -3,7 +3,6 @@ package io.hero.app
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.FileProvider
-import io.ktor.client.HttpClient
 import io.ktor.client.request.header
 import io.ktor.client.request.prepareGet
 import io.ktor.client.statement.bodyAsChannel
@@ -19,7 +18,8 @@ actual fun updateAssetSuffix(): String = ".apk"
 
 actual suspend fun installUpdate(info: UpdateInfo, onProgress: (Long, Long?) -> Unit): String {
     val ctx = appContext ?: return "no app context"
-    val client = HttpClient()
+    // No HttpTimeout: the download is progress-streamed and may take minutes.
+    val client = heroHttpClient()
     try {
         val out = File(ctx.cacheDir, "hero-update.apk")
         client.prepareGet(info.downloadUrl) {
