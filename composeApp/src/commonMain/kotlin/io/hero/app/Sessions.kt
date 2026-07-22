@@ -173,11 +173,13 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         catModels = emptyList(); catEffortLevels = emptyList()
         val n = sel.node
         if (n != null && backend.isNotEmpty()) {
-            runCatching { api.harness(n).backends.firstOrNull { it.backend == backend }?.catalog }
-                .getOrNull()?.let { c ->
-                    catModels = c.models.filter { !it.hidden }
-                    catEffortLevels = c.effort_levels
-                }
+            // Cache-first so opening a session is instant; refresh in the background.
+            val hs = FleetCache.harness[n]
+                ?: runCatching { api.harness(n) }.getOrNull()?.also { FleetCache.harness[n] = it }
+            hs?.backends?.firstOrNull { it.backend == backend }?.catalog?.let { c ->
+                catModels = c.models.filter { !it.hidden }
+                catEffortLevels = c.effort_levels
+            }
         }
     }
 
@@ -240,9 +242,12 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     }
 
     if (showStart && sel.node != null) {
-        StartSessionDialog(api, sel.node!!, onDismiss = { showStart = false }) {
+        StartSessionDialog(api, sel.node!!, onDismiss = { showStart = false }) { newID ->
             showStart = false
             sessionsReload++
+            // Jump straight into the new session instead of leaving the user on the
+            // list wondering whether it worked.
+            if (newID.isNotEmpty()) onSel(sel.copy(session = newID, drill = emptyList()))
         }
     }
 
@@ -705,7 +710,7 @@ private fun ConversationPane(
             pend.filter { it.session_id == sessionKey }.forEach { p ->
                 PendingBar(p) { behavior -> onRespond(p, behavior) }
             }
-            InputBar(input, onInput, onSend, switchModels, effortLevels, model, onModel, effort, onEffort)
+            InputBar(input, onInput, onSend, switchModels, effortLevels, model, onModel, effort, onEffort, backend)
         }
     }
 }
@@ -935,18 +940,20 @@ private fun InputBar(
     switchModels: List<HarnessModel> = emptyList(), effortLevels: List<String> = emptyList(),
     model: String = "", onModel: (String) -> Unit = {},
     effort: String = "", onEffort: (String) -> Unit = {},
+    backend: String = "",
 ) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
-            // Mid-conversation switcher: pick a model (same backend) and, for a
-            // backend with a reasoning knob, an effort (its OWN levels) — applied to
-            // the next message.
+            // Mid-conversation switcher: pick a model (same backend, with its logo)
+            // and, for a backend with a reasoning knob, an effort (its OWN levels) —
+            // applied to the next message.
             if (switchModels.isNotEmpty()) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     PickerChip(
                         "model: " + model.ifEmpty { "current" },
                         listOf("" to "current") + switchModels.map { it.slug to it.label.ifEmpty { it.slug } },
                         onModel,
+                        backend = backend,
                     )
                     if (effortLevels.isNotEmpty()) {
                         PickerChip(
@@ -969,17 +976,34 @@ private fun InputBar(
 }
 
 // PickerChip is a compact label + dropdown for the composer's model/effort switch.
+// When backend is set, each option (and the chip) is prefixed with that backend's
+// logo — the "Claude/Codex logo on the left" of the model picker.
 @Composable
-private fun PickerChip(label: String, options: List<Pair<String, String>>, onSelect: (String) -> Unit) {
+private fun PickerChip(label: String, options: List<Pair<String, String>>, onSelect: (String) -> Unit, backend: String = "") {
     var open by remember { mutableStateOf(false) }
     Box {
         TextButton(onClick = { open = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+            if (backend.isNotEmpty()) {
+                BackendMark(backend, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(4.dp))
+            }
             Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1)
             Icon(Icons.Filled.ArrowDropDown, contentDescription = null, modifier = Modifier.size(16.dp))
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             options.forEach { (v, l) ->
-                DropdownMenuItem(text = { Text(l) }, onClick = { onSelect(v); open = false })
+                DropdownMenuItem(
+                    text = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (backend.isNotEmpty() && v.isNotEmpty()) {
+                                BackendMark(backend, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Spacer(Modifier.width(6.dp))
+                            }
+                            Text(l)
+                        }
+                    },
+                    onClick = { onSelect(v); open = false },
+                )
             }
         }
     }

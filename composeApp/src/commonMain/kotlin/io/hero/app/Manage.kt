@@ -1175,18 +1175,19 @@ internal fun ControlScreen(api: Api) {
 // Start session dialog (used by SessionsScreen)
 // ============================================================================
 @Composable
-internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, onStarted: () -> Unit) {
+internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, onStarted: (String) -> Unit) {
     val scope = rememberCoroutineScope()
     var cwd by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
     var model by remember { mutableStateOf("") }
-    var models by remember { mutableStateOf<List<HarnessModel>>(emptyList()) }
+    // (backend, model) so each option can show its backend logo.
+    var models by remember { mutableStateOf<List<Pair<String, HarnessModel>>>(emptyList()) }
     var modelMenu by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(node) {
-        runCatching {
-            api.harness(node).backends.flatMap { it.catalog.models }.filter { !it.hidden }
-        }.onSuccess { models = it }
+        val hs = FleetCache.harness[node]
+            ?: runCatching { api.harness(node) }.getOrNull()?.also { FleetCache.harness[node] = it }
+        models = hs?.backends?.flatMap { b -> b.catalog.models.filter { !it.hidden }.map { b.backend to it } }.orEmpty()
     }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1199,7 +1200,18 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
                     OutlinedTextField(model, { model = it }, Modifier.fillMaxWidth(), label = { Text("Model (blank = default)") }, singleLine = true,
                         trailingIcon = { IconButton(onClick = { modelMenu = true }) { Icon(Icons.Filled.ArrowDropDown, contentDescription = "Pick model") } })
                     DropdownMenu(expanded = modelMenu, onDismissRequest = { modelMenu = false }) {
-                        models.forEach { m -> DropdownMenuItem(text = { Text(m.label.ifEmpty { m.slug }) }, onClick = { model = m.slug; modelMenu = false }) }
+                        models.forEach { (b, m) ->
+                            DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        BackendMark(b, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(m.label.ifEmpty { m.slug })
+                                    }
+                                },
+                                onClick = { model = m.slug; modelMenu = false },
+                            )
+                        }
                     }
                 }
                 Spacer(Modifier.height(8.dp))
@@ -1211,7 +1223,7 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
             TextButton(onClick = {
                 scope.launch {
                     runCatching { api.startSession(node, StartSessionReq(cwd.trim(), msg, model)) }
-                        .onSuccess { onStarted() }.onFailure { status = it.message }
+                        .onSuccess { onStarted(it) }.onFailure { status = it.message }
                 }
             }) { Text("Start") }
         },
