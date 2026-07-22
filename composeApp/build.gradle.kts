@@ -58,8 +58,8 @@ android {
         applicationId = "io.hero.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 12
-        versionName = "0.5.6"
+        versionCode = 13
+        versionName = "0.5.7"
     }
     // Signing secrets never live in the repo. Locally, put them in a gitignored
     // keystore.properties at the project root; in CI, provide them via env
@@ -106,6 +106,11 @@ android {
 compose.desktop {
     application {
         mainClass = "io.hero.app.MainKt"
+        // OkHttp pulls in optional TLS providers / Android classes the desktop JVM
+        // lacks; without these -dontwarn rules the release ProGuard pass fails.
+        buildTypes.release.proguard {
+            configurationFiles.from(project.file("proguard-desktop.pro"))
+        }
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "HERO"
