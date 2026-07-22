@@ -1267,17 +1267,24 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                OutlinedTextField(msg, { msg = it }, Modifier.fillMaxWidth(), label = { Text("Initial message (optional)") })
+                // A session IS its first turn — the node needs both a cwd and a
+                // first message to spawn the CLI, so both are required (not optional).
+                OutlinedTextField(msg, { msg = it }, Modifier.fillMaxWidth(), label = { Text("First message") })
                 status?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
         },
         confirmButton = {
-            TextButton(onClick = {
-                scope.launch {
-                    runCatching { api.startSession(node, StartSessionReq(cwd.trim(), msg, model)) }
-                        .onSuccess { onStarted(it) }.onFailure { status = it.message }
-                }
-            }) { Text("Start") }
+            TextButton(
+                enabled = cwd.isNotBlank() && msg.isNotBlank(),
+                onClick = {
+                    scope.launch {
+                        status = null
+                        runCatching { api.startSession(node, StartSessionReq(cwd.trim(), msg, model)) }
+                            .onSuccess { if (it.isNotEmpty()) onStarted(it) else status = "create failed" }
+                            .onFailure { status = it.message }
+                    }
+                },
+            ) { Text("Start") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )

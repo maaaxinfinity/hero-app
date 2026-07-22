@@ -13,6 +13,7 @@ import io.ktor.client.request.prepareGet
 import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsChannel
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.contentType
@@ -99,6 +100,12 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun startSession(node: String, req: StartSessionReq): String {
         val resp = client.post("$baseUrl/api/nodes/${node.enc()}/sessions") {
             contentType(ContentType.Application.Json); setBody(req)
+        }
+        // Surface the node's validation error (e.g. "cwd is required",
+        // "initial_message: text is required") instead of silently returning "".
+        if (!resp.status.isSuccess()) {
+            val msg = runCatching { resp.bodyAsText() }.getOrNull()?.trim()?.ifBlank { null }
+            throw IllegalStateException(msg ?: "create failed (${resp.status.value})")
         }
         return runCatching { resp.body<Map<String, String>>()["id"] ?: "" }.getOrDefault("")
     }
