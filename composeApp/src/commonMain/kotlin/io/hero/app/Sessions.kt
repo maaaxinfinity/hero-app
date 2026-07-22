@@ -156,10 +156,11 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
 
     // Backend tag for the open session — drives the harness icon only, never parsing.
     // Subagents share their parent's harness, so the root session's tag applies.
-    val rootSession = sessions.firstOrNull { it.id == sel.session }
+    // Memoized on (sessions, sel.session): without this the whole list is
+    // rescanned twice on every live frame (each part/status recomposes here).
+    val rootSession = remember(sessions, sel.session) { sessions.firstOrNull { it.id == sel.session } }
     val backend = rootSession?.backend.orEmpty()
-    val title = sessions.firstOrNull { it.id == sel.session }?.let { it.title.ifEmpty { it.id } }
-        ?: sel.session.orEmpty()
+    val title = rootSession?.let { it.title.ifEmpty { it.id } } ?: sel.session.orEmpty()
     val active = sel.active
     val readonly = sel.readonly
 
@@ -444,7 +445,9 @@ private fun SessionInspector(
                 }
             }
         }
-        val children = collectChildSessions(turns)
+        // Memoized: scans every loaded turn/part; the inspector recomposes on
+        // each live frame and every pending-poll tick.
+        val children = remember(turns) { collectChildSessions(turns) }
         if (children.isNotEmpty()) {
             PanelSection("Subagents") {
                 children.forEach { (label, id) -> LinkRow(label) { onOpenChild(id) } }
@@ -662,6 +665,9 @@ private fun ConversationPane(
             }
         }
         val hasEarlier = convo.cursor?.hasMore == true
+        // Hoisted out of the LazyColumn builder + memoized: it scans every loaded
+        // turn, and the builder re-runs on each recomposition (every live frame).
+        val keys = remember(convo.turns) { displayKeys(convo.turns) }
         LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp), state = listState) {
             if (hasEarlier) {
                 item(key = "load-earlier") {
@@ -700,7 +706,6 @@ private fun ConversationPane(
                     }
                 }
             }
-            val keys = displayKeys(convo.turns)
             itemsIndexed(convo.turns, key = { i, _ -> keys[i] }) { _, turn ->
                 TurnView(turn, backend, onOpenChild = onOpenChild)
             }

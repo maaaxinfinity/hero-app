@@ -115,9 +115,16 @@ fun ConvoState.prepend(page: List<Turn>, total: Int, start: Int): ConvoState =
         cursor = Cursor(total, start, cursor?.pageSize ?: page.size.coerceAtLeast(1)),
     )
 
-/** turnKey is a stable LazyColumn key: assistant turns key on uuid (survives part
- *  appends); others on role+ts with a size tiebreaker for same-ts collisions. */
-fun turnKey(t: Turn): Any = t.uuid ?: "${t.role}:${t.ts}:${t.content?.length ?: t.parts.size}"
+/** turnKey is a stable LazyColumn key. Assistant turns prefer uuid (assigned at
+ *  exit); before that they key on role+ts ONLY — never parts.size, which grows on
+ *  every streamed part and would rebuild the live row (losing tool-card expand
+ *  state and scroll) on each append. Non-assistant turns have settled content, so
+ *  a length tiebreaker is stable. displayKeys disambiguates same-ts collisions. */
+fun turnKey(t: Turn): Any {
+    t.uuid?.let { return it }
+    return if (t.role == "assistant") "assistant:${t.ts}"
+    else "${t.role}:${t.ts}:${t.content?.length ?: 0}"
+}
 
 /** collectChildSessions lists the subagent transcripts spawned in this
  *  conversation (display label → child session id), in order of first
