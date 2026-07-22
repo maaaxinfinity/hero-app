@@ -1180,31 +1180,83 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
     var cwd by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
     var model by remember { mutableStateOf("") }
-    // (backend, model) so each option can show its backend logo.
-    var models by remember { mutableStateOf<List<Pair<String, HarnessModel>>>(emptyList()) }
+    var backend by remember { mutableStateOf("") }
+    var backends by remember { mutableStateOf<List<String>>(emptyList()) }
+    // Per-backend model lists, so the picker filters to the chosen harness.
+    var modelsByBackend by remember { mutableStateOf<Map<String, List<HarnessModel>>>(emptyMap()) }
+    var cwds by remember { mutableStateOf<List<String>>(emptyList()) }
+    var backendMenu by remember { mutableStateOf(false) }
     var modelMenu by remember { mutableStateOf(false) }
+    var cwdMenu by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(node) {
         val hs = FleetCache.harness[node]
             ?: runCatching { api.harness(node) }.getOrNull()?.also { FleetCache.harness[node] = it }
-        models = hs?.backends?.flatMap { b -> b.catalog.models.filter { !it.hidden }.map { b.backend to it } }.orEmpty()
+        val bs = hs?.backends.orEmpty()
+        backends = bs.map { it.backend }
+        modelsByBackend = bs.associate { it.backend to it.catalog.models.filter { m -> !m.hidden } }
+        if (backend.isEmpty()) backend = backends.firstOrNull().orEmpty()
+        // Recent working directories from this node's existing sessions — a derived
+        // pick-list, not a filesystem browse (HERO never browses the machine). Free
+        // text still works for a brand-new path.
+        cwds = (FleetCache.sessions[node] ?: runCatching { api.sessions(node) }.getOrNull().orEmpty())
+            .map { it.cwd }.filter { it.isNotBlank() }.distinct().sorted()
     }
+    val models = modelsByBackend[backend].orEmpty()
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("New session on $node") },
         text = {
             Column {
-                OutlinedTextField(cwd, { cwd = it }, Modifier.fillMaxWidth(), label = { Text("Working directory") }, singleLine = true)
+                // Harness selector (only when the node has more than one).
+                if (backends.size > 1) {
+                    Box {
+                        OutlinedTextField(
+                            backend, {}, Modifier.fillMaxWidth(), readOnly = true, label = { Text("Harness") }, singleLine = true,
+                            trailingIcon = { IconButton(onClick = { backendMenu = true }) { Icon(Icons.Filled.ArrowDropDown, contentDescription = "Pick harness") } },
+                        )
+                        DropdownMenu(expanded = backendMenu, onDismissRequest = { backendMenu = false }) {
+                            backends.forEach { b ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            BackendMark(b, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Spacer(Modifier.width(6.dp)); Text(b)
+                                        }
+                                    },
+                                    onClick = { backend = b; model = ""; backendMenu = false },
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+                // Working directory: free text + a dropdown of this node's known dirs.
+                Box {
+                    OutlinedTextField(
+                        cwd, { cwd = it }, Modifier.fillMaxWidth(), label = { Text("Working directory") }, singleLine = true,
+                        trailingIcon = if (cwds.isEmpty()) null else {
+                            { IconButton(onClick = { cwdMenu = true }) { Icon(Icons.Filled.ArrowDropDown, contentDescription = "Pick a recent directory") } }
+                        },
+                    )
+                    DropdownMenu(expanded = cwdMenu, onDismissRequest = { cwdMenu = false }) {
+                        cwds.forEach { c -> DropdownMenuItem(text = { Text(c, maxLines = 1) }, onClick = { cwd = c; cwdMenu = false }) }
+                    }
+                }
                 Spacer(Modifier.height(8.dp))
+                // Model — filtered to the chosen harness, with its logo + friendly label.
                 Box {
                     OutlinedTextField(model, { model = it }, Modifier.fillMaxWidth(), label = { Text("Model (blank = default)") }, singleLine = true,
                         trailingIcon = { IconButton(onClick = { modelMenu = true }) { Icon(Icons.Filled.ArrowDropDown, contentDescription = "Pick model") } })
                     DropdownMenu(expanded = modelMenu, onDismissRequest = { modelMenu = false }) {
-                        models.forEach { (b, m) ->
+                        if (models.isEmpty()) {
+                            DropdownMenuItem(text = { Text("(no models listed — type one, or blank for default)") }, onClick = { modelMenu = false }, enabled = false)
+                        }
+                        models.forEach { m ->
                             DropdownMenuItem(
                                 text = {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        BackendMark(b, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        BackendMark(backend, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                         Spacer(Modifier.width(6.dp))
                                         Text(m.label.ifEmpty { m.slug })
                                     }
