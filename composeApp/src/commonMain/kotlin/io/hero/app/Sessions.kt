@@ -134,12 +134,15 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     val scope = rememberCoroutineScope()
     // Sidebar collapse survives restarts (a workspace-layout choice, not UI froth).
     var collapsed by remember { mutableStateOf(settings.getString(Keys.SidebarCollapsed) == "1") }
-    var nodes by remember { mutableStateOf<List<NodeView>>(emptyList()) }
+    // Nodes render straight from the fleet cache (fed here and by the badge
+    // poll) — re-entering the tab shows data instantly, no spinner.
+    val cachedNodes by FleetCache.nodes
+    val nodes = cachedNodes?.filter { it.connected } ?: emptyList()
+    val nodesLoading = cachedNodes == null
     var sessions by remember { mutableStateOf<List<Session>>(emptyList()) }
     var convo by remember { mutableStateOf(ConvoState()) }
     var pend by remember { mutableStateOf<List<Pending>>(emptyList()) }
     var input by remember { mutableStateOf("") }
-    var nodesLoading by remember { mutableStateOf(true) }
     var sessionsLoading by remember { mutableStateOf(false) }
     var nodesError by remember { mutableStateOf<String?>(null) }
     var sessionsError by remember { mutableStateOf<String?>(null) }
@@ -158,24 +161,28 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     val readonly = sel.readonly
 
     // Node and session lists poll quietly (cheap GETs) so they stay live
-    // without pull-to-refresh; a failure only surfaces when there is nothing
-    // usable on screen, and Retry bumps the reload key.
+    // without pull-to-refresh; results land in FleetCache so revisits are
+    // instant. A failure only surfaces when there is nothing usable on screen,
+    // and Retry bumps the reload key.
     LaunchedEffect(nodesReload) {
         while (isActive) {
-            runCatching { api.nodes().filter { it.connected } }
-                .onSuccess { nodes = it; nodesError = null }
-                .onFailure { if (nodes.isEmpty()) nodesError = it.message ?: "couldn't load nodes" }
-            nodesLoading = false
+            runCatching { api.nodes() }
+                .onSuccess { FleetCache.nodes.value = it; nodesError = null }
+                .onFailure { if (FleetCache.nodes.value == null) nodesError = it.message ?: "couldn't load nodes" }
             delay(15_000)
         }
     }
     LaunchedEffect(sel.node, sessionsReload) {
         val n = sel.node
         if (n == null) { sessions = emptyList(); sessionsError = null; return@LaunchedEffect }
-        sessionsLoading = true; sessions = emptyList(); sessionsError = null
+        // Cached page first — the spinner is reserved for a truly cold node.
+        val cached = FleetCache.sessions[n]
+        sessions = cached.orEmpty()
+        sessionsLoading = cached == null
+        sessionsError = null
         while (isActive) {
             runCatching { api.sessions(n) }
-                .onSuccess { sessions = it; sessionsError = null }
+                .onSuccess { sessions = it; FleetCache.sessions[n] = it; sessionsError = null }
                 .onFailure { if (sessions.isEmpty()) sessionsError = it.message ?: "couldn't load sessions" }
             sessionsLoading = false
             delay(10_000)
@@ -252,7 +259,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
             onSelectNode = { onSel(SessionSel(node = it)) },
             onSelectSession = { onSel(sel.copy(session = it, drill = emptyList())) },
             onNewSession = { showStart = true },
-            onRetryNodes = { nodesError = null; nodesLoading = true; nodesReload++ },
+            onRetryNodes = { nodesError = null; nodesReload++ },
             onRetrySessions = { sessionsReload++ },
             collapsed = rail, onToggleCollapse = onToggle,
             modifier = m,

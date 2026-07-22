@@ -45,16 +45,18 @@ fun SectionGlyph(section: Section, modifier: Modifier = Modifier, tint: Color) {
     }
 }
 
-// Chat bubble: rounded outline with a tail off the lower left.
+// Terminal: window outline, prompt chevron, input line — the workspace is
+// where you drive coding agents, not a chat app.
 private fun DrawScope.sessionsGlyph(tint: Color) {
     drawRoundRect(
-        color = tint, topLeft = Offset(3.5f, 4.5f), size = Size(17f, 12f),
-        cornerRadius = CornerRadius(3.5f, 3.5f), style = lineStroke(),
+        color = tint, topLeft = Offset(3f, 4.5f), size = Size(18f, 15f),
+        cornerRadius = CornerRadius(2.5f, 2.5f), style = lineStroke(),
     )
-    val tail = Path().apply {
-        moveTo(7.5f, 16.5f); lineTo(7.5f, 20.5f); lineTo(11.6f, 16.5f)
+    val prompt = Path().apply {
+        moveTo(6.8f, 9.4f); lineTo(10f, 12f); lineTo(6.8f, 14.6f)
     }
-    drawPath(tail, tint, style = lineStroke())
+    drawPath(prompt, tint, style = lineStroke())
+    drawLine(tint, Offset(12.4f, 15.6f), Offset(17.2f, 15.6f), LINE, StrokeCap.Round)
 }
 
 // Two stacked machines, each with a status dot.

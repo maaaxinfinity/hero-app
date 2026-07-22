@@ -58,8 +58,8 @@ android {
         applicationId = "io.hero.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 7
-        versionName = "0.5.1"
+        versionCode = 8
+        versionName = "0.5.2"
     }
     // Signing secrets never live in the repo. Locally, put them in a gitignored
     // keystore.properties at the project root; in CI, provide them via env

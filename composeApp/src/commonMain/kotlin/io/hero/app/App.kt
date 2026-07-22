@@ -58,6 +58,9 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -150,6 +153,7 @@ private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (T
                     },
                     onSignOut = {
                         api = null; me = Me()
+                        FleetCache.clear()
                         settings.remove(Keys.Cookie); settings.remove(Keys.Remember)
                     },
                 )
@@ -335,14 +339,19 @@ private fun MainScreen(
 
     // Fleet-wide attention signal: any pending permission request on any
     // connected node lights the dock's Sessions badge (agents block on these).
+    // The node fetch feeds FleetCache (so every screen stays fresh for free)
+    // and the per-node pending probes run concurrently, not as a waterfall.
     var attention by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         while (isActive) {
             runCatching {
-                val connected = api.nodes().filter { it.connected }
-                attention = connected.any { n ->
-                    runCatching { api.pending(n.node_id).isNotEmpty() }.getOrDefault(false)
-                }
+                val ns = api.nodes()
+                FleetCache.nodes.value = ns
+                attention = coroutineScope {
+                    ns.filter { it.connected }.map { n ->
+                        async { runCatching { api.pending(n.node_id).isNotEmpty() }.getOrDefault(false) }
+                    }.awaitAll()
+                }.any { it }
             }
             delay(7000)
         }
@@ -421,8 +430,8 @@ internal fun HintText(text: String) {
 
 @Composable
 internal fun PaneLoader() {
-    Box(Modifier.fillMaxWidth().height(72.dp), contentAlignment = Alignment.Center) {
-        ParticleLoader(tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(64.dp))
+    Box(Modifier.fillMaxWidth().height(64.dp), contentAlignment = Alignment.Center) {
+        InlineSpinner(size = 20.dp)
     }
 }
 

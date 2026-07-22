@@ -195,6 +195,8 @@ data class HarnessCatalog(
     val custom_provider: Boolean = false,
     val provider_name: String = "",
     val base_url: String = "",
+    val supports_effort: Boolean = false,
+    val live_error: String = "",
 )
 
 @Serializable

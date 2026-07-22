@@ -76,17 +76,20 @@ import kotlinx.serialization.json.put
 // ============================================================================
 @Composable
 internal fun NodesScreen(api: Api, me: Me, focus: String? = null, onFocusConsumed: () -> Unit = {}) {
-    var nodes by remember { mutableStateOf<List<NodeView>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    // Cache-first: the list renders instantly from FleetCache (kept warm by the
+    // dock's badge poll); entering the tab refreshes it in the background.
+    val cached by FleetCache.nodes
+    val nodes = cached.orEmpty()
+    val loading = cached == null
     var reload by remember { mutableStateOf(0) }
     var status by remember { mutableStateOf<String?>(null) }
     var selected by remember { mutableStateOf<String?>(null) }
     var joinMode by remember { mutableStateOf(false) }
 
     LaunchedEffect(reload) {
-        loading = true
-        runCatching { nodes = api.nodes() }.onFailure { status = it.message }
-        loading = false
+        runCatching { api.nodes() }
+            .onSuccess { FleetCache.nodes.value = it; status = null }
+            .onFailure { status = it.message }
     }
     // Cross-section focus (a user's "owns"/"shared" link): select once, then clear.
     LaunchedEffect(focus) {
@@ -433,11 +436,18 @@ private fun HarnessBackendCard(
                     }
                 }
             }
+            if (cat.live_error.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "⚠ model listing failed — showing built-in defaults (${cat.live_error})",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+                )
+            }
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
                 effort, { effort = it }, Modifier.fillMaxWidth(),
-                label = { Text(if (b.backend == "codex") "Default effort (e.g. low/medium/high)" else "Default effort (codex only)") },
-                singleLine = true, enabled = b.backend == "codex",
+                label = { Text(if (cat.supports_effort) "Default effort (e.g. low/medium/high)" else "Default effort (not supported)") },
+                singleLine = true, enabled = cat.supports_effort,
             )
             Spacer(Modifier.height(6.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -449,7 +459,7 @@ private fun HarnessBackendCard(
                 OutlinedButton(enabled = !pullManaged, onClick = {
                     scope.launch {
                         // Rebuild the whole harness.json with this backend's slice merged in.
-                        val next = buildMergedConfig(api, nodeId, b.backend, model, if (b.backend == "codex") effort else "", autoUpd)
+                        val next = buildMergedConfig(api, nodeId, b.backend, model, if (cat.supports_effort) effort else "", autoUpd)
                         runCatching {
                             api.setHarnessConfig(nodeId, next)
                             onResult(api.harnessApply(nodeId, b.backend))
@@ -487,17 +497,25 @@ private suspend fun buildMergedConfig(api: Api, nodeId: String, backend: String,
 // ============================================================================
 @Composable
 internal fun UsersScreen(api: Api, me: Me, onOpenNode: (String) -> Unit) {
-    var users by remember { mutableStateOf<List<UserInfo>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    // Cache-first, like Nodes: instant render on re-entry, background refresh.
+    val cached by FleetCache.users
+    val users = cached.orEmpty()
+    val loading = cached == null
     var reload by remember { mutableStateOf(0) }
     var status by remember { mutableStateOf<String?>(null) }
     var selected by remember { mutableStateOf<String?>(null) }
     var createMode by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
 
     LaunchedEffect(reload) {
-        loading = true
-        runCatching { users = api.users() }.onFailure { status = it.message }
-        loading = false
+        runCatching { api.users() }
+            .onSuccess { FleetCache.users.value = it; status = null }
+            .onFailure { status = it.message }
+    }
+
+    val filtered = remember(users, query) {
+        val q = query.trim().lowercase()
+        if (q.isEmpty()) users else users.filter { it.user.lowercase().contains(q) }
     }
 
     InspectorHost(
@@ -507,7 +525,8 @@ internal fun UsersScreen(api: Api, me: Me, onOpenNode: (String) -> Unit) {
         main = {
             Column(Modifier.fillMaxSize()) {
                 TopToolbar("Users") {
-                    Spacer(Modifier.weight(1f))
+                    ToolbarSearchField(query, { query = it }, Modifier.weight(1f), placeholder = "Filter users…")
+                    Spacer(Modifier.width(8.dp))
                     IconButton(onClick = { reload++ }) {
                         Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -521,11 +540,20 @@ internal fun UsersScreen(api: Api, me: Me, onOpenNode: (String) -> Unit) {
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
                 }
+                if (users.isNotEmpty()) {
+                    Text(
+                        "${users.size} users · ${users.count { it.admin }} admins",
+                        fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                    )
+                }
                 when {
                     loading -> PaneLoader()
-                    users.isEmpty() -> Box(Modifier.padding(12.dp)) { HintText("No users.") }
-                    else -> LazyColumn(contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)) {
-                        items(users, key = { it.user }) { u ->
+                    filtered.isEmpty() -> Box(Modifier.padding(12.dp)) {
+                        HintText(if (users.isEmpty()) "No users." else "No matches.")
+                    }
+                    else -> LazyColumn(contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+                        items(filtered, key = { it.user }) { u ->
                             UserRow(u, selected = selected == u.user) {
                                 createMode = false
                                 selected = if (selected == u.user) null else u.user
@@ -713,20 +741,22 @@ internal fun filterAudit(records: List<AuditRecord>, query: String): List<AuditR
 
 @Composable
 internal fun AuditScreen(api: Api) {
-    var recs by remember { mutableStateOf<List<AuditRecord>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    // Cache-first: show the last fetch instantly, refresh (or re-fetch at the
+    // new limit) in the background.
+    var recs by remember { mutableStateOf(FleetCache.audit.value.orEmpty()) }
+    var loading by remember { mutableStateOf(FleetCache.audit.value == null) }
     var reload by remember { mutableStateOf(0) }
     var query by remember { mutableStateOf("") }
     var limit by remember { mutableStateOf(300) }
     LaunchedEffect(reload, limit) {
-        loading = true
-        runCatching { recs = api.audit(limit) }
+        if (recs.isEmpty()) loading = true
+        runCatching { api.audit(limit) }.onSuccess { recs = it; FleetCache.audit.value = it }
         loading = false
     }
     val filtered = remember(recs, query) { filterAudit(recs, query) }
     Column(Modifier.fillMaxSize()) {
         TopToolbar("Audit") {
-            ToolbarSearchField(query, { query = it }, Modifier.weight(1f))
+            ToolbarSearchField(query, { query = it }, Modifier.weight(1f), placeholder = "Filter action / user / node…")
             Spacer(Modifier.width(8.dp))
             LimitPicker(limit) { limit = it }
             IconButton(onClick = { reload++ }) {
@@ -762,7 +792,11 @@ internal fun AuditScreen(api: Api) {
 // ToolbarSearchField: compact filter input for toolbars (OutlinedTextField's
 // 56dp minimum doesn't fit a 44dp bar).
 @Composable
-private fun ToolbarSearchField(value: String, onChange: (String) -> Unit, modifier: Modifier = Modifier) {
+private fun ToolbarSearchField(
+    value: String, onChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: String = "Filter…",
+) {
     BasicTextField(
         value, onChange,
         modifier = modifier,
@@ -776,7 +810,7 @@ private fun ToolbarSearchField(value: String, onChange: (String) -> Unit, modifi
                     .padding(horizontal = 9.dp, vertical = 5.dp),
             ) {
                 if (value.isEmpty()) {
-                    Text("Filter action / user / node…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(placeholder, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 inner()
             }

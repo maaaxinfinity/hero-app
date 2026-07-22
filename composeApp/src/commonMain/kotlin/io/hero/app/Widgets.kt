@@ -1,6 +1,12 @@
 package io.hero.app
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
@@ -37,7 +43,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
@@ -153,6 +162,26 @@ internal fun KeyValueRow(key: String, value: String) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurface,
             maxLines = 2, overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+/** InlineSpinner is the quiet in-content loader: a rotating 270° ink arc. The
+ *  particle logo stays reserved for brand moments (boot splash, login). */
+@Composable
+internal fun InlineSpinner(size: Dp = 18.dp, modifier: Modifier = Modifier) {
+    val transition = rememberInfiniteTransition(label = "spin")
+    val angle by transition.animateFloat(
+        0f, 360f,
+        infiniteRepeatable(tween(850, easing = LinearEasing)),
+        label = "angle",
+    )
+    val color = MaterialTheme.colorScheme.onSurfaceVariant
+    Canvas(modifier.size(size)) {
+        drawArc(
+            color = color,
+            startAngle = angle, sweepAngle = 270f, useCenter = false,
+            style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round),
         )
     }
 }

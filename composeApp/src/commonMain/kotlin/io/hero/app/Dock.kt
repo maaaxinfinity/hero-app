@@ -1,8 +1,9 @@
 package io.hero.app
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -36,11 +37,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
-// Dock is the app's one piece of global chrome: a floating pill at the bottom
-// of the window, on both desktop and phones (macOS-dock language: selected item
-// gets a dot under its glyph). Items sit in four functional blocks separated by
-// dividers — workspace | infrastructure | people & permissions | system (the
-// account avatar lives in the system block).
+// Dock is the app's one piece of global chrome: a fixed full-width bar at the
+// bottom of the window, on both desktop and phones (selected item gets a dot
+// under its glyph). Items sit in four functional blocks separated by dividers —
+// workspace | infrastructure | people & permissions | system (the account
+// avatar lives in the system block).
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -51,18 +52,15 @@ fun Dock(
     onSignOut: () -> Unit,
     attention: Boolean = false, // fleet has pending permission requests
 ) {
-    // Admins see all seven items; 40dp cells keep the pill inside a 360dp phone.
+    // Admins see all seven items; 40dp cells keep the row inside a 360dp phone.
     val item = if (LocalWindowWidth.current == WindowWidth.Compact) 40.dp else 44.dp
     val groups = Section.entries.filter { !it.adminOnly || me.admin }.groupBy { it.group }
-    Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), contentAlignment = Alignment.Center) {
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 3.dp,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-        ) {
+    Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
+        Column(Modifier.fillMaxWidth()) {
+            HorizontalDivider()
             Row(
-                Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 5.dp),
+                horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 groups.keys.sorted().forEachIndexed { i, g ->
@@ -128,7 +126,8 @@ private fun DockItem(section: Section, selected: Boolean, badge: Boolean, size: 
 }
 
 // DockAvatar anchors the account menu (identity + sign out); app settings have
-// their own dock item in the same block.
+// their own dock item in the same block. The halo ring marks the account cell
+// apart from plain sections — primary for admins, outline otherwise.
 @Composable
 private fun DockAvatar(me: Me, size: Dp, onSignOut: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
@@ -140,7 +139,14 @@ private fun DockAvatar(me: Me, size: Dp, onSignOut: () -> Unit) {
                 .clickable { menu = true },
             contentAlignment = Alignment.Center,
         ) {
-            Identicon(me.user.ifEmpty { "?" }, size = 24.dp)
+            Box(
+                Modifier.size(30.dp).border(
+                    1.5.dp,
+                    if (me.admin) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                    RoundedCornerShape(8.dp),
+                ),
+            )
+            Identicon(me.user.ifEmpty { "?" }, size = 21.dp)
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
