@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
 
 // AppVersion is compared against the latest GitHub release tag. Bump it before
 // tagging a release so the running app can tell it is out of date.
-const val AppVersion = "0.5.0"
+const val AppVersion = "0.5.1"
 const val Repo = "maaaxinfinity/hero-app"
 
 @Serializable
@@ -29,16 +29,20 @@ private val updaterJson = Json { ignoreUnknownKeys = true }
 // newer than AppVersion and has an asset ending in assetSuffix (.apk / os.jar).
 // No credentials: the release is PUBLIC, so the app hits the anonymous GitHub
 // API and downloads via the public browser_download_url — no token to manage.
+// Returns null ONLY for "genuinely up to date"; every failure mode (network,
+// rate limit, missing asset) THROWS so the UI can say "check failed" instead
+// of lying with "up to date".
 suspend fun checkForUpdate(assetSuffix: String): UpdateInfo? {
     val client = HttpClient { install(ContentNegotiation) { json(updaterJson) } }
     try {
         val r = client.get("https://api.github.com/repos/$Repo/releases/latest") {
             header("Accept", "application/vnd.github+json")
         }
-        if (!r.status.isSuccess()) return null
+        if (!r.status.isSuccess()) error("GitHub API HTTP ${r.status.value}")
         val rel: GhRelease = r.body()
         if (!isNewer(rel.tag_name, AppVersion)) return null
-        val asset = rel.assets.firstOrNull { it.name.endsWith(assetSuffix) && it.browser_download_url.isNotEmpty() } ?: return null
+        val asset = rel.assets.firstOrNull { it.name.endsWith(assetSuffix) && it.browser_download_url.isNotEmpty() }
+            ?: error("release ${rel.tag_name} has no *$assetSuffix asset")
         return UpdateInfo(rel.tag_name.removePrefix("v"), asset.browser_download_url)
     } finally {
         client.close()
@@ -59,8 +63,9 @@ fun isNewer(tag: String, current: String): Boolean {
 }
 
 // installUpdate downloads the public asset and applies it: Android launches the
-// package installer; desktop saves the OS jar and prints how to run it.
-expect suspend fun installUpdate(info: UpdateInfo): String
+// package installer; desktop relaunches onto the new jar. onProgress streams
+// (bytesReceived, totalOrNull) so the UI can show real download progress.
+expect suspend fun installUpdate(info: UpdateInfo, onProgress: (Long, Long?) -> Unit = { _, _ -> }): String
 
 // updateAssetSuffix is the release-asset name suffix this platform installs.
 expect fun updateAssetSuffix(): String

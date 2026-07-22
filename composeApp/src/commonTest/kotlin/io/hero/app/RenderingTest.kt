@@ -81,4 +81,23 @@ class RenderingTest {
         assertTrue(blocks.any { it is MdBlock.Bullet && it.text == "item" })
         assertTrue(blocks.any { it is MdBlock.Ordered && it.text == "first" })
     }
+
+    // Links: the visible text is the label only; the URL rides in an annotation
+    // spanning exactly the label. Unclosed markers still degrade to literals.
+    @Test
+    fun markdownLinkAnnotations() {
+        val out = parseInline(
+            "see [docs](https://example.com/d) now",
+            link = androidx.compose.ui.graphics.Color.Black,
+            codeBg = androidx.compose.ui.graphics.Color.White,
+        )
+        assertEquals("see docs now", out.text)
+        val ann = out.getStringAnnotations(URL_TAG, 0, out.length).single()
+        assertEquals("https://example.com/d", ann.item)
+        assertEquals("docs", out.text.substring(ann.start, ann.end))
+
+        val broken = parseInline("a [label(no-close", androidx.compose.ui.graphics.Color.Black, androidx.compose.ui.graphics.Color.White)
+        assertEquals("a [label(no-close", broken.text)
+        assertTrue(broken.getStringAnnotations(URL_TAG, 0, broken.length).isEmpty())
+    }
 }

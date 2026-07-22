@@ -17,17 +17,54 @@ send messages.
 ```
 composeApp/
   build.gradle.kts               # androidTarget() + jvm("desktop"), signing
-  keystore.jks                    # release signing key (committed; private repo)
+  keystore.jks                    # release signing key (gitignored; CI gets it from secrets)
   src/commonMain/kotlin/io/hero/app/
-    Models.kt   # v1 API data types (NodeView, Session, Event)
-    Api.kt      # Ktor client: login, nodes, sessions, send, events (SSE)
-    App.kt      # Compose UI: login → nodes → sessions → live events + send
-    Update.kt   # in-app updater (checkForUpdate + expect installUpdate)
+    Models.kt      # v1 API data types (NodeView, Session, Turn/TurnPart, Event)
+    Api.kt         # Ktor client: login, nodes, sessions, transcript, send, SSE
+    App.kt         # root: width classes, login, MainScreen chrome, shortcuts
+    Sessions.kt    # Sessions section: sidebar (collapsible), conversation pane
+    Conversation.kt# ConvoState reducer + turn/part renderers (harness-neutral)
+    Dock.kt        # bottom dock: four section blocks + account (all chrome)
+    Panels.kt      # sidebar kit: TopToolbar, InspectorHost, PanelSection
+    Switcher.kt    # Ctrl/Cmd+K quick switcher (fleet-wide session jump)
+    Manage.kt      # Nodes/Users/Audit/Control screens + inspectors
+    Markdown.kt    # minimal markdown renderer (links clickable)
+    Widgets.kt     # shared small controls: Pill, PasswordField, hover, keys
+    Glyphs.kt      # hand-drawn line glyphs (dock marks, password eye)
+    Menus.kt       # expect: right-click context menus (desktop actual)
+    Theme.kt / Brand.kt / ParticleLoader.kt / Identicon.kt  # ink identity
+    Update.kt      # in-app updater (checkForUpdate + expect installUpdate)
   src/androidMain/…               # MainActivity, manifest, FileProvider, APK updater
-  src/desktopMain/kotlin/main.kt  # desktop entry point + per-OS jar updater
+  src/desktopMain/kotlin/main.kt  # desktop entry: window sizing, key routing
 gradle/libs.versions.toml         # version catalog
 .github/workflows/release.yml     # tag v* → build APK + desktop jars → GitHub release
 ```
+
+## UI
+
+One chrome for both form factors: a floating bottom **dock** in four blocks —
+workspace (Sessions) | infrastructure (Nodes, Control plane) | people &
+permissions (Users, Audit) | system (Settings, account) — with a dot under the
+selected glyph; there is no top bar on desktop. Sidebar placement is a
+language: **left navigates** (the Sessions node/session list, collapsible
+240dp ⇄ 52dp rail, `Ctrl/Cmd+B`, persisted), **right inspects** (per-screen
+inspector panels), **top acts on the collection** (toolbars/filters). Below
+600dp the app switches to stacked phone navigation (list ⇄ fullscreen
+conversation ⇄ fullscreen inspector; chrome hides in conversations, predictive
+back unwinds the stack).
+
+Inspectors are wired to real endpoints only: Sessions (`Ctrl/Cmd+I`) shows
+session facts + the node's pending-permission center + subagent drill-ins +
+quick actions; Nodes covers access (share/unshare, transfer ownership),
+per-backend harness config/install and two-click removal, with a join-script
+generator; Users covers password/admin/delete/create, its owns/shared entries
+deep-linking into Nodes. Audit has a live filter and a fetch-limit picker.
+Node and session rows carry the harness marks (claude / codex glyphs),
+connection dots and status; the conversation header shows the runtime model, a
+pulsing row signals thinking/stalled, and "Load earlier" pages the transcript
+backwards. Desktop niceties: hover states, tooltips, right-click menus,
+`Ctrl/Cmd+1..5` section jumps, `Ctrl/Cmd+K` quick switcher, Enter-to-send
+(Shift+Enter for newline).
 
 ## Build & run
 
@@ -50,11 +87,11 @@ GitHub Actions and publishes a release with:
 - `hero-app.apk` — signed Android APK
 - `hero-app-linux.jar` / `hero-app-macos.jar` / `hero-app-windows.jar` — desktop
 
-The login screen has an **Updates** panel: paste a GitHub token (the repo is
-private, so the releases API needs `Bearer` auth), tap **Check**, then
-**Update**. Android downloads the APK and fires the system installer via a
-`FileProvider`; desktop downloads the matching per-OS jar to the temp dir and
-tells you how to launch it. `AppVersion` in `Update.kt` gates "is this newer".
+Settings has an **Updates** section: tap **Check for updates**, then
+**Install**. The release is public, so no token is involved. Android downloads
+the APK and fires the system installer via a `FileProvider`; desktop downloads
+the matching per-OS jar to the temp dir and tells you how to launch it.
+`AppVersion` in `Update.kt` gates "is this newer".
 
 ## Status
 

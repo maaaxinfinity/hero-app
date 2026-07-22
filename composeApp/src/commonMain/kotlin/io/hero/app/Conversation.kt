@@ -1,5 +1,8 @@
 package io.hero.app
 
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -16,6 +19,9 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Surface
@@ -28,6 +34,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
@@ -100,9 +107,47 @@ fun ConvoState.reduce(f: LiveFrame): ConvoState = when (f) {
 fun ConvoState.optimisticUser(text: String): ConvoState =
     copy(turns = turns + Turn(role = "user", content = text), openAssistant = false)
 
+/** prepend inserts an earlier transcript page before the current window and
+ *  advances the cursor. Pure, like reduce. */
+fun ConvoState.prepend(page: List<Turn>, total: Int, start: Int): ConvoState =
+    copy(
+        turns = page + turns,
+        cursor = Cursor(total, start, cursor?.pageSize ?: page.size.coerceAtLeast(1)),
+    )
+
 /** turnKey is a stable LazyColumn key: assistant turns key on uuid (survives part
  *  appends); others on role+ts with a size tiebreaker for same-ts collisions. */
 fun turnKey(t: Turn): Any = t.uuid ?: "${t.role}:${t.ts}:${t.content?.length ?: t.parts.size}"
+
+/** collectChildSessions lists the subagent transcripts spawned in this
+ *  conversation (display label → child session id), in order of first
+ *  appearance, deduped by child id. Pure — feeds the session inspector. */
+fun collectChildSessions(turns: List<Turn>): List<Pair<String, String>> {
+    val out = LinkedHashMap<String, String>()
+    turns.forEach { t ->
+        t.parts.forEach { p ->
+            val child = p.childSessionId
+            if (child != null && child !in out) {
+                out[child] = p.toolTarget?.takeIf { it.isNotEmpty() } ?: (p.toolName ?: "subagent")
+            }
+        }
+    }
+    return out.map { (id, label) -> label to id }
+}
+
+/** displayKeys makes turnKey collision-proof for LazyColumn: live turns without
+ *  a uuid can legitimately repeat (same role/ts/size), which crashes the list.
+ *  Duplicates get an occurrence suffix; uuid'd history stays untouched, so keys
+ *  are stable across prepends and appends. */
+fun displayKeys(turns: List<Turn>): List<Any> {
+    val seen = HashMap<Any, Int>()
+    return turns.map { t ->
+        val base = turnKey(t)
+        val n = seen[base] ?: 0
+        seen[base] = n + 1
+        if (n == 0) base else "$base#$n"
+    }
+}
 
 // ---- rendering ----
 
@@ -119,22 +164,22 @@ fun TurnView(turn: Turn, backend: String, onOpenChild: ((String) -> Unit)? = nul
 
 @Composable
 private fun UserBubble(turn: Turn) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.End) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp), horizontalArrangement = Arrangement.End) {
         Surface(
             color = MaterialTheme.colorScheme.secondaryContainer,
-            shape = RoundedCornerShape(12.dp),
+            shape = RoundedCornerShape(10.dp),
             modifier = Modifier.widthIn(max = 560.dp),
         ) {
-            MarkdownText(turn.content.orEmpty(), Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+            MarkdownText(turn.content.orEmpty(), Modifier.padding(horizontal = 10.dp, vertical = 6.dp))
         }
     }
 }
 
 @Composable
 private fun AssistantTurn(turn: Turn, backend: String, onOpenChild: ((String) -> Unit)?) {
-    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            BackendMark(backend, Modifier.size(15.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            BackendMark(backend, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.width(6.dp))
             Text(
                 turn.model ?: "assistant",
@@ -192,8 +237,8 @@ fun PartView(part: TurnPart, onOpenChild: ((String) -> Unit)? = null) {
 // breadcrumb, a one-line summary, and fleet totals. Fits the monochrome ink theme.
 @Composable
 private fun WorkflowCard(wf: WorkflowInfo) {
-    OutlinedCard(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        Column(Modifier.padding(12.dp)) {
+    OutlinedCard(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+        Column(Modifier.padding(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("⌘ Workflow", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.width(8.dp))
@@ -260,35 +305,42 @@ private fun fmtCount(n: Long): String = when {
 private fun ToolCard(part: TurnPart, onOpenChild: ((String) -> Unit)?) {
     val expandDefault = part.toolName?.let { it.equals("Edit", true) || it.equals("Write", true) } == true
     var expanded by rememberSaveable(part.toolName, part.toolTarget) { mutableStateOf(expandDefault) }
-    OutlinedCard(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        Row(
-            Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(if (expanded) "▾" else "▸", fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Spacer(Modifier.width(8.dp))
-            Text(part.toolName ?: "tool", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
-            part.toolTarget?.takeIf { it.isNotEmpty() }?.let {
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    it, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-        // Agent-team drill-in: open the spawned subagent's own transcript.
-        val child = part.childSessionId
-        if (child != null && onOpenChild != null) {
+    val chevron by animateFloatAsState(if (expanded) 90f else 0f, tween(180), label = "chevron")
+    OutlinedCard(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+        Column(Modifier.animateContentSize(tween(200))) {
             Row(
-                Modifier.fillMaxWidth().clickable { onOpenChild(child) }.padding(horizontal = 10.dp, vertical = 8.dp),
+                Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 8.dp, vertical = 7.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("↳ Open subagent transcript", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-                Spacer(Modifier.weight(1f))
-                Text("›", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                Icon(
+                    Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp).rotate(chevron),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(part.toolName ?: "tool", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                part.toolTarget?.takeIf { it.isNotEmpty() }?.let {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        it, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
+            // Agent-team drill-in: open the spawned subagent's own transcript.
+            val child = part.childSessionId
+            if (child != null && onOpenChild != null) {
+                Row(
+                    Modifier.fillMaxWidth().clickable { onOpenChild(child) }.padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("↳ Open subagent transcript", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.weight(1f))
+                    Text("›", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                }
+            }
+            if (expanded && part.content.isNotEmpty()) MonoBlock(part.content)
         }
-        if (expanded && part.content.isNotEmpty()) MonoBlock(part.content)
     }
 }
 
@@ -306,7 +358,7 @@ fun MonoBlock(text: String) {
             fontFamily = FontFamily.Monospace,
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.horizontalScroll(rememberScrollState()).padding(10.dp),
+            modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp),
         )
     }
 }

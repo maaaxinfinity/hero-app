@@ -3,6 +3,7 @@ package io.hero.app
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.text.ClickableText
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -10,8 +11,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -29,6 +32,9 @@ import androidx.compose.ui.unit.dp
 // Inline level: **bold**/__bold__, *italic*/_italic_, `code`, [label](url)
 //               (styled; not clickable in v1). Selection is enabled for copy.
 
+/** Annotation tag carrying a link's target URL through the AnnotatedString. */
+internal const val URL_TAG = "URL"
+
 internal sealed interface MdBlock {
     data class Code(val text: String) : MdBlock
     data class Heading(val level: Int, val text: String) : MdBlock
@@ -42,36 +48,50 @@ fun MarkdownText(md: String, modifier: Modifier = Modifier) {
     val blocks = remember(md) { parseBlocks(md) }
     val link = MaterialTheme.colorScheme.primary
     val codeBg = MaterialTheme.colorScheme.surfaceVariant
+    val body = MaterialTheme.typography.bodyMedium
     SelectionContainer(modifier) {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             blocks.forEach { b ->
                 when (b) {
                     is MdBlock.Code -> MonoBlock(b.text)
-                    is MdBlock.Heading -> Text(
+                    is MdBlock.Heading -> LinkableText(
                         parseInline(b.text, link, codeBg),
                         style = when (b.level) {
                             1 -> MaterialTheme.typography.titleMedium
                             2 -> MaterialTheme.typography.titleSmall
                             else -> MaterialTheme.typography.bodyLarge
-                        },
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface,
+                        }.copy(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface),
                     )
                     is MdBlock.Bullet -> Row {
-                        Text("•  ", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
-                        Text(parseInline(b.text, link, codeBg), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+                        Text("•  ", style = body, color = MaterialTheme.colorScheme.onSurface)
+                        LinkableText(parseInline(b.text, link, codeBg), style = body.copy(color = MaterialTheme.colorScheme.onSurface))
                     }
                     is MdBlock.Ordered -> Row {
-                        Text("${b.marker}  ", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
-                        Text(parseInline(b.text, link, codeBg), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+                        Text("${b.marker}  ", style = body, color = MaterialTheme.colorScheme.onSurface)
+                        LinkableText(parseInline(b.text, link, codeBg), style = body.copy(color = MaterialTheme.colorScheme.onSurface))
                     }
-                    is MdBlock.Paragraph -> Text(
+                    is MdBlock.Paragraph -> LinkableText(
                         parseInline(b.text, link, codeBg),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurface,
+                        style = body.copy(color = MaterialTheme.colorScheme.onSurface),
                     )
                 }
             }
+        }
+    }
+}
+
+// LinkableText upgrades to ClickableText only when the string carries URL
+// annotations — plain text keeps the cheaper composable. ClickableText does not
+// inherit LocalTextStyle, so the resolved style is passed explicitly.
+@Composable
+private fun LinkableText(text: AnnotatedString, style: TextStyle) {
+    if (text.getStringAnnotations(URL_TAG, 0, text.length).isEmpty()) {
+        Text(text, style = style)
+    } else {
+        val uriHandler = LocalUriHandler.current
+        ClickableText(text, style = style) { offset ->
+            text.getStringAnnotations(URL_TAG, offset, offset).firstOrNull()
+                ?.let { runCatching { uriHandler.openUri(it.item) } }
         }
     }
 }
@@ -168,9 +188,13 @@ internal fun parseInline(s: String, link: Color, codeBg: Color): AnnotatedString
                 if (close > i && close + 1 < s.length && s[close + 1] == '(') {
                     val paren = s.indexOf(')', close + 2)
                     if (paren > close) {
+                        // The URL rides along as an annotation so the label is
+                        // tappable (LinkableText) — the url itself is not shown.
+                        pushStringAnnotation(URL_TAG, s.substring(close + 2, paren))
                         withStyle(SpanStyle(color = link, textDecoration = TextDecoration.Underline)) {
                             append(s.substring(i + 1, close))
                         }
+                        pop()
                         i = paren + 1
                     } else { append(c); i++ }
                 } else { append(c); i++ }

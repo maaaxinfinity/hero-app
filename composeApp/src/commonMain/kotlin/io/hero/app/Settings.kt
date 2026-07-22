@@ -17,6 +17,7 @@ object Keys {
     const val Cookie = "session_cookie"
     const val Remember = "remember"
     const val ThemeMode = "theme_mode" // "system" | "light" | "dark"
+    const val SidebarCollapsed = "sidebar_collapsed" // "1" = mini rail
 }
 
 // ThemeMode drives HeroTheme; System follows the OS.
