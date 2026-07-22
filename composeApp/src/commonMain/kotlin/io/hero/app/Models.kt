@@ -143,7 +143,7 @@ internal fun decodeLiveFrame(ev: Event, json: Json): LiveFrame? {
 }
 
 @Serializable
-data class SendReq(val text: String)
+data class SendReq(val text: String, val model: String = "", val effort: String = "")
 
 @Serializable
 data class Me(val user: String = "", val admin: Boolean = false)
@@ -205,6 +205,7 @@ data class HarnessCatalog(
     val provider_name: String = "",
     val base_url: String = "",
     val supports_effort: Boolean = false,
+    val effort_levels: List<String> = emptyList(),
     val live_error: String = "",
 )
 

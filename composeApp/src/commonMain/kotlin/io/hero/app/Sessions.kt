@@ -47,6 +47,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Button
@@ -60,6 +61,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
@@ -159,6 +162,24 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         ?: sel.session.orEmpty()
     val active = sel.active
     val readonly = sel.readonly
+
+    // Mid-conversation model/effort switcher: this session's backend catalog and
+    // the current selection (reset when the open session changes; "" = keep current).
+    var switchModel by remember(sel.session) { mutableStateOf("") }
+    var switchEffort by remember(sel.session) { mutableStateOf("") }
+    var catModels by remember { mutableStateOf<List<HarnessModel>>(emptyList()) }
+    var catEffortLevels by remember { mutableStateOf<List<String>>(emptyList()) }
+    LaunchedEffect(sel.node, backend) {
+        catModels = emptyList(); catEffortLevels = emptyList()
+        val n = sel.node
+        if (n != null && backend.isNotEmpty()) {
+            runCatching { api.harness(n).backends.firstOrNull { it.backend == backend }?.catalog }
+                .getOrNull()?.let { c ->
+                    catModels = c.models.filter { !it.hidden }
+                    catEffortLevels = c.effort_levels
+                }
+        }
+    }
 
     // Node and session lists poll quietly (cheap GETs) so they stay live
     // without pull-to-refresh; results land in FleetCache so revisits are
@@ -282,14 +303,18 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                     } ?: 0
             },
             input = input, onInput = { input = it },
+            switchModels = catModels, effortLevels = catEffortLevels,
+            model = switchModel, onModel = { switchModel = it },
+            effort = switchEffort, onEffort = { switchEffort = it },
             onSend = {
                 val n = sel.node; val s = sel.session; val t = input.trim()
                 if (n != null && s != null && t.isNotEmpty()) {
                     input = ""
                     convo = convo.optimisticUser(t)
+                    val m = switchModel; val e = if (catEffortLevels.isNotEmpty()) switchEffort else ""
                     scope.launch {
                         // The optimistic echo must not mask a failed send.
-                        runCatching { api.send(n, s, t) }
+                        runCatching { api.send(n, s, t, m, e) }
                             .onFailure { convo = convo.reduce(LiveFrame.ErrorFrame("send failed: ${it.message ?: "error"}")) }
                     }
                 }
@@ -592,6 +617,9 @@ private fun ConversationPane(
     onToggleInspector: () -> Unit,
     onLoadEarlier: suspend () -> Int,
     input: String, onInput: (String) -> Unit, onSend: () -> Unit,
+    switchModels: List<HarnessModel> = emptyList(), effortLevels: List<String> = emptyList(),
+    model: String = "", onModel: (String) -> Unit = {},
+    effort: String = "", onEffort: (String) -> Unit = {},
     onRespond: (Pending, String) -> Unit,
     onOpenChild: (String) -> Unit, onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -677,7 +705,7 @@ private fun ConversationPane(
             pend.filter { it.session_id == sessionKey }.forEach { p ->
                 PendingBar(p) { behavior -> onRespond(p, behavior) }
             }
-            InputBar(input, onInput, onSend)
+            InputBar(input, onInput, onSend, switchModels, effortLevels, model, onModel, effort, onEffort)
         }
     }
 }
@@ -902,16 +930,56 @@ private fun EmptyState() {
 }
 
 @Composable
-private fun InputBar(value: String, onChange: (String) -> Unit, onSend: () -> Unit) {
+private fun InputBar(
+    value: String, onChange: (String) -> Unit, onSend: () -> Unit,
+    switchModels: List<HarnessModel> = emptyList(), effortLevels: List<String> = emptyList(),
+    model: String = "", onModel: (String) -> Unit = {},
+    effort: String = "", onEffort: (String) -> Unit = {},
+) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            ComposerField(value, onChange, onSend, Modifier.weight(1f))
-            FilledIconButton(onClick = onSend, enabled = value.isNotBlank(), modifier = Modifier.size(36.dp)) {
-                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(17.dp))
+        Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+            // Mid-conversation switcher: pick a model (same backend) and, for a
+            // backend with a reasoning knob, an effort (its OWN levels) — applied to
+            // the next message.
+            if (switchModels.isNotEmpty()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    PickerChip(
+                        "model: " + model.ifEmpty { "current" },
+                        listOf("" to "current") + switchModels.map { it.slug to it.label.ifEmpty { it.slug } },
+                        onModel,
+                    )
+                    if (effortLevels.isNotEmpty()) {
+                        PickerChip(
+                            "effort: " + effort.ifEmpty { "current" },
+                            listOf("" to "current") + effortLevels.map { it to it },
+                            onEffort,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+            }
+            Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ComposerField(value, onChange, onSend, Modifier.weight(1f))
+                FilledIconButton(onClick = onSend, enabled = value.isNotBlank(), modifier = Modifier.size(36.dp)) {
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(17.dp))
+                }
+            }
+        }
+    }
+}
+
+// PickerChip is a compact label + dropdown for the composer's model/effort switch.
+@Composable
+private fun PickerChip(label: String, options: List<Pair<String, String>>, onSelect: (String) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        TextButton(onClick = { open = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+            Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+            Icon(Icons.Filled.ArrowDropDown, contentDescription = null, modifier = Modifier.size(16.dp))
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            options.forEach { (v, l) ->
+                DropdownMenuItem(text = { Text(l) }, onClick = { onSelect(v); open = false })
             }
         }
     }

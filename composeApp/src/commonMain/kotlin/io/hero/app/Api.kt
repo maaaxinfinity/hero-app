@@ -82,10 +82,10 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun sessions(node: String): List<Session> =
         client.get("$baseUrl/api/nodes/${node.enc()}/sessions").body()
 
-    suspend fun send(node: String, id: String, text: String) {
+    suspend fun send(node: String, id: String, text: String, model: String = "", effort: String = "") {
         client.post("$baseUrl/api/nodes/${node.enc()}/sessions/${id.enc()}/send") {
             contentType(ContentType.Application.Json)
-            setBody(SendReq(text))
+            setBody(SendReq(text, model, effort))
         }
     }
 
