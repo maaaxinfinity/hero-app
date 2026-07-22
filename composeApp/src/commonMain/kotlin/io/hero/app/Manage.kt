@@ -21,11 +21,16 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Refresh
@@ -75,7 +80,7 @@ import kotlinx.serialization.json.put
 // setOwner, harness config/apply/install, removeNode, mintJoin.
 // ============================================================================
 @Composable
-internal fun NodesScreen(api: Api, me: Me, focus: String? = null, onFocusConsumed: () -> Unit = {}) {
+internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = null, onFocusConsumed: () -> Unit = {}) {
     // Cache-first: the list renders instantly from FleetCache (kept warm by the
     // dock's badge poll); entering the tab refreshes it in the background.
     val cached by FleetCache.nodes
@@ -85,6 +90,10 @@ internal fun NodesScreen(api: Api, me: Me, focus: String? = null, onFocusConsume
     var status by remember { mutableStateOf<String?>(null) }
     var selected by remember { mutableStateOf<String?>(null) }
     var joinMode by remember { mutableStateOf(false) }
+    // configBackend routes the inspector into one harness's own config page.
+    var configBackend by remember { mutableStateOf<String?>(null) }
+    // View mode persists (cards read the fleet at a glance; list scans dense).
+    var cardView by remember { mutableStateOf(settings.getString(Keys.NodesView) != "list") }
 
     LaunchedEffect(reload) {
         runCatching { api.nodes() }
@@ -93,22 +102,40 @@ internal fun NodesScreen(api: Api, me: Me, focus: String? = null, onFocusConsume
     }
     // Cross-section focus (a user's "owns"/"shared" link): select once, then clear.
     LaunchedEffect(focus) {
-        if (focus != null) { selected = focus; joinMode = false; onFocusConsumed() }
+        if (focus != null) { selected = focus; joinMode = false; configBackend = null; onFocusConsumed() }
+    }
+
+    val select: (String) -> Unit = { id ->
+        joinMode = false; configBackend = null
+        selected = if (selected == id) null else id
     }
 
     InspectorHost(
         open = joinMode || selected != null,
-        onClose = { selected = null; joinMode = false },
-        panelTitle = if (joinMode) "Join a node" else selected.orEmpty(),
+        // Back peels one layer: harness config page → node inspector → closed.
+        onClose = {
+            if (configBackend != null) configBackend = null
+            else { selected = null; joinMode = false }
+        },
+        panelTitle = when {
+            joinMode -> "Join a node"
+            configBackend != null -> "${selected.orEmpty()} · $configBackend"
+            else -> selected.orEmpty()
+        },
         main = {
             Column(Modifier.fillMaxSize()) {
                 TopToolbar("Nodes") {
                     Spacer(Modifier.weight(1f))
+                    ViewToggle(cardView) { want ->
+                        cardView = want
+                        settings.putString(Keys.NodesView, if (want) "card" else "list")
+                    }
+                    Spacer(Modifier.width(4.dp))
                     IconButton(onClick = { reload++ }) {
                         Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     if (me.admin) {
-                        OutlinedButton(onClick = { joinMode = true; selected = null }) {
+                        OutlinedButton(onClick = { joinMode = true; selected = null; configBackend = null }) {
                             Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(6.dp))
                             Text("Add node")
@@ -122,26 +149,147 @@ internal fun NodesScreen(api: Api, me: Me, focus: String? = null, onFocusConsume
                 when {
                     loading -> PaneLoader()
                     nodes.isEmpty() -> Box(Modifier.padding(12.dp)) { HintText("No nodes yet.") }
+                    cardView -> LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 280.dp),
+                        contentPadding = PaddingValues(10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        items(nodes, key = { it.node_id }) { n ->
+                            NodeCard(n, selected = selected == n.node_id) { select(n.node_id) }
+                        }
+                    }
                     else -> LazyColumn(contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)) {
                         items(nodes, key = { it.node_id }) { n ->
-                            NodeRow(n, selected = selected == n.node_id) {
-                                joinMode = false
-                                selected = if (selected == n.node_id) null else n.node_id
-                            }
+                            NodeRow(n, selected = selected == n.node_id) { select(n.node_id) }
                         }
                     }
                 }
             }
         },
         panel = {
-            if (joinMode) JoinPanel(api)
-            else selected?.let { id ->
-                val n = nodes.firstOrNull { it.node_id == id }
-                if (n == null) Box(Modifier.padding(12.dp)) { HintText("Node not found.") }
-                else NodeInspector(api, n, onChanged = { reload++ }, onRemoved = { selected = null; reload++ })
+            val nodeId = selected
+            when {
+                joinMode -> JoinPanel(api)
+                nodeId != null && configBackend != null -> HarnessConfigPanel(
+                    api, nodeId, configBackend!!,
+                    onBack = { configBackend = null },
+                )
+                nodeId != null -> {
+                    val n = nodes.firstOrNull { it.node_id == nodeId }
+                    if (n == null) Box(Modifier.padding(12.dp)) { HintText("Node not found.") }
+                    else NodeInspector(
+                        api, n,
+                        onConfigureHarness = { configBackend = it },
+                        onChanged = { reload++ },
+                        onRemoved = { selected = null; reload++ },
+                    )
+                }
             }
         },
     )
+}
+
+// ViewToggle flips Nodes between card and list rendering.
+@Composable
+private fun ViewToggle(cardView: Boolean, onChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        listOf(true to "Card view", false to "List view").forEach { (isCard, label) ->
+            val sel = cardView == isCard
+            val shape = RoundedCornerShape(6.dp)
+            Box(
+                Modifier.padding(horizontal = 1.dp).size(28.dp)
+                    .clip(shape)
+                    .background(if (sel) MaterialTheme.colorScheme.primaryContainer else androidx.compose.ui.graphics.Color.Transparent, shape)
+                    .hoverHighlight(shape)
+                    .clickable { onChange(isCard) },
+                contentAlignment = Alignment.Center,
+            ) {
+                ViewGlyph(
+                    grid = isCard, modifier = Modifier.size(15.dp),
+                    tint = if (sel) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+// nodeMeters renders the machine-health bars shared by card, inspector (and,
+// compactly, the list row). Absent metrics render nothing.
+@Composable
+private fun nodeMeters(n: NodeView) {
+    n.cpu_percent?.let {
+        MetricBar("CPU", (it / 100.0).toFloat(), "${it.toInt()}%")
+    }
+    if (n.mem_total > 0) {
+        MetricBar("MEM", n.mem_used.toFloat() / n.mem_total, "${fmtBytes(n.mem_used)} / ${fmtBytes(n.mem_total)}")
+    }
+    if (n.disk_total > 0) {
+        MetricBar("DISK", n.disk_used.toFloat() / n.disk_total, "${fmtBytes(n.disk_used)} / ${fmtBytes(n.disk_total)}")
+    }
+}
+
+// NodeCard is the default fleet tile: identity, installed harnesses, health
+// meters, provenance — the at-a-glance view of one machine.
+@Composable
+private fun NodeCard(n: NodeView, selected: Boolean, onClick: () -> Unit) {
+    OutlinedCard(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .hoverHighlight(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick),
+        border = BorderStroke(
+            1.dp,
+            if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+        ),
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(7.dp).background(
+                        if (n.connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                        CircleShape,
+                    ),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    n.node_id, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(n.scope, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (n.harnesses.isNotEmpty()) {
+                Spacer(Modifier.height(7.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    n.harnesses.forEach { h ->
+                        BackendMark(h, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            h, style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(end = 10.dp),
+                        )
+                    }
+                }
+            }
+            if (n.hasMetrics) {
+                Spacer(Modifier.height(7.dp))
+                nodeMeters(n)
+            }
+            Spacer(Modifier.height(6.dp))
+            val meta = buildList {
+                if (n.connected) add("${n.os} · ${n.version}")
+                add(if (n.owner.isNotEmpty()) "owner ${n.owner}" else "ownerless")
+                if (n.shared_with.isNotEmpty()) add("shared ${n.shared_with.joinToString(", ")}")
+            }
+            Text(
+                meta.joinToString("  ·  "),
+                fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
 }
 
 /** managePad is the management screens' outer padding — tighter on phones. */
@@ -195,15 +343,38 @@ private fun NodeRow(n: NodeView, selected: Boolean, onClick: () -> Unit) {
             )
         }
         Spacer(Modifier.width(8.dp))
+        if (n.hasMetrics) {
+            val bits = buildList {
+                n.cpu_percent?.let { add("cpu ${it.toInt()}%") }
+                if (n.mem_total > 0) add("mem ${(n.mem_used * 100 / n.mem_total)}%")
+                if (n.disk_total > 0) add("disk ${(n.disk_used * 100 / n.disk_total)}%")
+            }
+            Text(bits.joinToString(" · "), fontSize = 11.sp, color = dim, maxLines = 1)
+            Spacer(Modifier.width(8.dp))
+        }
         Text(n.scope, style = MaterialTheme.typography.labelSmall, color = dim)
     }
 }
 
-// NodeInspector: overview facts, access editing, harness management, removal.
+// NodeInspector: overview facts + health, access editing, per-harness config
+// entry points, removal.
 @Composable
-private fun NodeInspector(api: Api, n: NodeView, onChanged: () -> Unit, onRemoved: () -> Unit) {
+private fun NodeInspector(
+    api: Api, n: NodeView,
+    onConfigureHarness: (String) -> Unit,
+    onChanged: () -> Unit, onRemoved: () -> Unit,
+) {
     val scope = rememberCoroutineScope()
     var status by remember(n.node_id) { mutableStateOf<String?>(null) }
+    // Harness install state is loaded once here so the section can show each
+    // backend's version/status line; the config page re-fetches on entry.
+    var harness by remember(n.node_id) { mutableStateOf<HarnessState?>(null) }
+    LaunchedEffect(n.node_id, n.connected) {
+        if (n.connected && n.scope == "admin") {
+            runCatching { harness = api.harness(n.node_id) }
+                .onFailure { status = it.message ?: "harness load failed" }
+        }
+    }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -216,24 +387,35 @@ private fun NodeInspector(api: Api, n: NodeView, onChanged: () -> Unit, onRemove
             KeyValueRow("Scope", n.scope)
             KeyValueRow("Enrolled", if (n.enrolled) "yes" else "no")
             if (n.connected_at.isNotEmpty()) KeyValueRow("Connected", n.connected_at.replace('T', ' ').removeSuffix("Z"))
-            if (n.harnesses.isNotEmpty()) {
-                Spacer(Modifier.height(4.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    n.harnesses.forEach { h ->
-                        BackendMark(h, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Spacer(Modifier.width(4.dp))
-                        Text(h, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(end = 8.dp))
-                    }
-                }
-            }
+        }
+        if (n.hasMetrics) {
+            PanelSection("Machine") { nodeMeters(n) }
         }
         if (n.scope == "admin") {
             PanelSection("Access") {
                 AccessEditor(api, n.node_id, onChanged = onChanged, onError = { status = it })
             }
             if (n.connected) {
-                SectionLabel("HARNESS")
-                HarnessPanel(api, n.node_id, onResult = { status = it })
+                PanelSection("Harness") {
+                    val st = harness
+                    when {
+                        st == null -> HintText("Loading…")
+                        st.backends.isEmpty() -> HintText("No harnesses.")
+                        else -> {
+                            if (st.pull_managed) {
+                                Text(
+                                    "Config is pull-managed from ${st.pull_url}.",
+                                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+                                )
+                                Spacer(Modifier.height(4.dp))
+                            }
+                            st.backends.forEachIndexed { i, b ->
+                                if (i > 0) HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                                HarnessRow(b) { onConfigureHarness(b.backend) }
+                            }
+                        }
+                    }
+                }
             }
             PanelSection("Danger") {
                 ConfirmButton("Remove node") {
@@ -242,6 +424,84 @@ private fun NodeInspector(api: Api, n: NodeView, onChanged: () -> Unit, onRemove
                             .onSuccess { onRemoved() }
                             .onFailure { status = it.message ?: "remove failed" }
                     }
+                }
+            }
+        }
+    }
+}
+
+// HarnessRow is one backend's summary line; tapping opens its config page.
+@Composable
+private fun HarnessRow(b: HarnessBackend, onOpen: () -> Unit) {
+    val shape = RoundedCornerShape(6.dp)
+    Row(
+        Modifier.fillMaxWidth()
+            .clip(shape).hoverHighlight(shape).clickable(onClick = onOpen)
+            .padding(horizontal = 4.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        BackendMark(b.backend, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.width(7.dp))
+        Column(Modifier.weight(1f)) {
+            Text(b.backend, style = MaterialTheme.typography.bodyMedium, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            val vline = when {
+                b.installing -> "installing…"
+                b.version_status == "missing" -> "not installed"
+                else -> "${b.installed_version} · ${b.version_status.replace('_', ' ')}"
+            }
+            Text(
+                (if (b.enabled) "enabled · " else "disabled · ") + vline,
+                fontSize = 11.sp,
+                color = if (b.version_status == "ok" || b.version_status.isEmpty()) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+            )
+        }
+        Text("›", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+    }
+}
+
+// HarnessConfigPanel is one backend's dedicated config page inside the
+// inspector: back to the node, then the full editable card.
+@Composable
+private fun HarnessConfigPanel(api: Api, nodeId: String, backend: String, onBack: () -> Unit) {
+    var st by remember(nodeId, backend) { mutableStateOf<HarnessState?>(null) }
+    var status by remember(nodeId, backend) { mutableStateOf<String?>(null) }
+    var reload by remember(nodeId, backend) { mutableStateOf(0) }
+    LaunchedEffect(nodeId, backend, reload) {
+        runCatching { st = api.harness(nodeId) }
+            .onFailure { status = it.message ?: "harness load failed" }
+    }
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        val backShape = RoundedCornerShape(6.dp)
+        Row(
+            Modifier.clip(backShape).hoverHighlight(backShape).clickable(onClick = onBack)
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to node",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(13.dp),
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(nodeId, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        status?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        val state = st
+        val b = state?.backends?.firstOrNull { it.backend == backend }
+        when {
+            state == null -> HintText("Loading…")
+            b == null -> HintText("Backend $backend not present on this node.")
+            else -> {
+                if (state.pull_managed) {
+                    Text(
+                        "Config is pull-managed from ${state.pull_url}. Per-node edits are refused; you can still apply and install.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                HarnessBackendCard(api, nodeId, b, parseConfig(state.config)[backend], state.pull_managed) { msg ->
+                    status = msg; reload++
                 }
             }
         }
@@ -299,32 +559,6 @@ private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onErro
                 shareUser = ""; reload++; onChanged()
             }
         }) { Text("Share") }
-    }
-}
-
-// HarnessPanel: per-backend cards (config + apply + install), pull-managed note.
-@Composable
-private fun HarnessPanel(api: Api, nodeId: String, onResult: (String) -> Unit) {
-    var st by remember(nodeId) { mutableStateOf<HarnessState?>(null) }
-    var reload by remember(nodeId) { mutableStateOf(0) }
-    LaunchedEffect(nodeId, reload) {
-        runCatching { st = api.harness(nodeId) }.onFailure { onResult(it.message ?: "harness load failed") }
-    }
-    val state = st
-    if (state == null) { HintText("Loading…"); return }
-    if (state.pull_managed) {
-        Text(
-            "Config is pull-managed from ${state.pull_url}. Per-node edits are refused; you can still apply and install.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
-        )
-        Spacer(Modifier.height(6.dp))
-    }
-    val cfg = parseConfig(state.config)
-    state.backends.forEach { b ->
-        HarnessBackendCard(api, nodeId, b, cfg[b.backend], state.pull_managed) { msg ->
-            onResult(msg); reload++
-        }
-        Spacer(Modifier.height(8.dp))
     }
 }
 
@@ -936,11 +1170,6 @@ internal fun ControlScreen(api: Api) {
     }
 }
 
-private fun fmtBytes(b: Long): String = when {
-    b >= 1_000_000 -> "${b / 1_000_000}.${(b / 100_000) % 10} MB"
-    b >= 1_000 -> "${b / 1_000} kB"
-    else -> "$b B"
-}
 
 // ============================================================================
 // Start session dialog (used by SessionsScreen)

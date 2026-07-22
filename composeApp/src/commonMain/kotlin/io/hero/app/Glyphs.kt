@@ -116,6 +116,28 @@ private fun DrawScope.prefsGlyph(tint: Color) {
     }
 }
 
+/** ViewGlyph is the card/list view-mode mark: a 2×2 grid or three list lines. */
+@Composable
+fun ViewGlyph(grid: Boolean, modifier: Modifier = Modifier, tint: Color) {
+    Canvas(modifier) {
+        val s = size.minDimension / GLYPH_REF
+        scale(s, s, pivot = Offset.Zero) {
+            if (grid) {
+                for (x in listOf(4.5f, 13.5f)) for (y in listOf(4.5f, 13.5f)) {
+                    drawRoundRect(
+                        color = tint, topLeft = Offset(x, y), size = Size(6f, 6f),
+                        cornerRadius = CornerRadius(1.5f, 1.5f), style = lineStroke(),
+                    )
+                }
+            } else {
+                for (y in listOf(6.5f, 12f, 17.5f)) {
+                    drawLine(tint, Offset(4.5f, y), Offset(19.5f, y), LINE, StrokeCap.Round)
+                }
+            }
+        }
+    }
+}
+
 /** EyeGlyph is the password show/hide mark: almond outline + pupil, slashed when hidden. */
 @Composable
 fun EyeGlyph(open: Boolean, modifier: Modifier = Modifier, tint: Color) {

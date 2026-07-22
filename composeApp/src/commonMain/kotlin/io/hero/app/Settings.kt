@@ -18,6 +18,7 @@ object Keys {
     const val Remember = "remember"
     const val ThemeMode = "theme_mode" // "system" | "light" | "dark"
     const val SidebarCollapsed = "sidebar_collapsed" // "1" = mini rail
+    const val NodesView = "nodes_view" // "card" (default) | "list"
 }
 
 // ThemeMode drives HeroTheme; System follows the OS.

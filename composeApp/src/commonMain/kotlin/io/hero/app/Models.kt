@@ -19,7 +19,16 @@ data class NodeView(
     val enrolled: Boolean = false,
     val owner: String = "",
     val shared_with: List<String> = emptyList(),
-)
+    // Machine health, present only while connected and reported (nodes without
+    // the Metrics RPC omit these — null/zero means "not reported", never 0%).
+    val cpu_percent: Double? = null,
+    val mem_used: Long = 0,
+    val mem_total: Long = 0,
+    val disk_used: Long = 0,
+    val disk_total: Long = 0,
+) {
+    val hasMetrics: Boolean get() = cpu_percent != null || mem_total > 0 || disk_total > 0
+}
 
 @Serializable
 data class Session(

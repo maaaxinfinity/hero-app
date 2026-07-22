@@ -56,9 +56,13 @@ back unwinds the stack).
 Inspectors are wired to real endpoints only: Sessions (`Ctrl/Cmd+I`) shows
 session facts + the node's pending-permission center + subagent drill-ins +
 quick actions; Nodes covers access (share/unshare, transfer ownership),
-per-backend harness config/install and two-click removal, with a join-script
-generator; Users covers password/admin/delete/create, its owns/shared entries
-deep-linking into Nodes. Audit has a live filter and a fetch-limit picker.
+per-harness config pages (each backend opens its own page inside the
+inspector) and two-click removal, with a join-script generator; Users covers
+password/admin/delete/create, its owns/shared entries deep-linking into
+Nodes. Audit has a live filter and a fetch-limit picker. The Nodes fleet
+renders as cards by default (switchable to a dense list, persisted) and shows
+each machine's CPU/MEM/DISK meters when the node reports them (control-plane
+`Metrics` RPC; older nodes simply omit the fields).
 Node and session rows carry the harness marks (claude / codex glyphs),
 connection dots and status; the conversation header shows the runtime model, a
 pulsing row signals thinking/stalled, and "Load earlier" pages the transcript

@@ -373,7 +373,7 @@ private fun MainScreen(
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (section) {
                 Section.Sessions -> SessionsScreen(api, settings, sel, onSel = { sel = it })
-                Section.Nodes -> NodesScreen(api, me, focus = nodesFocus, onFocusConsumed = { nodesFocus = null })
+                Section.Nodes -> NodesScreen(api, me, settings, focus = nodesFocus, onFocusConsumed = { nodesFocus = null })
                 Section.Control -> ControlScreen(api)
                 Section.Users -> UsersScreen(api, me, onOpenNode = { id ->
                     nodesFocus = id; selectSection(Section.Nodes)

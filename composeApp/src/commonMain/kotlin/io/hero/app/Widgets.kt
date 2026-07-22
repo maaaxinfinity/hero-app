@@ -12,8 +12,12 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -51,6 +55,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 
 // Widgets.kt holds small shared controls and interaction helpers used across
@@ -164,6 +169,51 @@ internal fun KeyValueRow(key: String, value: String) {
             maxLines = 2, overflow = TextOverflow.Ellipsis,
         )
     }
+}
+
+/** MetricBar is a dense machine-health meter: label, thin fill bar, detail
+ *  text. The fill goes error-red past 90% — the one place the monochrome
+ *  scheme allows an alarm color. */
+@Composable
+internal fun MetricBar(label: String, fraction: Float, detail: String) {
+    val f = fraction.coerceIn(0f, 1f)
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(34.dp),
+        )
+        Box(
+            Modifier.weight(1f).height(4.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+        ) {
+            Box(
+                Modifier.fillMaxWidth(f).fillMaxHeight().background(
+                    if (f > 0.9f) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                ),
+            )
+        }
+        Spacer(Modifier.width(7.dp))
+        Text(
+            detail,
+            fontSize = 10.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+        )
+    }
+}
+
+/** fmtBytes renders byte counts compactly (7.2 GB / 412 MB / 88 kB). */
+internal fun fmtBytes(b: Long): String = when {
+    b >= 1_000_000_000 -> "${b / 1_000_000_000}.${(b / 100_000_000) % 10} GB"
+    b >= 1_000_000 -> "${b / 1_000_000} MB"
+    b >= 1_000 -> "${b / 1_000} kB"
+    else -> "$b B"
 }
 
 /** InlineSpinner is the quiet in-content loader: a rotating 270° ink arc. The
