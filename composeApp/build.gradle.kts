@@ -39,13 +39,13 @@ kotlin {
         val androidMain by getting {
             dependencies {
                 implementation(libs.androidx.activity.compose)
-                implementation(libs.ktor.client.cio)
+                implementation(libs.ktor.client.okhttp)
             }
         }
         val desktopMain by getting {
             dependencies {
                 implementation(compose.desktop.currentOs)
-                implementation(libs.ktor.client.cio)
+                implementation(libs.ktor.client.okhttp)
             }
         }
     }
@@ -58,8 +58,8 @@ android {
         applicationId = "io.hero.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 11
-        versionName = "0.5.5"
+        versionCode = 12
+        versionName = "0.5.6"
     }
     // Signing secrets never live in the repo. Locally, put them in a gitignored
     // keystore.properties at the project root; in CI, provide them via env
