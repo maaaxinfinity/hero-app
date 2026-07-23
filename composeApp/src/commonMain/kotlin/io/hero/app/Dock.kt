@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
@@ -53,29 +55,37 @@ fun Dock(
     onSignOut: () -> Unit,
     attentionCount: Int = 0, // fleet count of actionable items (permission/question)
 ) {
-    // Admins see all seven items; 40dp cells keep the row inside a 360dp phone.
-    val item = if (LocalWindowWidth.current == WindowWidth.Compact) 40.dp else 44.dp
+    val compact = LocalWindowWidth.current == WindowWidth.Compact
+    val item = if (compact) 40.dp else 44.dp
     val groups = Section.entries.filter { !it.adminOnly || me.admin }.groupBy { it.group }
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
         Column(Modifier.fillMaxWidth()) {
             HorizontalDivider()
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 5.dp),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically,
+            // Centered when the blocks fit; horizontally scrollable when they don't —
+            // an admin's cells + dividers can exceed a 320dp phone, and clipping the
+            // edge item/avatar (its old behavior) is worse than a scroll. Cells keep
+            // full touch size; compact just tightens the gaps.
+            Box(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                contentAlignment = Alignment.Center,
             ) {
-                groups.keys.sorted().forEachIndexed { i, g ->
-                    if (i > 0) DockDivider()
-                    groups.getValue(g).forEach { s ->
-                        DockItem(
-                            section = s,
-                            selected = s == section,
-                            badge = if (s == Section.Attention) attentionCount else 0,
-                            size = item,
-                            onClick = { onSelect(s) },
-                        )
+                Row(
+                    Modifier.padding(horizontal = if (compact) 4.dp else 8.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    groups.keys.sorted().forEachIndexed { i, g ->
+                        if (i > 0) DockDivider(compact)
+                        groups.getValue(g).forEach { s ->
+                            DockItem(
+                                section = s,
+                                selected = s == section,
+                                badge = if (s == Section.Attention) attentionCount else 0,
+                                size = item,
+                                onClick = { onSelect(s) },
+                            )
+                        }
+                        if (g == 4) DockAvatar(me, size = item, onSignOut = onSignOut)
                     }
-                    if (g == 4) DockAvatar(me, size = item, onSignOut = onSignOut)
                 }
             }
         }
@@ -83,9 +93,9 @@ fun Dock(
 }
 
 @Composable
-private fun DockDivider() {
+private fun DockDivider(compact: Boolean = false) {
     Box(
-        Modifier.padding(horizontal = 5.dp).width(1.dp).height(22.dp)
+        Modifier.padding(horizontal = if (compact) 3.dp else 5.dp).width(1.dp).height(22.dp)
             .background(MaterialTheme.colorScheme.outline),
     )
 }

@@ -14,7 +14,7 @@ import kotlinx.serialization.json.Json
 
 // AppVersion is compared against the latest GitHub release tag. Bump it before
 // tagging a release so the running app can tell it is out of date.
-const val AppVersion = "0.5.15"
+const val AppVersion = "0.5.16"
 const val Repo = "maaaxinfinity/hero-app"
 
 @Serializable
