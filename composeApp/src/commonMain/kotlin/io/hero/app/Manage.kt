@@ -181,14 +181,15 @@ internal fun <T> CoroutineScope.launchManaged(
 // setOwner, harness config/apply/install, removeNode, mintJoin.
 // ============================================================================
 @Composable
-internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = null, onFocusConsumed: () -> Unit = {}) {
+internal fun NodesScreen(api: Api, me: Me, settings: Settings, poll: FleetPoll, focus: String? = null, onFocusConsumed: () -> Unit = {}) {
     // Cache-first: the list renders instantly from FleetCache (kept warm by the
-    // dock's badge poll); entering the tab refreshes it in the background.
+    // single fleet poll owner); entering the tab, the manual Refresh button and
+    // post-mutation reloads all ask THAT owner for an immediate cycle instead of
+    // running a third competing nodes fetch. The error banner reads the owner's
+    // shared error surface.
     val cached by FleetCache.nodes
     val nodes = cached.orEmpty()
     val loading = cached == null
-    var reload by remember { mutableStateOf(0) }
-    var status by remember { mutableStateOf<String?>(null) }
     var selected by remember { mutableStateOf<String?>(null) }
     var joinMode by remember { mutableStateOf(false) }
     // configBackend routes the inspector into one harness's own config page.
@@ -197,12 +198,7 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
     var cardView by remember { mutableStateOf(settings.getString(Keys.NodesView) != "list") }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(reload) {
-        val gen = FleetCache.generation
-        runCatchingCancellable { api.nodes() }
-            .onSuccess { FleetCache.putNodes(gen, it); status = null }
-            .onFailure { status = it.message }
-    }
+    LaunchedEffect(Unit) { poll.wake() }
     // Cross-section focus (a user's "owns"/"shared" link): select once, then clear.
     LaunchedEffect(focus) {
         if (focus != null) { selected = focus; joinMode = false; configBackend = null; onFocusConsumed() }
@@ -234,7 +230,7 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
                         scope.launch { settings.update { it[Keys.NodesView] = if (want) "card" else "list" } }
                     }
                     Spacer(Modifier.width(4.dp))
-                    IconButton(onClick = { reload++ }) {
+                    IconButton(onClick = { poll.wake() }) {
                         Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     if (me.admin) {
@@ -245,7 +241,7 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
                         }
                     }
                 }
-                status?.let {
+                poll.nodesError.value?.let {
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
                 }
@@ -287,11 +283,11 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
                         NodeInspector(
                             api, n,
                             onConfigureHarness = { configBackend = it },
-                            onChanged = { reload++ },
+                            onChanged = { poll.wake() },
                             // Drop a stale completion: only close + refresh if the
                             // removed node is still the selected target (the user
                             // may have switched to another node meanwhile).
-                            onRemoved = { removed -> if (selected == removed) { selected = null; reload++ } },
+                            onRemoved = { removed -> if (selected == removed) { selected = null; poll.wake() } },
                         )
                     }
                 }

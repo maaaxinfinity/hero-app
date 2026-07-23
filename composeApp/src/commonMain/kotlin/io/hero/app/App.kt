@@ -60,11 +60,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.coroutines.cancellation.CancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 // WindowWidth splits the UI into two responsive classes at 600dp: Compact
@@ -472,29 +467,47 @@ private fun MainScreen(
     // fires a local OS notification (desktop tray) exactly once. The first poll
     // only seeds the set — no notification burst on launch.
     var seen by remember { mutableStateOf<Set<String>?>(null) }
+    // THE fleet poll owner: one jittered loop refreshes nodes + attention for
+    // every consumer (dock badge, Sessions' node list, the Nodes page, the
+    // Attention screen). Screens request refreshes through `poll` (wake on tab
+    // entry / manual refresh / an answered item; attentionFast while the
+    // Attention screen is open) instead of running their own competing
+    // fixed-phase pollers against the same FleetCache slots — so there is never
+    // more than one nodes/attention fetch in flight, and late responses cannot
+    // land out of order over a newer snapshot.
+    val poll = remember { FleetPoll() }
     LaunchedEffect(Unit) {
-        val gen = FleetCache.generation
-        while (isActive) {
-            runCatchingCancellable { FleetCache.putNodes(gen, api.nodes()) }
-            runCatchingCancellable {
-                val items = api.attention()
-                FleetCache.putAttention(gen, items)
-                val actionable = items.filter { it.kind == "permission" || it.kind == "question" }
-                attentionCount = actionable.size
-                val ids = actionable.map { it.node + ":" + it.id }.toSet()
-                seen?.let { prior ->
-                    actionable.filter { (it.node + ":" + it.id) !in prior }.forEach {
-                        notifyLocal(
-                            "HERO — " + it.node,
-                            (if (it.kind == "question") "Question" else "Wants to use " + it.tool_name.ifEmpty { "a tool" }) +
-                                " · " + it.title.ifEmpty { "session " + it.session_id.take(8) },
-                        )
+        fleetPollOwner(
+            poll,
+            fetchNodes = {
+                // The generation is re-captured EVERY cycle: a long-lived owner
+                // stamps each put with the current identity, not its launch-time one.
+                val gen = FleetCache.generation
+                runCatchingCancellable { api.nodes() }
+                    .onSuccess { FleetCache.putNodes(gen, it); poll.publishNodesError(null) }
+                    .onFailure { poll.publishNodesError(it.message ?: "couldn't load nodes") }
+            },
+            fetchAttention = {
+                val gen = FleetCache.generation
+                runCatchingCancellable {
+                    val items = api.attention()
+                    FleetCache.putAttention(gen, items)
+                    val actionable = items.filter { it.kind == "permission" || it.kind == "question" }
+                    attentionCount = actionable.size
+                    val ids = actionable.map { it.node + ":" + it.id }.toSet()
+                    seen?.let { prior ->
+                        actionable.filter { (it.node + ":" + it.id) !in prior }.forEach {
+                            notifyLocal(
+                                "HERO — " + it.node,
+                                (if (it.kind == "question") "Question" else "Wants to use " + it.tool_name.ifEmpty { "a tool" }) +
+                                    " · " + it.title.ifEmpty { "session " + it.session_id.take(8) },
+                            )
+                        }
                     }
+                    seen = ids
                 }
-                seen = ids
-            }
-            delay(7000)
-        }
+            },
+        )
     }
 
     // In a compact conversation the chrome gets out of the way: both bars hide
@@ -512,11 +525,11 @@ private fun MainScreen(
         // stream must not restart), so never fork this into per-mode layouts.
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (section) {
-                Section.Sessions -> SessionsScreen(api, settings, sel, onSel = { sel = it })
-                Section.Attention -> AttentionScreen(api, onOpen = { node, sess ->
+                Section.Sessions -> SessionsScreen(api, settings, sel, onSel = { sel = it }, poll = poll)
+                Section.Attention -> AttentionScreen(api, poll, onOpen = { node, sess ->
                     sel = SessionSel(node = node, session = sess); section = Section.Sessions
                 })
-                Section.Nodes -> NodesScreen(api, me, settings, focus = nodesFocus, onFocusConsumed = { nodesFocus = null })
+                Section.Nodes -> NodesScreen(api, me, settings, poll, focus = nodesFocus, onFocusConsumed = { nodesFocus = null })
                 Section.Control -> ControlScreen(api)
                 Section.Users -> UsersScreen(api, me, onOpenNode = { id ->
                     nodesFocus = id; selectSection(Section.Nodes)

@@ -231,7 +231,7 @@ data class SessionSel(
 }
 
 @Composable
-internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel: (SessionSel) -> Unit) {
+internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel: (SessionSel) -> Unit, poll: FleetPoll) {
     val scope = rememberCoroutineScope()
     // The CURRENT selection for async completions. Handlers launched from a
     // previous composition captured a stale `sel`; any late response must CAS
@@ -255,12 +255,15 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     val drafts = remember { DraftStore() }
     var input by remember(sel.node, sel.session) { mutableStateOf(drafts.get(sel.node, sel.session)) }
     var sessionsLoading by remember { mutableStateOf(false) }
-    var nodesError by remember { mutableStateOf<String?>(null) }
+    // Node freshness/errors come from the single fleet poll owner — this screen
+    // no longer runs its own competing nodes poller. A fetch error only
+    // surfaces when there is nothing usable on screen (a warm list keeps
+    // rendering); Retry asks the owner for an immediate cycle.
+    val nodesError = if (cachedNodes == null) poll.nodesError.value else null
     var sessionsError by remember { mutableStateOf<String?>(null) }
     // A warm node whose refresh keeps failing keeps its last-good list, but is
     // flagged stale so it doesn't masquerade as authoritative/fresh.
     var sessionsStale by remember { mutableStateOf(false) }
-    var nodesReload by remember { mutableStateOf(0) }
     var sessionsReload by remember { mutableStateOf(0) }
     var showStart by remember { mutableStateOf(false) }
     var inspector by remember { mutableStateOf(false) }
@@ -298,23 +301,13 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         }
     }
 
-    // Node and session lists poll quietly (cheap GETs) so they stay live
-    // without pull-to-refresh; results land in FleetCache so revisits are
-    // instant. A failure only surfaces when there is nothing usable on screen,
-    // and Retry bumps the reload key.
-    LaunchedEffect(nodesReload) {
-        val gen = FleetCache.generation
-        while (isActive) {
-            runCatchingCancellable { api.nodes() }
-                .onSuccess { FleetCache.putNodes(gen, it); nodesError = null }
-                .onFailure { if (FleetCache.nodes.value == null) nodesError = it.message ?: "couldn't load nodes" }
-            delay(15_000)
-        }
-    }
+    // The session list polls quietly (a cheap GET) so it stays live without
+    // pull-to-refresh; results land in FleetCache so revisits are instant. The
+    // node list itself is refreshed by the single fleet poll owner — no second
+    // loop here.
     LaunchedEffect(sel.node, sessionsReload) {
         val n = sel.node
         if (n == null) { sessions = emptyList(); sessionsError = null; sessionsStale = false; return@LaunchedEffect }
-        val gen = FleetCache.generation
         // Cached page first — the spinner is reserved for a truly cold node.
         val cached = FleetCache.sessionsOf(n)
         sessions = cached.orEmpty()
@@ -322,8 +315,11 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         sessionsError = null
         sessionsStale = false
         while (isActive) {
-            runCatchingCancellable { api.sessions(n) }
-                .onSuccess { sessions = it; FleetCache.putSessions(n, gen, it); sessionsError = null; sessionsStale = false }
+            // refresh = true forces a fresh snapshot but still shares its
+            // in-flight request (single-flight) with the Start dialog / quick
+            // switcher — one download per node, and completions can't reorder.
+            FleetCache.fetchSessions(api, n, refresh = true)
+                .onSuccess { sessions = it; sessionsError = null; sessionsStale = false }
                 .onFailure {
                     // Cold node: surface the error. Warm node: keep the last-good
                     // list on screen but mark it stale rather than treating the
@@ -332,7 +328,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                     else sessionsStale = true
                 }
             sessionsLoading = false
-            delay(10_000)
+            delay(pollDelayMillis(10_000))
         }
     }
     // Seed the newest transcript page, then subscribe the grouped live tail and
@@ -380,7 +376,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     LaunchedEffect(sel.node, active, readonly) {
         while (sel.node != null && active != null && !readonly) {
             runCatchingCancellable { pend = api.pending(sel.node!!) }
-            delay(3000)
+            delay(pollDelayMillis(3000))
         }
         pend = emptyList()
     }
@@ -430,7 +426,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
             onSelectNode = { onSel(SessionSel(node = it)) },
             onSelectSession = { onSel(sel.copy(session = it, drill = emptyList())) },
             onNewSession = { showStart = true },
-            onRetryNodes = { nodesError = null; nodesReload++ },
+            onRetryNodes = { poll.wake() },
             onRetrySessions = { sessionsReload++ },
             collapsed = rail, onToggleCollapse = onToggle,
             modifier = m,

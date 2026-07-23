@@ -66,13 +66,20 @@ fun QuickSwitcher(api: Api, onDismiss: () -> Unit, onPick: (node: String, sessio
     LaunchedEffect(Unit) {
         runCatchingCancellable {
             coroutineScope {
-                val nodes = api.nodes().filter { it.connected }
+                // The node list reuses the fleet poll owner's warm snapshot (same
+                // generation, at most one cycle old) instead of a fresh download
+                // per open; only a cold cache falls back to the direct call.
+                val nodes = (FleetCache.nodes.value ?: api.nodes()).filter { it.connected }
                 entries = nodes.map { n ->
                     async {
-                        // Per-node fan-out: an offline/errored node collapses to an
-                        // empty slice, but a cancelled child must still propagate so
+                        // Per-node fan-out through the SHARED session fetch: a warm
+                        // cache hit costs no request, and a miss joins any in-flight
+                        // download (single-flight) instead of duplicating it. An
+                        // offline/errored node collapses to an empty slice, but a
+                        // cancelled child must still propagate so
                         // awaitAll/coroutineScope tear down instead of "succeeding" empty.
-                        runCatchingCancellable { api.sessions(n.node_id).map { s -> SwitchEntry(n.node_id, s) } }
+                        FleetCache.fetchSessions(api, n.node_id)
+                            .map { list -> list.map { s -> SwitchEntry(n.node_id, s) } }
                             .getOrDefault(emptyList())
                     }
                 }.awaitAll().flatten()

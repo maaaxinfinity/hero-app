@@ -28,7 +28,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -40,8 +40,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -52,16 +50,23 @@ import kotlinx.serialization.json.JsonObject
 // accessible connected node. Actionable items (permission / AskUserQuestion) are
 // answered in place through the same relay respond endpoint; informational ones
 // (finished / errored) link to the session. Data is shared with the dock count
-// via FleetCache.attention — MainScreen polls it; this screen polls faster while
-// open and re-polls immediately after an answer so a resolved item drops out.
+// via FleetCache.attention, refreshed by the SINGLE fleet poll owner: while this
+// screen is open it asks the owner for the fast cadence (instead of running a
+// second competing poller), and an answered item wakes the owner so it drops
+// out immediately.
 
 private val attnJson = Json { ignoreUnknownKeys = true }
 
 @Composable
-fun AttentionScreen(api: Api, onOpen: (node: String, session: String) -> Unit) {
-    val scope = rememberCoroutineScope()
-    LaunchedRefresh(api)
-    val refresh: () -> Unit = { scope.launch { val gen = FleetCache.generation; runCatchingCancellable { FleetCache.putAttention(gen, api.attention()) } } }
+fun AttentionScreen(api: Api, poll: FleetPoll, onOpen: (node: String, session: String) -> Unit) {
+    // Fast cadence while open, one immediate cycle on entry; both flow through
+    // the one poll owner, so there is never a second in-flight attention fetch.
+    DisposableEffect(Unit) {
+        poll.attentionFast = true
+        poll.wake()
+        onDispose { poll.attentionFast = false }
+    }
+    val refresh: () -> Unit = { poll.wake() }
 
     Column(Modifier.fillMaxSize()) {
         TopToolbar("Attention")
@@ -80,21 +85,6 @@ fun AttentionScreen(api: Api, onOpen: (node: String, session: String) -> Unit) {
                     AttentionCard(api, item, onOpen, refresh)
                 }
             }
-        }
-    }
-}
-
-// LaunchedRefresh keeps the inbox fresh while it is on screen (snappier than the
-// 7s dock poll). Split into its own composable so the effect key stays Unit.
-@Composable
-private fun LaunchedRefresh(api: Api) {
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        val gen = FleetCache.generation
-        // Prime immediately, then poll.
-        runCatchingCancellable { FleetCache.putAttention(gen, api.attention()) }
-        while (isActive) {
-            delay(4000)
-            runCatchingCancellable { FleetCache.putAttention(gen, api.attention()) }
         }
     }
 }

@@ -1,13 +1,20 @@
 package io.hero.app
 
 import androidx.compose.runtime.State
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import kotlin.random.Random
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 // FleetCache is the process-wide, identity-scoped store behind the cache-first
 // UX: management screens and the session list render their last-known data
@@ -282,6 +289,76 @@ object FleetCache {
             for (e in c.effort_levels) n += 8 + e.length
         }
         return n
+    }
+}
+
+// ---- the fleet poll owner (one refresher for the whole-fleet slots) ----
+
+/** Base cadence of the single fleet poll owner (nodes + attention), and the
+ *  tightened cadence while the Attention screen is open. One owner at 4s
+ *  replaces the old stack of independent fixed-phase pollers (MainScreen 7s +
+ *  Sessions 15s nodes + Nodes-page fetches + the Attention page's own 4s). */
+internal const val FLEET_POLL_BASE_MILLIS = 7_000L
+internal const val FLEET_POLL_FAST_MILLIS = 4_000L
+
+/** pollDelayMillis draws one jittered poll delay: uniform in
+ *  [base/2, 3·base/2], so the average cadence stays `base` while simultaneous
+ *  clients (or several loops in one client) decorrelate instead of forming a
+ *  synchronized wake-up against the control plane. Pure; unit-tested. */
+internal fun pollDelayMillis(base: Long, random: Random = Random.Default): Long =
+    base / 2 + random.nextLong(base + 1)
+
+/**
+ * FleetPoll is the request side of the single fleet poll owner. MainScreen owns
+ * the one loop that refreshes the whole-fleet slots (nodes + attention);
+ * screens REQUEST refreshes here instead of running their own competing
+ * pollers against the same FleetCache state:
+ *  - [wake] asks for an immediate cycle (tab entry, the manual Refresh button,
+ *    Retry, an answered attention item). Requests conflate — a burst collapses
+ *    into at most one pending cycle, never a queued fetch storm.
+ *  - [attentionFast] tightens the owner's cadence while the Attention screen is
+ *    open (it used to run a second 4s poller on top of the global 7s one).
+ *  - [nodesError] is the owner's shared error surface for the nodes fetch, so
+ *    every consumer derives failure state from the same authoritative attempt.
+ *
+ * One instance per MainScreen mount (passed down explicitly), so a sign-out or
+ * re-login gets a fresh coordinator with no cross-session residue.
+ */
+class FleetPoll {
+    internal val wakes = Channel<Unit>(Channel.CONFLATED)
+
+    fun wake() { wakes.trySend(Unit) }
+
+    var attentionFast: Boolean by mutableStateOf(false)
+
+    private val _nodesError = mutableStateOf<String?>(null)
+    val nodesError: State<String?> get() = _nodesError
+    internal fun publishNodesError(msg: String?) { _nodesError.value = msg }
+}
+
+/**
+ * fleetPollOwner is THE poll loop for whole-fleet state: one cycle fetches
+ * nodes then attention (the callbacks own their error handling and their
+ * generation stamping), then waits a jittered delay — cut short the moment a
+ * [FleetPoll.wake] request lands. Because there is exactly one owner and its
+ * cycle is sequential, late nodes/attention responses can no longer complete
+ * out of order and overwrite a newer snapshot with an older one.
+ *
+ * [wait] is injectable for the unit tests; the default waits [ms] on the wake
+ * channel (returning early on a wake request).
+ */
+internal suspend fun fleetPollOwner(
+    poll: FleetPoll,
+    fetchNodes: suspend () -> Unit,
+    fetchAttention: suspend () -> Unit,
+    random: Random = Random.Default,
+    wait: suspend (Long) -> Unit = { ms -> withTimeoutOrNull(ms) { poll.wakes.receive() } },
+) {
+    while (currentCoroutineContext().isActive) {
+        fetchNodes()
+        fetchAttention()
+        val base = if (poll.attentionFast) FLEET_POLL_FAST_MILLIS else FLEET_POLL_BASE_MILLIS
+        wait(pollDelayMillis(base, random))
     }
 }
 
