@@ -438,6 +438,125 @@ fun collectChildSessions(turns: List<Turn>): List<Pair<String, String>> {
     return out.map { (id, label) -> label to id }
 }
 
+// ---- flattened presentation rows (pure; no Compose — unit-testable) ----
+//
+// The transcript LazyColumn virtualizes PART-level rows, not whole turns: an
+// assistant turn contributes [header][part…]([fold])[part…][footer] items, so a
+// single huge visible turn no longer eagerly composes every part, and a live
+// part append composes ONE new row instead of recomposing the growing turn.
+// Row keys derive from the turn's lifetime-stable UI id plus the part ordinal —
+// parts only ever append, so an existing row's key never changes across live
+// streaming, settle (the key set is IDENTICAL before/after: the rows just move
+// from the open block to the history block), prepend and truth-up.
+
+/** Per-turn presentation budget: an unexpanded turn renders at most
+ *  TURN_PART_HEAD_ROWS + TURN_PART_TAIL_ROWS part rows … */
+internal const val TURN_PART_HEAD_ROWS = 64
+internal const val TURN_PART_TAIL_ROWS = 64
+
+/** … and at most ~TURN_PART_HEAD_CHARS + TURN_PART_TAIL_CHARS rendered
+ *  (post-body-cap) chars of part content — whichever budget fills first. Parts
+ *  between head and tail fold into one expandable "… N more parts" row; nothing
+ *  is dropped, and expanding stays cheap because rows are virtualized. */
+internal const val TURN_PART_HEAD_CHARS = 128 * 1024
+internal const val TURN_PART_TAIL_CHARS = 128 * 1024
+
+/** PartFoldPlan is a turn's part-row window: parts [0, headCount) and
+ *  [tailStart, partCount) render as rows; the [hiddenCount] between them fold.
+ *  Canonical no-fold form is headCount == tailStart == partCount. */
+internal data class PartFoldPlan(val partCount: Int, val headCount: Int, val tailStart: Int) {
+    val hiddenCount: Int get() = tailStart - headCount
+    val folded: Boolean get() = hiddenCount > 0
+}
+
+/** partRenderCost estimates the chars a part row can hand to layout — its
+ *  content and workflow summary, each bounded by the per-body render cap. */
+private fun partRenderCost(p: TurnPart): Int =
+    minOf(p.content.length, RENDER_CHAR_CAP) +
+        (p.workflow?.summary?.length?.coerceAtMost(RENDER_CHAR_CAP) ?: 0)
+
+/** partFoldPlan computes the default part-row window under the row + char
+ *  budgets. The walk is bounded by the head/tail row caps — never O(parts) —
+ *  so planning the open turn on every streamed part frame stays O(1). The tail
+ *  is kept because the newest (and final result/error) content lives there.
+ *  Pure and deterministic in the parts list, so a settled turn re-plans to the
+ *  identical window and row keys survive the settle. */
+internal fun partFoldPlan(parts: List<TurnPart>): PartFoldPlan {
+    val n = parts.size
+    var head = 0
+    var spent = 0
+    while (head < n && head < TURN_PART_HEAD_ROWS && (head == 0 || spent < TURN_PART_HEAD_CHARS)) {
+        spent += partRenderCost(parts[head])
+        head++
+    }
+    var tailCount = 0
+    spent = 0
+    while (tailCount < n - head && tailCount < TURN_PART_TAIL_ROWS && (tailCount == 0 || spent < TURN_PART_TAIL_CHARS)) {
+        spent += partRenderCost(parts[n - 1 - tailCount])
+        tailCount++
+    }
+    val tailStart = n - tailCount
+    return if (tailStart <= head) PartFoldPlan(n, n, n) else PartFoldPlan(n, head, tailStart)
+}
+
+/** visiblePartRanges maps a plan (+ the user's expand choice) to the part index
+ *  ranges rendered as rows. Expanded turns render every part — virtualization
+ *  keeps that affordable — with the fold row (as "Show fewer") still present at
+ *  its stable position between the ranges. */
+internal fun visiblePartRanges(plan: PartFoldPlan, expanded: Boolean): Pair<IntRange, IntRange> = when {
+    !plan.folded -> (0 until plan.partCount) to IntRange.EMPTY
+    expanded -> (0 until plan.headCount) to (plan.headCount until plan.partCount)
+    else -> (0 until plan.headCount) to (plan.tailStart until plan.partCount)
+}
+
+internal fun rangeSize(r: IntRange): Int = if (r.isEmpty()) 0 else r.last - r.first + 1
+
+/** turnIsMultiRow: assistant turns (and unknown future roles, which render via
+ *  the assistant path) flatten into header/part/footer rows; user, system and
+ *  error turns stay single rows under their original keys. */
+internal fun turnIsMultiRow(t: Turn): Boolean =
+    t.role != "user" && t.role != "system" && t.role != "error"
+
+// Row-key suffixes (the pane prefixes its {node, session} namespace). The
+// header/single-row suffix is the bare UI id — the exact key rows had before
+// the flatten, so a turn's FIRST row key is also its stable anchor key.
+internal fun headerRowSuffix(uiKey: Any): String = "$uiKey"
+internal fun partRowSuffix(uiKey: Any, index: Int): String = "$uiKey#p$index"
+internal fun moreRowSuffix(uiKey: Any): String = "$uiKey#m"
+internal fun footerRowSuffix(uiKey: Any): String = "$uiKey#z"
+
+/** turnRowCount is the number of LazyColumn items a turn contributes — the
+ *  arithmetic twin of [turnRowSuffixes] (kept O(1) for the per-frame follow
+ *  target; parity is unit-tested). */
+internal fun turnRowCount(turn: Turn, plan: PartFoldPlan?, expanded: Boolean): Int {
+    if (plan == null) return 1
+    val (head, tail) = visiblePartRanges(plan, expanded)
+    return 2 + rangeSize(head) + rangeSize(tail) + (if (plan.folded) 1 else 0)
+}
+
+/** turnRowSuffixes lists one turn's row keys in render order. */
+internal fun turnRowSuffixes(uiKey: Any, turn: Turn, expanded: Boolean): List<String> {
+    if (!turnIsMultiRow(turn)) return listOf(headerRowSuffix(uiKey))
+    val plan = partFoldPlan(turn.parts)
+    val (head, tail) = visiblePartRanges(plan, expanded)
+    return buildList(3 + rangeSize(head) + rangeSize(tail)) {
+        add(headerRowSuffix(uiKey))
+        for (i in head) add(partRowSuffix(uiKey, i))
+        if (plan.folded) add(moreRowSuffix(uiKey))
+        for (i in tail) add(partRowSuffix(uiKey, i))
+        add(footerRowSuffix(uiKey))
+    }
+}
+
+/** flattenRowSuffixes lists the whole window's row keys in render order — the
+ *  page-scale reference behind Load-earlier anchoring (the per-frame path uses
+ *  [turnRowCount] arithmetic instead). */
+internal fun flattenRowSuffixes(turns: List<Turn>, uiKeys: List<Any>, expanded: Set<Any>): List<String> {
+    val out = ArrayList<String>()
+    for (i in turns.indices) out += turnRowSuffixes(uiKeys[i], turns[i], uiKeys[i] in expanded)
+    return out
+}
+
 // ---- rendering ----
 
 @Composable
@@ -466,12 +585,27 @@ private fun UserBubble(turn: Turn) {
 
 @Composable
 private fun AssistantTurn(turn: Turn, backend: String, onOpenChild: ((String) -> Unit)?) {
+    // Whole-turn reference render (single-item callers); the transcript pane
+    // flattens the same pieces — AssistantTurnHeader + PartView rows — into
+    // individually virtualized LazyColumn items instead.
     Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+        AssistantTurnHeader(turn, backend)
+        turn.parts.forEach { PartView(it, onOpenChild) }
+    }
+}
+
+/** AssistantTurnHeader is an assistant turn's first row: harness glyph + model
+ *  label (bounded by the shared render cap — a runaway label can't hand
+ *  megabytes to layout), plus the "…" placeholder while a live turn has no
+ *  parts yet. Layout matches the pre-flatten header exactly. */
+@Composable
+internal fun AssistantTurnHeader(turn: Turn, backend: String, modifier: Modifier = Modifier) {
+    Column(modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             BackendMark(backend, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.width(6.dp))
             Text(
-                turn.model ?: "assistant",
+                capDisplay(turn.model ?: "assistant"),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -479,9 +613,26 @@ private fun AssistantTurn(turn: Turn, backend: String, onOpenChild: ((String) ->
         Spacer(Modifier.size(2.dp))
         if (turn.parts.isEmpty()) {
             Text("…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } else {
-            turn.parts.forEach { PartView(it, onOpenChild) }
         }
+    }
+}
+
+/** MorePartsRow is the per-turn budget fold: the parts between the head and
+ *  tail windows collapse into this one expandable row (count always honest,
+ *  content never dropped — expanding renders every part, still virtualized). */
+@Composable
+internal fun MorePartsRow(hiddenCount: Int, expanded: Boolean, onToggle: () -> Unit) {
+    Box(
+        Modifier.fillMaxWidth()
+            .clickable(onClick = onToggle)
+            .padding(vertical = 4.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            if (expanded) "Show fewer parts" else "… $hiddenCount more parts — show all",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.primary,
+        )
     }
 }
 
@@ -489,7 +640,9 @@ private fun AssistantTurn(turn: Turn, backend: String, onOpenChild: ((String) ->
 private fun SystemMarker(turn: Turn) {
     Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
         Text(
-            turn.content.orEmpty().ifEmpty { "—" },
+            // System markers are compact separators; the shared cap keeps a
+            // pathological one from handing megabytes to a single Text.
+            capDisplay(turn.content.orEmpty()).ifEmpty { "—" },
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -498,17 +651,36 @@ private fun SystemMarker(turn: Turn) {
 
 @Composable
 private fun ErrorLine(turn: Turn) {
+    val text = turn.content.orEmpty()
     Surface(
         color = MaterialTheme.colorScheme.errorContainer,
         shape = RoundedCornerShape(8.dp),
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
     ) {
-        Text(
-            turn.content.orEmpty(),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onErrorContainer,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-        )
+        if (!isRenderCapped(text)) {
+            Text(
+                text,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            )
+        } else {
+            // Same budget + affordances as part bodies: head + TAIL (the decisive
+            // part of a long error usually sits at the end), Show full on demand,
+            // Copy raw for the complete original.
+            var showFull by rememberSaveable(text) { mutableStateOf(false) }
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                if (showFull) {
+                    Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
+                    TruncationActions("showing full text", showFull = true, onToggle = { showFull = false }, raw = text)
+                } else {
+                    val slices = remember(text) { checkNotNull(renderSlices(text)) }
+                    Text(slices.head, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
+                    TruncationActions("… ${slices.omitted} characters hidden", showFull = false, onToggle = { showFull = true }, raw = text)
+                    Text(slices.tail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
+                }
+            }
+        }
     }
 }
 
@@ -528,27 +700,30 @@ fun PartView(part: TurnPart, onOpenChild: ((String) -> Unit)? = null) {
 private fun WorkflowCard(wf: WorkflowInfo) {
     OutlinedCard(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
         Column(Modifier.padding(10.dp)) {
+            // Every free-text field below goes through the shared render cap:
+            // a multi-MiB workflow summary/name/phase list is server data too,
+            // and used to bypass the per-part budget straight into layout.
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("⌘ Workflow", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    wf.name.ifEmpty { "workflow" },
+                    capDisplay(wf.name).ifEmpty { "workflow" },
                     fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
                 )
-                if (wf.status.isNotEmpty()) StatusChip(wf.status)
+                if (wf.status.isNotEmpty()) StatusChip(capDisplay(wf.status))
             }
             if (wf.phases.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
-                    wf.phases.joinToString("  ›  ") { it.title },
+                    boundedPhaseTrail(wf.phases),
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             if (wf.summary.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
-                    wf.summary, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface,
+                    capDisplay(wf.summary), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 3, overflow = TextOverflow.Ellipsis,
                 )
             }
@@ -635,43 +810,50 @@ private fun ToolCard(part: TurnPart, onOpenChild: ((String) -> Unit)?) {
 
 /** MonoBlock renders code / tool output / unknown-kind content as a scrollable
  *  monospace block. Shared by ToolCard, the PartView fallback, and Markdown code.
- *  A very long block (e.g. a 64 KiB tool output) is bounded to a head + transcript
- *  affordance so one giant Text is never measured/laid out; normal-sized content
+ *  A very long block (e.g. a 64 KiB tool output) is bounded to a code-point-safe
+ *  head + TAIL (the final result/error usually lives at the end) with an honest
+ *  fold row, on-demand "Show full" and "Copy raw" — so one giant Text is never
+ *  measured/laid out by default yet no content is lost. Normal-sized content
  *  keeps the exact original single-Text layout. */
 @Composable
 fun MonoBlock(text: String) {
-    val truncated = text.length > RENDER_CHAR_CAP
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant,
         shape = RoundedCornerShape(6.dp),
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
-        if (!truncated) {
-            Text(
-                text,
-                fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp),
-            )
+        if (!isRenderCapped(text)) {
+            MonoText(text)
         } else {
+            var showFull by rememberSaveable(text) { mutableStateOf(false) }
             Column {
-                Text(
-                    capForRender(text),
-                    fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp),
-                )
-                Text(
-                    RENDER_TRUNCATION_NOTICE,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 8.dp).padding(bottom = 8.dp),
-                )
+                if (showFull) {
+                    MonoText(text)
+                    Box(Modifier.padding(horizontal = 8.dp).padding(bottom = 8.dp)) {
+                        TruncationActions("showing full text", showFull = true, onToggle = { showFull = false }, raw = text)
+                    }
+                } else {
+                    val slices = remember(text) { checkNotNull(renderSlices(text)) }
+                    MonoText(slices.head)
+                    Box(Modifier.padding(horizontal = 8.dp)) {
+                        TruncationActions("… ${slices.omitted} characters hidden", showFull = false, onToggle = { showFull = true }, raw = text)
+                    }
+                    MonoText(slices.tail)
+                }
             }
         }
     }
+}
+
+@Composable
+private fun MonoText(text: String) {
+    Text(
+        text,
+        fontFamily = FontFamily.Monospace,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp),
+    )
 }
 
 // codexMarkPath is render.js's codex glyph (a single filled superellipse) in the

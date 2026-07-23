@@ -33,9 +33,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
@@ -136,12 +136,14 @@ internal fun sessionLive(status: String?): Boolean = when (status?.trim()?.lower
 }
 
 /** anchorAfterPrepend computes the LazyColumn (item index, scroll offset) that
- *  keeps the pre-prepend first visible turn stationary after an earlier page
- *  lands above it. [anchorKey] is that turn's stable display key recorded before
- *  the load; [keysAfter] the merged window's keys; [hasHeaderAfter] whether the
- *  "Load earlier" item still occupies index 0 — on the LAST page it disappears,
- *  which the old `oldIndex + added` arithmetic ignored, landing one row down. A
- *  vanished key falls back to the top of the window. Pure; unit-tested. */
+ *  keeps the pre-prepend first visible row stationary after an earlier page
+ *  lands above it. [anchorKey] is that row's stable display key recorded before
+ *  the load (since the part-level flatten: turn UI id + part ordinal — stable
+ *  because prepends never touch a loaded turn's parts); [keysAfter] the merged
+ *  window's row keys; [hasHeaderAfter] whether the "Load earlier" item still
+ *  occupies index 0 — on the LAST page it disappears, which the old
+ *  `oldIndex + added` arithmetic ignored, landing one row down. A vanished key
+ *  falls back to the top of the window. Pure; unit-tested. */
 internal fun anchorAfterPrepend(
     anchorKey: Any?,
     keysAfter: List<Any>,
@@ -154,11 +156,14 @@ internal fun anchorAfterPrepend(
 }
 
 /** EarlierPage reports one applied "Load earlier" fetch back to the pane: how
- *  many turns landed, the merged window's stable UI ids (to re-anchor scroll by
- *  key), and whether the header item still renders. null = nothing applied (no
- *  more pages, fetch failed, or the response outlived its conversation and was
- *  discarded by the owner CAS). */
-data class EarlierPage(val added: Int, val keys: List<Any>, val hasMore: Boolean)
+ *  many turns landed and the merged window (whose stable UI ids the pane
+ *  flattens into row keys to re-anchor scroll, and whose cursor says whether
+ *  the header item still renders). null = nothing applied (no more pages,
+ *  fetch failed, or the response outlived its conversation and was discarded
+ *  by the owner CAS). */
+data class EarlierPage(val added: Int, val merged: ConvoState) {
+    val hasMore: Boolean get() = merged.cursor?.hasMore == true
+}
 
 /**
  * SessionSel is the hoisted selection state: which node, which root session,
@@ -403,7 +408,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                         val nowOwner = now.node?.let { nn -> now.active?.let { ss -> ConvoOwner(nn, ss) } }
                         applyEarlierPage(convo, ConvoOwner(n, s), nowOwner, page)?.let { merged ->
                             convo = merged
-                            EarlierPage(page.turns.size, merged.uiKeys, merged.cursor?.hasMore == true)
+                            EarlierPage(page.turns.size, merged)
                         }
                     }
             },
@@ -842,11 +847,42 @@ private fun ConversationPane(
                     isReallyAtBottom(last.offset + last.size, info.viewportEndOffset))
             }
         }
+        // Per-turn "show all parts" expansion of the budget fold, keyed by the
+        // turn's lifetime UI id — so it survives live→settle (the id moves with
+        // the turn) and prepends, and resets with the conversation.
+        var expandedParts by remember(paneKey) { mutableStateOf(setOf<Any>()) }
+        val history = convo.history
+        val historyKeys = convo.historyKeys
+        // Fold plans are pure in each turn's parts; the history list reference
+        // is untouched by live part frames (ConvoState's contract), so this
+        // recomputes only on page-scale changes (seed, settle, prepend,
+        // truth-up) — never per streamed part.
+        val historyPlans = remember(history) {
+            history.map { t -> if (turnIsMultiRow(t)) partFoldPlan(t.parts) else null }
+        }
+        val historyRowCount = remember(history, historyKeys, expandedParts) {
+            var n = 0
+            for (i in history.indices) n += turnRowCount(history[i], historyPlans[i], historyKeys[i] in expandedParts)
+            n
+        }
+        val open = convo.open
+        // Planning the open turn per frame is O(head+tail budget), not O(parts).
+        val openPlan = open?.let { partFoldPlan(it.parts) }
+        val openExpanded = convo.openKey?.let { it in expandedParts } == true
+        val hasEarlier = convo.cursor?.hasMore == true
+        val totalRows = (if (hasEarlier) 1 else 0) + historyRowCount +
+            (if (open != null) turnRowCount(open, openPlan, openExpanded) else 0)
+        val totalRowsNow = rememberUpdatedState(totalRows)
+        val togglePartsFold: (Any) -> Unit = { k ->
+            expandedParts = if (k in expandedParts) expandedParts - k else expandedParts + k
+        }
         val lastKey = convo.lastUiKey
         LaunchedEffect(paneKey, lastKey, convo.lastTurn?.parts?.size) {
             if (convo.turnCount == 0) return@LaunchedEffect
-            // Last turn's list index, offset by the "load earlier" header when shown.
-            val target = convo.turnCount - 1 + if (convo.cursor?.hasMore == true) 1 else 0
+            // The window's last ROW (the open turn's trailing row under the
+            // part-level flatten), read post-recomposition so a part landing as
+            // a new row is already counted.
+            val target = totalRowsNow.value - 1
             if (!didInitialScroll) {
                 // The seeded page must land at its newest CONTENT unconditionally —
                 // deciding via atBottom races the first non-empty layout pass.
@@ -859,7 +895,6 @@ private fun ConversationPane(
                 listState.followToBottom(target, animate = true)
             }
         }
-        val hasEarlier = convo.cursor?.hasMore == true
         // Row keys come straight from ConvoState's incremental UI id index —
         // assigned once per turn, stable for the row's whole life (live→exit,
         // prepends, truth-ups) — so nothing is rescanned per frame here.
@@ -877,27 +912,31 @@ private fun ConversationPane(
                             TextButton(onClick = {
                                 scope.launch {
                                     loadingEarlier = true
-                                    // Anchor the first visible TURN by its stable display key,
-                                    // not by raw item index: when the fetched page is the LAST
-                                    // one, hasMore flips false and this very header item
-                                    // disappears — index math (`old + added`) would land one
-                                    // row down. The key survives the prepend unchanged.
+                                    // Anchor the first visible ROW by its stable key (turn UI
+                                    // id + part ordinal), not by raw item index: when the
+                                    // fetched page is the LAST one, hasMore flips false and
+                                    // this very header item disappears — index math
+                                    // (`old + added`) would land one row down. Row keys
+                                    // survive the prepend unchanged (a prepend never touches
+                                    // a loaded turn's parts, plans or expansion).
                                     val first = listState.firstVisibleItemIndex
                                     val offset = if (first >= 1) listState.firstVisibleItemScrollOffset else 0
-                                    val anchorKey = convo.uiKeyAt(maxOf(first, 1) - 1)
-                                    val before = listState.layoutInfo.totalItemsCount
+                                    val rowsBefore = flattenRowSuffixes(convo.turns, convo.uiKeys, expandedParts)
+                                    val anchorKey = rowsBefore.getOrNull(maxOf(first, 1) - 1)
                                     val res = onLoadEarlier()
                                     if (res != null && res.added > 0) {
                                         // Scroll only after the new page reaches layout —
                                         // earlier, scrollToItem clamps to the OLD item count
                                         // and the view lands at the bottom instead. The expected
                                         // count accounts for this header leaving on the last page.
-                                        val expected = before + res.added - (if (res.hasMore) 0 else 1)
+                                        val merged = res.merged
+                                        val rowsAfter = flattenRowSuffixes(merged.turns, merged.uiKeys, expandedParts)
+                                        val expected = rowsAfter.size + (if (res.hasMore) 1 else 0)
                                         withTimeoutOrNull(1000) {
                                             snapshotFlow { listState.layoutInfo.totalItemsCount }
                                                 .first { it >= expected }
                                         }
-                                        val (idx, off) = anchorAfterPrepend(anchorKey, res.keys, res.hasMore, offset)
+                                        val (idx, off) = anchorAfterPrepend(anchorKey, rowsAfter, res.hasMore, offset)
                                         listState.scrollToItem(idx, off)
                                     }
                                     loadingEarlier = false
@@ -912,16 +951,22 @@ private fun ConversationPane(
             // un-namespaced keys would hand node A's row state (tool-card
             // expansion) to node B's rows on a Quick Switcher jump. Settled
             // turns and the open turn are separate item blocks over the SAME
-            // key space: when the open turn settles, its key simply moves from
-            // the trailing item into the history block, so the row (and its
-            // tool-card expand state) is reused, never deleted+reinserted.
-            itemsIndexed(convo.history, key = { i, _ -> "$paneKey|${convo.historyKeys[i]}" }) { _, turn ->
-                TurnView(turn, backend, onOpenChild = onOpenChild)
+            // key space: when the open turn settles, its rows' keys simply move
+            // from the trailing block into the history block (fold plans are
+            // pure in the unchanged parts), so every row — and its tool-card /
+            // Show-full state — is reused, never deleted+reinserted. A live
+            // part append adds ONE trailing row; existing row keys never change.
+            history.forEachIndexed { i, turn ->
+                turnRowItems(
+                    paneKey, historyKeys[i], turn, historyPlans[i], historyKeys[i] in expandedParts,
+                    backend, onOpenChild, togglePartsFold,
+                )
             }
-            convo.open?.let { live ->
-                item(key = "$paneKey|${convo.openKey}") {
-                    TurnView(live, backend, onOpenChild = onOpenChild)
-                }
+            open?.let { live ->
+                turnRowItems(
+                    paneKey, checkNotNull(convo.openKey), live, openPlan, openExpanded,
+                    backend, onOpenChild, togglePartsFold,
+                )
             }
         }
         convo.status?.takeIf { !readonly }?.let { ThinkingRow(it) }
@@ -934,6 +979,42 @@ private fun ConversationPane(
             InputBar(input, onInput, onSend, switchModels, effortLevels, model, onModel, effort, onEffort, backend)
         }
     }
+}
+
+// turnRowItems emits ONE turn's flattened rows into the transcript LazyColumn:
+// user/system/error turns stay single items under their original bare-UI-id
+// key; an assistant turn becomes [header][part…]([fold])[part…][footer], every
+// key built by the same suffix helpers flattenRowSuffixes/turnRowCount use, so
+// the emitted keys, the anchor math and the follow target can never drift.
+private fun LazyListScope.turnRowItems(
+    paneKey: String, uiKey: Any, turn: Turn, plan: PartFoldPlan?, expanded: Boolean,
+    backend: String, onOpenChild: (String) -> Unit, onToggleMore: (Any) -> Unit,
+) {
+    if (plan == null) {
+        item(key = "$paneKey|${headerRowSuffix(uiKey)}") { TurnView(turn, backend, onOpenChild = onOpenChild) }
+        return
+    }
+    // Header top padding + footer spacer reproduce the whole-turn Column's
+    // `padding(vertical = 3.dp)` so the flatten is visually invisible.
+    item(key = "$paneKey|${headerRowSuffix(uiKey)}") {
+        AssistantTurnHeader(turn, backend, Modifier.padding(top = 3.dp))
+    }
+    val (head, tail) = visiblePartRanges(plan, expanded)
+    items(rangeSize(head), key = { i -> "$paneKey|${partRowSuffix(uiKey, i)}" }) { i ->
+        PartView(turn.parts[i], onOpenChild)
+    }
+    if (plan.folded) {
+        item(key = "$paneKey|${moreRowSuffix(uiKey)}") {
+            MorePartsRow(plan.hiddenCount, expanded) { onToggleMore(uiKey) }
+        }
+    }
+    if (!tail.isEmpty()) {
+        val tailFirst = tail.first
+        items(rangeSize(tail), key = { i -> "$paneKey|${partRowSuffix(uiKey, tailFirst + i)}" }) { i ->
+            PartView(turn.parts[tailFirst + i], onOpenChild)
+        }
+    }
+    item(key = "$paneKey|${footerRowSuffix(uiKey)}") { Spacer(Modifier.height(3.dp)) }
 }
 
 // ThinkingRow is the transient activity signal above the composer: staggered
@@ -989,7 +1070,7 @@ private fun ConversationHeader(
                 )
                 model?.let {
                     Text(
-                        it,
+                        capDisplay(it), // node-reported free text — same render budget as turn labels
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1, overflow = TextOverflow.Ellipsis,

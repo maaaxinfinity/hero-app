@@ -1,16 +1,24 @@
 package io.hero.app
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.text.ClickableText
+import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -35,25 +43,83 @@ import androidx.compose.ui.unit.dp
 /** Annotation tag carrying a link's target URL through the AnnotatedString. */
 internal const val URL_TAG = "URL"
 
-/** RENDER_CHAR_CAP bounds the characters any single Text / markdown body renders.
- *  The node RPC caps a part at ~64 KiB and a turn at ~512 KiB, but one legit 64 KiB
- *  part of short lines still expands into tens of thousands of blocks/spans and a
- *  single enormous Text. This is a defensive *view* cap: content past it stays in
- *  the transcript (reachable there) — normal chat messages are a few KiB, far below
- *  it, so they render unchanged. Deliberately generous. */
+/** RENDER_CHAR_CAP is the threshold past which a single Text / markdown body is
+ *  truncated for the DEFAULT view. The node RPC caps a part at ~64 KiB and a turn
+ *  at ~512 KiB, but one legit 64 KiB part of short lines still expands into tens
+ *  of thousands of blocks/spans and a single enormous Text. Normal chat messages
+ *  are a few KiB, far below it, so they render unchanged. Deliberately generous. */
 internal const val RENDER_CHAR_CAP = 16 * 1024
 
-/** Shown after a body that [capForRender] truncated, so the cut is visible. */
-internal const val RENDER_TRUNCATION_NOTICE = "… (truncated in view; full text in transcript)"
+/** A capped body renders its first RENDER_HEAD_CHARS and last RENDER_TAIL_CHARS
+ *  (head + tail, so a final result/error living at the END of a huge tool output
+ *  stays visible), with an explicit fold row in between. Head + tail == the cap,
+ *  so anything at or under RENDER_CHAR_CAP renders exactly as before. */
+internal const val RENDER_HEAD_CHARS = 12 * 1024
+internal const val RENDER_TAIL_CHARS = 4 * 1024
 
-/** capForRender returns [s] unchanged when within [RENDER_CHAR_CAP], else its first
- *  RENDER_CHAR_CAP chars. Pure — the caller adds the visible affordance when
- *  [isRenderCapped] is true. */
-internal fun capForRender(s: String): String =
-    if (s.length <= RENDER_CHAR_CAP) s else s.substring(0, RENDER_CHAR_CAP)
+/** RENDER_BLOCK_CAP bounds how many parsed markdown blocks one body SEGMENT
+ *  composes by default: a 12 KiB head of one-char lines is ~6k blocks — thousands
+ *  of eager Compose nodes for a single row. Blocks past it fold into the same
+ *  Show-full affordance; nothing is lost. */
+internal const val RENDER_BLOCK_CAP = 512
 
-/** isRenderCapped reports whether [capForRender] would drop content. */
+/** isRenderCapped reports whether the default view truncates [s]. */
 internal fun isRenderCapped(s: String): Boolean = s.length > RENDER_CHAR_CAP
+
+/** RenderSlices is the default view of a capped body: [head] + (omitted middle of
+ *  [omitted] chars) + [tail]. head + middle + tail reconstruct the original
+ *  exactly — truncation is view-level only, never data loss. */
+internal data class RenderSlices(val head: String, val tail: String, val omitted: Int)
+
+/** codePointSafeEnd backs [end] off by one when cutting there would split a
+ *  surrogate pair — a head slice must never end in a dangling high surrogate. */
+internal fun codePointSafeEnd(s: String, end: Int): Int =
+    if (end in 1 until s.length && s[end - 1].isHighSurrogate() && s[end].isLowSurrogate()) end - 1 else end
+
+/** codePointSafeStart advances [start] by one when it would land on the low half
+ *  of a surrogate pair — a tail slice must never begin mid-code-point. */
+internal fun codePointSafeStart(s: String, start: Int): Int =
+    if (start in 1 until s.length && s[start].isLowSurrogate() && s[start - 1].isHighSurrogate()) start + 1 else start
+
+/** renderSlices splits an over-cap body into its rendered head + tail (both
+ *  code-point safe: a surrogate pair is dropped whole, never split into lone
+ *  halves) and the exact count of chars folded between them. Returns null when
+ *  [s] is within the cap and renders whole. Pure; unit-tested. */
+internal fun renderSlices(s: String): RenderSlices? {
+    if (s.length <= RENDER_CHAR_CAP) return null
+    val headEnd = codePointSafeEnd(s, RENDER_HEAD_CHARS)
+    val tailStart = codePointSafeStart(s, s.length - RENDER_TAIL_CHARS)
+    return RenderSlices(s.substring(0, headEnd), s.substring(tailStart), tailStart - headEnd)
+}
+
+/** capDisplay bounds a free-text LABEL (workflow name/status/summary, system
+ *  marker, model chip …) to the same render cap: within it the string passes
+ *  through untouched; past it a code-point-safe head + "…" is shown. Labels are
+ *  decorative one/few-liners — head-only is honest there because the Text itself
+ *  already ellipsizes; content-bearing bodies use [renderSlices] instead. */
+internal fun capDisplay(s: String): String =
+    if (s.length <= RENDER_CHAR_CAP) s
+    else s.substring(0, codePointSafeEnd(s, RENDER_CHAR_CAP)) + "…"
+
+/** boundedPhaseTrail renders the workflow phase breadcrumb without ever
+ *  materializing an unbounded join: titles append (separated like the original
+ *  joinToString) only until the shared render cap, then "…". Under the cap the
+ *  output is byte-identical to the old `joinToString("  ›  ") { it.title }`. */
+internal fun boundedPhaseTrail(phases: List<WorkflowPhase>): String {
+    val sb = StringBuilder()
+    for ((i, p) in phases.withIndex()) {
+        if (i > 0) sb.append("  ›  ")
+        val room = RENDER_CHAR_CAP - sb.length
+        if (room <= 0) { sb.append('…'); break }
+        val t = p.title
+        if (t.length <= room) sb.append(t)
+        else {
+            sb.append(t, 0, codePointSafeEnd(t, room)).append('…')
+            break
+        }
+    }
+    return sb.toString()
+}
 
 internal sealed interface MdBlock {
     data class Code(val text: String) : MdBlock
@@ -65,49 +131,107 @@ internal sealed interface MdBlock {
 
 @Composable
 fun MarkdownText(md: String, modifier: Modifier = Modifier) {
-    // Defensive per-part view cap: parse/annotate only a bounded head so a huge
-    // part can't expand into an unbounded block/span tree (the full text stays in
-    // the transcript). Normal messages sit far below the cap and are unaffected.
-    val capped = remember(md) { capForRender(md) }
-    val truncated = md.length > RENDER_CHAR_CAP
-    val blocks = remember(capped) { parseBlocks(capped) }
+    // Defensive per-part view budget. Under the cap (the overwhelmingly common
+    // case) this is exactly the pre-budget render. Past it the DEFAULT view is a
+    // code-point-safe head + tail with an honest fold row between them; "Show
+    // full" parses the entire body on demand (collapsible) and "Copy raw" puts
+    // the complete original on the clipboard. This screen IS the transcript, so
+    // the fold row states what is hidden instead of pointing elsewhere. Block
+    // counts are budgeted per segment too — a body of one-char lines can't
+    // eagerly compose thousands of nodes into a single row.
+    val slices = if (isRenderCapped(md)) remember(md) { renderSlices(md) } else null
+    var showFull by rememberSaveable(md) { mutableStateOf(false) }
+    SelectionContainer(modifier) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (slices == null || showFull) {
+                val blocks = remember(md) { parseBlocks(md) }
+                // Show full renders EVERYTHING the user asked for; the default
+                // path bounds composed blocks and folds the rest.
+                val shown = if (showFull) blocks else blocks.take(RENDER_BLOCK_CAP)
+                shown.forEach { b -> MdBlockView(b) }
+                val hiddenBlocks = blocks.size - shown.size
+                when {
+                    hiddenBlocks > 0 -> TruncationActions(
+                        label = "… $hiddenBlocks more blocks hidden",
+                        showFull = false, onToggle = { showFull = true }, raw = md,
+                    )
+                    showFull -> TruncationActions(
+                        label = "showing full text",
+                        showFull = true, onToggle = { showFull = false }, raw = md,
+                    )
+                }
+            } else {
+                val headBlocks = remember(slices) { parseBlocks(slices.head) }
+                val tailBlocks = remember(slices) { parseBlocks(slices.tail) }
+                val headShown = headBlocks.take(RENDER_BLOCK_CAP)
+                val tailShown = if (tailBlocks.size <= RENDER_BLOCK_CAP) tailBlocks else tailBlocks.subList(tailBlocks.size - RENDER_BLOCK_CAP, tailBlocks.size)
+                headShown.forEach { b -> MdBlockView(b) }
+                val hiddenBlocks = (headBlocks.size - headShown.size) + (tailBlocks.size - tailShown.size)
+                TruncationActions(
+                    label = if (hiddenBlocks > 0) "… ${slices.omitted} characters + $hiddenBlocks blocks hidden"
+                    else "… ${slices.omitted} characters hidden",
+                    showFull = false, onToggle = { showFull = true }, raw = md,
+                )
+                // The tail keeps its END — the newest/final content — when block-capped.
+                tailShown.forEach { b -> MdBlockView(b) }
+            }
+        }
+    }
+}
+
+// MdBlockView renders ONE parsed markdown block — the same dispatch the whole-body
+// Column used before the per-segment budget split it up.
+@Composable
+private fun MdBlockView(b: MdBlock) {
     val link = MaterialTheme.colorScheme.primary
     val codeBg = MaterialTheme.colorScheme.surfaceVariant
     val body = MaterialTheme.typography.bodyMedium
-    SelectionContainer(modifier) {
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            blocks.forEach { b ->
-                when (b) {
-                    is MdBlock.Code -> MonoBlock(b.text)
-                    is MdBlock.Heading -> LinkableText(
-                        parseInline(b.text, link, codeBg),
-                        style = when (b.level) {
-                            1 -> MaterialTheme.typography.titleMedium
-                            2 -> MaterialTheme.typography.titleSmall
-                            else -> MaterialTheme.typography.bodyLarge
-                        }.copy(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface),
-                    )
-                    is MdBlock.Bullet -> Row {
-                        Text("•  ", style = body, color = MaterialTheme.colorScheme.onSurface)
-                        LinkableText(parseInline(b.text, link, codeBg), style = body.copy(color = MaterialTheme.colorScheme.onSurface))
-                    }
-                    is MdBlock.Ordered -> Row {
-                        Text("${b.marker}  ", style = body, color = MaterialTheme.colorScheme.onSurface)
-                        LinkableText(parseInline(b.text, link, codeBg), style = body.copy(color = MaterialTheme.colorScheme.onSurface))
-                    }
-                    is MdBlock.Paragraph -> LinkableText(
-                        parseInline(b.text, link, codeBg),
-                        style = body.copy(color = MaterialTheme.colorScheme.onSurface),
-                    )
-                }
-            }
-            if (truncated) {
-                Text(
-                    RENDER_TRUNCATION_NOTICE,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+    when (b) {
+        is MdBlock.Code -> MonoBlock(b.text)
+        is MdBlock.Heading -> LinkableText(
+            parseInline(b.text, link, codeBg),
+            style = when (b.level) {
+                1 -> MaterialTheme.typography.titleMedium
+                2 -> MaterialTheme.typography.titleSmall
+                else -> MaterialTheme.typography.bodyLarge
+            }.copy(fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface),
+        )
+        is MdBlock.Bullet -> Row {
+            Text("•  ", style = body, color = MaterialTheme.colorScheme.onSurface)
+            LinkableText(parseInline(b.text, link, codeBg), style = body.copy(color = MaterialTheme.colorScheme.onSurface))
+        }
+        is MdBlock.Ordered -> Row {
+            Text("${b.marker}  ", style = body, color = MaterialTheme.colorScheme.onSurface)
+            LinkableText(parseInline(b.text, link, codeBg), style = body.copy(color = MaterialTheme.colorScheme.onSurface))
+        }
+        is MdBlock.Paragraph -> LinkableText(
+            parseInline(b.text, link, codeBg),
+            style = body.copy(color = MaterialTheme.colorScheme.onSurface),
+        )
+    }
+}
+
+/** TruncationActions is the fold row under/inside a budgeted body: an honest
+ *  count of what the view hides, "Show full"/"Show less" toggling the on-demand
+ *  complete render, and "Copy raw" putting the ENTIRE original text on the
+ *  clipboard. Wrapped in DisableSelection so drag-selecting the body never
+ *  copies this chrome as if it were content. */
+@Composable
+internal fun TruncationActions(label: String, showFull: Boolean, onToggle: () -> Unit, raw: String) {
+    val clipboard = LocalClipboardManager.current
+    DisableSelection {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                if (showFull) "Show less" else "Show full",
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.clickable(onClick = onToggle),
+            )
+            Text(
+                "Copy raw",
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.clickable { clipboard.setText(AnnotatedString(raw)) },
+            )
         }
     }
 }

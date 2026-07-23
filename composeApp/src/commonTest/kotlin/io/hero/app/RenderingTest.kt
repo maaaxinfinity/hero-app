@@ -169,20 +169,31 @@ class RenderingTest {
         parseInline("[".repeat(4096), Color.Black, Color.White)
     }
 
-    // The per-part view cap keeps a huge body from rendering wholesale: a multi-MiB
-    // string is bounded to RENDER_CHAR_CAP chars, and short-line markdown parses a
-    // bounded number of blocks instead of one block per line for the whole part.
+    // The per-part view budget keeps a huge body from rendering wholesale: a
+    // multi-MiB string is bounded to a code-point-safe head + tail (summing to at
+    // most RENDER_CHAR_CAP chars) before layout, and short-line markdown parses a
+    // bounded number of blocks per slice instead of one block per line for the
+    // whole part. (Mechanical adaptation of the old head-only capForRender test:
+    // truncation became head+tail with Show full / Copy raw, so the API is
+    // renderSlices now — the pre-layout bound this test guards is unchanged, and
+    // sub-cap content still renders untouched.)
     @Test
     fun renderCapBoundsHugeContent() {
         val small = "hello **world**"
-        assertEquals(small, capForRender(small))
+        assertNull(renderSlices(small))
         assertFalse(isRenderCapped(small))
 
         val huge = "a".repeat(4 * 1024 * 1024) // multi-MiB
         assertTrue(isRenderCapped(huge))
-        assertEquals(RENDER_CHAR_CAP, capForRender(huge).length)
+        val slices = renderSlices(huge)!!
+        assertEquals(RENDER_HEAD_CHARS, slices.head.length)
+        assertEquals(RENDER_TAIL_CHARS, slices.tail.length)
+        assertTrue(slices.head.length + slices.tail.length <= RENDER_CHAR_CAP)
+        assertEquals(huge.length, slices.head.length + slices.omitted + slices.tail.length)
 
         val manyLines = "x\n".repeat(1_000_000)
-        assertTrue(parseBlocks(capForRender(manyLines)).size <= RENDER_CHAR_CAP)
+        val sliced = renderSlices(manyLines)!!
+        assertTrue(parseBlocks(sliced.head).size <= RENDER_CHAR_CAP)
+        assertTrue(parseBlocks(sliced.tail).size <= RENDER_CHAR_CAP)
     }
 }
