@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -50,7 +51,7 @@ fun Dock(
     section: Section,
     onSelect: (Section) -> Unit,
     onSignOut: () -> Unit,
-    attention: Boolean = false, // fleet has pending permission requests
+    attentionCount: Int = 0, // fleet count of actionable items (permission/question)
 ) {
     // Admins see all seven items; 40dp cells keep the row inside a 360dp phone.
     val item = if (LocalWindowWidth.current == WindowWidth.Compact) 40.dp else 44.dp
@@ -69,7 +70,7 @@ fun Dock(
                         DockItem(
                             section = s,
                             selected = s == section,
-                            badge = s == Section.Sessions && attention,
+                            badge = if (s == Section.Attention) attentionCount else 0,
                             size = item,
                             onClick = { onSelect(s) },
                         )
@@ -91,7 +92,7 @@ private fun DockDivider() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DockItem(section: Section, selected: Boolean, badge: Boolean, size: Dp, onClick: () -> Unit) {
+private fun DockItem(section: Section, selected: Boolean, badge: Int, size: Dp, onClick: () -> Unit) {
     TooltipBox(
         positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
         tooltip = { PlainTooltip { Text(section.label) } },
@@ -115,11 +116,21 @@ private fun DockItem(section: Section, selected: Boolean, badge: Boolean, size: 
                         .size(3.dp).background(MaterialTheme.colorScheme.primary, CircleShape),
                 )
             }
-            if (badge) {
+            if (badge > 0) {
                 Box(
-                    Modifier.align(Alignment.TopEnd).padding(top = 6.dp, end = 6.dp)
-                        .size(6.dp).background(MaterialTheme.colorScheme.error, CircleShape),
-                )
+                    Modifier.align(Alignment.TopEnd).padding(top = 3.dp, end = 3.dp)
+                        .defaultMinSize(minWidth = 14.dp, minHeight = 14.dp)
+                        .background(MaterialTheme.colorScheme.error, CircleShape)
+                        .padding(horizontal = 3.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        if (badge > 9) "9+" else badge.toString(),
+                        color = MaterialTheme.colorScheme.onError,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
             }
         }
     }

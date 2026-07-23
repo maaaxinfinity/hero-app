@@ -35,6 +35,7 @@ fun SectionGlyph(section: Section, modifier: Modifier = Modifier, tint: Color) {
         scale(s, s, pivot = Offset.Zero) {
             when (section) {
                 Section.Sessions -> sessionsGlyph(tint)
+                Section.Attention -> bellGlyph(tint)
                 Section.Nodes -> nodesGlyph(tint)
                 Section.Control -> updatesGlyph(tint)
                 Section.Users -> usersGlyph(tint)
@@ -57,6 +58,19 @@ private fun DrawScope.sessionsGlyph(tint: Color) {
     }
     drawPath(prompt, tint, style = lineStroke())
     drawLine(tint, Offset(12.4f, 15.6f), Offset(17.2f, 15.6f), LINE, StrokeCap.Round)
+}
+
+// Bell: dome + rim + clapper — the attention inbox.
+private fun DrawScope.bellGlyph(tint: Color) {
+    val bell = Path().apply {
+        moveTo(6.5f, 16.5f)
+        cubicTo(6.5f, 11f, 7.5f, 6.5f, 12f, 6.5f)
+        cubicTo(16.5f, 6.5f, 17.5f, 11f, 17.5f, 16.5f)
+    }
+    drawPath(bell, tint, style = lineStroke())
+    drawLine(tint, Offset(4.6f, 16.5f), Offset(19.4f, 16.5f), LINE, StrokeCap.Round)
+    drawLine(tint, Offset(12f, 4.4f), Offset(12f, 6.5f), LINE, StrokeCap.Round)
+    drawCircle(tint, radius = 1.5f, center = Offset(12f, 18.4f), style = lineStroke())
 }
 
 // Two stacked machines, each with a status dot.

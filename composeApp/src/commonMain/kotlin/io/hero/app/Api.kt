@@ -127,6 +127,12 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun pending(node: String): List<Pending> =
         client.get("$baseUrl/api/nodes/${node.enc()}/pending").body()
 
+    /** attention is the cross-fleet inbox: one aggregate of everything wanting the
+     *  user's attention across every accessible connected node (permission/question
+     *  + recent finished/errored), each item stamped with its node. */
+    suspend fun attention(): List<AttentionItem> =
+        client.get("$baseUrl/api/attention").body()
+
     // ---- conversation: structured window (history + grouped live tail) ----
 
     /** transcript fetches one grouped display page. offset=null → newest page; the
@@ -153,9 +159,14 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
             .filter { it.session_id.isEmpty() || it.session_id == session }
             .mapNotNull { decodeLiveFrame(it, json) }
 
-    suspend fun respond(node: String, id: String, behavior: String) {
+    suspend fun respond(node: String, id: String, behavior: String) =
+        respond(node, id, RespondReq(behavior))
+
+    /** respond resolves a pending interaction with a full request (scope for
+     *  "allow always", answers for AskUserQuestion). */
+    suspend fun respond(node: String, id: String, req: RespondReq) {
         client.post("$baseUrl/api/nodes/${node.enc()}/pending/${id.enc()}/respond") {
-            contentType(ContentType.Application.Json); setBody(RespondReq(behavior))
+            contentType(ContentType.Application.Json); setBody(req)
         }.orThrow()
     }
 

@@ -12,6 +12,9 @@ object FleetCache {
     val nodes = mutableStateOf<List<NodeView>?>(null)
     val users = mutableStateOf<List<UserInfo>?>(null)
     val audit = mutableStateOf<List<AuditRecord>?>(null)
+    // Cross-fleet attention inbox (GET /api/attention), polled by MainScreen so
+    // the dock count and the Attention screen share one fetch.
+    val attention = mutableStateOf<List<AttentionItem>?>(null)
     val sessions = mutableStateMapOf<String, List<Session>>()
     // Per-node harness state (version probes + model catalogs). A heavier node
     // RPC, so it is cached read-through: the model/effort pickers reuse it instead
@@ -22,6 +25,7 @@ object FleetCache {
         nodes.value = null
         users.value = null
         audit.value = null
+        attention.value = null
         sessions.clear()
         harness.clear()
     }

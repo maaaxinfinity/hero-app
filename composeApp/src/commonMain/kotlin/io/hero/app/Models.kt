@@ -223,7 +223,43 @@ data class Pending(
     val session_id: String = "",
     val tool_name: String = "",
     val event: String = "",
+    // tool_input is the raw backend request payload; for AskUserQuestion it holds
+    // the questions. allow_always is true only when the backend advertised a
+    // native "always" rule, gating the "Allow always" (session scope) action.
+    val tool_input: JsonElement? = null,
+    val allow_always: Boolean = false,
 )
+
+// AttentionItem is one entry in the cross-fleet attention inbox (GET
+// /api/attention): an actionable permission/question or an informational
+// finished/errored turn, stamped with its owning node. Mirrors core.AttentionItem.
+@Serializable
+data class AttentionItem(
+    val node: String = "",
+    val session_id: String = "",
+    val kind: String = "",           // permission | question | finished | errored
+    val id: String = "",
+    val tool_name: String = "",
+    val tool_input: JsonElement? = null,
+    val allow_always: Boolean = false,
+    val event: String = "",
+    val title: String = "",
+    val detail: String = "",
+    val created_at: String = "",
+)
+
+// AskQuestion / AskOption model an AskUserQuestion tool_input so the inbox can
+// render option buttons. Parsed from AttentionItem.tool_input when kind=="question".
+@Serializable
+data class AskQuestion(
+    val question: String = "",
+    val header: String = "",
+    val multiSelect: Boolean = false,
+    val options: List<AskOption> = emptyList(),
+)
+
+@Serializable
+data class AskOption(val label: String = "", val description: String = "", val preview: String = "")
 
 @Serializable
 data class AuditRecord(
@@ -251,8 +287,17 @@ data class BackendReq(val backend: String = "")
 // backend pins the harness explicitly; "" lets the node infer it from the
 // model (legacy behavior — wrong on dual-harness nodes with a blank model).
 data class StartSessionReq(val cwd: String = "", val initial_message: String = "", val model: String = "", val backend: String = "")
+// RespondReq resolves a pending interaction. scope "session" is the "allow
+// always" choice (valid only when the pending advertised allow_always); answers
+// resolves an AskUserQuestion (behavior "allow"). Defaults are omitted on the
+// wire (encodeDefaults is off), so a plain RespondReq("allow") is unchanged.
 @Serializable
-data class RespondReq(val behavior: String)
+data class RespondReq(
+    val behavior: String,
+    val scope: String = "",
+    val reason: String = "",
+    val answers: Map<String, String>? = null,
+)
 @Serializable
 data class MessageResult(val message: String = "")
 

@@ -286,6 +286,7 @@ private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSe
 // (nodes + the control plane itself), 3 people & permissions, 4 system.
 enum class Section(val label: String, val adminOnly: Boolean, val group: Int) {
     Sessions("Sessions", false, 1),
+    Attention("Attention", false, 1),
     Nodes("Nodes", false, 2),
     Control("Control plane", true, 2),
     Users("Users", true, 3),
@@ -337,21 +338,19 @@ private fun MainScreen(
         )
     }
 
-    // Fleet-wide attention signal: any pending permission request on any
-    // connected node lights the dock's Sessions badge (agents block on these).
-    // The node fetch feeds FleetCache (so every screen stays fresh for free)
-    // and the per-node pending probes run concurrently, not as a waterfall.
-    var attention by remember { mutableStateOf(false) }
+    // Fleet-wide attention: one aggregate call (GET /api/attention) feeds both the
+    // dock count and the Attention screen (via FleetCache). This replaces the old
+    // N-per-node pending fan-out — one request instead of a fan-out that scaled
+    // with fleet size (and could time out). The node fetch still feeds FleetCache
+    // so every other screen stays fresh for free.
+    var attentionCount by remember { mutableStateOf(0) }
     LaunchedEffect(Unit) {
         while (isActive) {
+            runCatching { FleetCache.nodes.value = api.nodes() }
             runCatching {
-                val ns = api.nodes()
-                FleetCache.nodes.value = ns
-                attention = coroutineScope {
-                    ns.filter { it.connected }.map { n ->
-                        async { runCatching { api.pending(n.node_id).isNotEmpty() }.getOrDefault(false) }
-                    }.awaitAll()
-                }.any { it }
+                val items = api.attention()
+                FleetCache.attention.value = items
+                attentionCount = items.count { it.kind == "permission" || it.kind == "question" }
             }
             delay(7000)
         }
@@ -373,6 +372,9 @@ private fun MainScreen(
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (section) {
                 Section.Sessions -> SessionsScreen(api, settings, sel, onSel = { sel = it })
+                Section.Attention -> AttentionScreen(api, onOpen = { node, sess ->
+                    sel = SessionSel(node = node, session = sess); section = Section.Sessions
+                })
                 Section.Nodes -> NodesScreen(api, me, settings, focus = nodesFocus, onFocusConsumed = { nodesFocus = null })
                 Section.Control -> ControlScreen(api)
                 Section.Users -> UsersScreen(api, me, onOpenNode = { id ->
@@ -386,7 +388,7 @@ private fun MainScreen(
             visible = !conversationOpen,
             enter = expandVertically(tween(220)), exit = shrinkVertically(tween(220)),
         ) {
-            Dock(me, section, selectSection, onSignOut, attention = attention)
+            Dock(me, section, selectSection, onSignOut, attentionCount = attentionCount)
         }
     }
 }
