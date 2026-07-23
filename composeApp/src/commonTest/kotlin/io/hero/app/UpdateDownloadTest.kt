@@ -4,6 +4,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 // Covers the pure, engine-free validation gates the updater applies around a
 // download: status, declared size, and post-transfer size. The byte-copy loop
@@ -20,10 +21,17 @@ class UpdateDownloadTest {
     }
 
     @Test
-    fun acceptsSuccessAndReturnsDeclaredLength() {
+    fun acceptsOnlyACompleteResponse200() {
         assertEquals(1234L, validateDownloadStatus(200, 1234))
-        assertEquals(1234L, validateDownloadStatus(206, 1234)) // partial content is 2xx
-        assertNull(validateDownloadStatus(200, null))          // no Content-Length is allowed
+        assertNull(validateDownloadStatus(200, null)) // no Content-Length: package verification closes it
+        // The updater never sends Range: a 206's Content-Length describes a
+        // SEGMENT, so matching it would "verify" a partial APK/JAR as complete.
+        val partial = assertFailsWith<UpdateDownloadException> { validateDownloadStatus(206, 1234) }
+        assertTrue(partial.message!!.contains("partial"))
+        // Nor do the other 2xx shapes carry the verbatim complete asset.
+        assertFailsWith<UpdateDownloadException> { validateDownloadStatus(202, 1234) }
+        assertFailsWith<UpdateDownloadException> { validateDownloadStatus(203, 1234) }
+        assertFailsWith<UpdateDownloadException> { validateDownloadStatus(204, null) }
     }
 
     @Test
