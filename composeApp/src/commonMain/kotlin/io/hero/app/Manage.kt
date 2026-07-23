@@ -95,6 +95,7 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
     var configBackend by remember { mutableStateOf<String?>(null) }
     // View mode persists (cards read the fleet at a glance; list scans dense).
     var cardView by remember { mutableStateOf(settings.getString(Keys.NodesView) != "list") }
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(reload) {
         runCatching { api.nodes() }
@@ -129,7 +130,7 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
                     Spacer(Modifier.weight(1f))
                     ViewToggle(cardView) { want ->
                         cardView = want
-                        settings.putString(Keys.NodesView, if (want) "card" else "list")
+                        scope.launch { settings.update { it[Keys.NodesView] = if (want) "card" else "list" } }
                     }
                     Spacer(Modifier.width(4.dp))
                     IconButton(onClick = { reload++ }) {

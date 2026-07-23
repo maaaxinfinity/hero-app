@@ -103,6 +103,9 @@ private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (T
     // The order is load-bearing: imePadding after systemBars adds only the
     // remainder, so the composer sits flush on the IME. Desktop insets are zero.
     Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.systemBars).imePadding()) {
+        // Persisting a settings change is an atomic off-UI batch; it is launched
+        // here (never awaited on a click) so the store I/O never blocks a frame.
+        val scope = rememberCoroutineScope()
         var api by remember { mutableStateOf<Api?>(null) }
         var me by remember { mutableStateOf(Me()) }
         var showSettings by remember { mutableStateOf(false) }
@@ -133,9 +136,11 @@ private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (T
                 "settings" -> SettingsScreen(
                     settings = settings,
                     themeMode = themeMode,
-                    onThemeMode = { onThemeMode(it); settings.putString(Keys.ThemeMode, it.id) },
+                    onThemeMode = { mode -> onThemeMode(mode); scope.launch { settings.update { it[Keys.ThemeMode] = mode.id } } },
                     onForget = {
-                        settings.remove(Keys.Cookie); settings.remove(Keys.Remember); settings.remove(Keys.Username)
+                        // One batch clears the whole saved login, so the section
+                        // recomposes to "Nothing saved" the instant it commits.
+                        scope.launch { settings.update { it.remove(Keys.ServerUrl); it.remove(Keys.Username); it.remove(Keys.Remember); it.remove(Keys.Cookie) } }
                     },
                     onClose = { showSettings = false },
                 )
@@ -147,14 +152,18 @@ private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (T
                 else -> MainScreen(
                     api!!, me, settings,
                     themeMode = themeMode,
-                    onThemeMode = { onThemeMode(it); settings.putString(Keys.ThemeMode, it.id) },
+                    onThemeMode = { mode -> onThemeMode(mode); scope.launch { settings.update { it[Keys.ThemeMode] = mode.id } } },
                     onForget = {
-                        settings.remove(Keys.Cookie); settings.remove(Keys.Remember); settings.remove(Keys.Username)
+                        // One batch clears the whole saved login, so the section
+                        // recomposes to "Nothing saved" the instant it commits.
+                        scope.launch { settings.update { it.remove(Keys.ServerUrl); it.remove(Keys.Username); it.remove(Keys.Remember); it.remove(Keys.Cookie) } }
                     },
                     onSignOut = {
                         api = null; me = Me()
                         FleetCache.clear()
-                        settings.remove(Keys.Cookie); settings.remove(Keys.Remember)
+                        // Sign out keeps server+user (convenience for quick re-login);
+                        // only the durable "remember me" cookie pair is dropped.
+                        scope.launch { settings.update { it.remove(Keys.Cookie); it.remove(Keys.Remember) } }
                     },
                 )
             }
@@ -247,13 +256,18 @@ private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSe
                                             val a = checkedApi ?: Api(url.trim().trimEnd('/'))
                                             if (a.login(user, pass)) {
                                                 val m = runCatching { a.me() }.getOrDefault(Me(user = user))
-                                                settings.putString(Keys.ServerUrl, url.trim().trimEnd('/'))
-                                                settings.putString(Keys.Username, user)
-                                                if (remember) {
-                                                    settings.putString(Keys.Remember, "1")
-                                                    a.sessionCookie?.let { settings.putString(Keys.Cookie, it) }
-                                                } else {
-                                                    settings.remove(Keys.Remember); settings.remove(Keys.Cookie)
+                                                val server = url.trim().trimEnd('/')
+                                                // One atomic batch: server+user (+remember+cookie) or
+                                                // the cleared pair — never a half-written combination.
+                                                settings.update {
+                                                    it[Keys.ServerUrl] = server
+                                                    it[Keys.Username] = user
+                                                    if (remember) {
+                                                        it[Keys.Remember] = "1"
+                                                        a.sessionCookie?.let { c -> it[Keys.Cookie] = c }
+                                                    } else {
+                                                        it.remove(Keys.Remember); it.remove(Keys.Cookie)
+                                                    }
                                                 }
                                                 onLogin(a, m)
                                             } else error = "Invalid credentials"

@@ -263,9 +263,9 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     }
     PredictiveBack(enabled = sel.session != null, onBack = onBackInPane)
 
-    val toggleCollapse = {
+    val toggleCollapse: () -> Unit = {
         collapsed = !collapsed
-        settings.putString(Keys.SidebarCollapsed, if (collapsed) "1" else "0")
+        scope.launch { settings.update { it[Keys.SidebarCollapsed] = if (collapsed) "1" else "0" } }
     }
     // Desktop shortcuts: Ctrl/Cmd+B collapses the sidebar, Ctrl/Cmd+I toggles
     // the session inspector, Esc backs out of the open conversation (drill
