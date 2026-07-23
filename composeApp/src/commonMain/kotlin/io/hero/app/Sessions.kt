@@ -149,6 +149,9 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     var sessionsLoading by remember { mutableStateOf(false) }
     var nodesError by remember { mutableStateOf<String?>(null) }
     var sessionsError by remember { mutableStateOf<String?>(null) }
+    // A warm node whose refresh keeps failing keeps its last-good list, but is
+    // flagged stale so it doesn't masquerade as authoritative/fresh.
+    var sessionsStale by remember { mutableStateOf(false) }
     var nodesReload by remember { mutableStateOf(0) }
     var sessionsReload by remember { mutableStateOf(0) }
     var showStart by remember { mutableStateOf(false) }
@@ -174,11 +177,12 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         catModels = emptyList(); catEffortLevels = emptyList()
         val n = sel.node
         if (n != null && backend.isNotEmpty()) {
+            val gen = FleetCache.generation
             // Cache-first so opening a session is instant. The cache is refilled
             // by the Nodes inspector and invalidated on Save+apply/Install; a hit
             // here deliberately skips the heavy status RPC.
-            val hs = FleetCache.harness[n]
-                ?: runCatching { api.harness(n) }.getOrNull()?.also { FleetCache.harness[n] = it }
+            val hs = FleetCache.harnessOf(n)
+                ?: runCatching { api.harness(n) }.getOrNull()?.also { FleetCache.putHarness(n, gen, it) }
             hs?.backends?.firstOrNull { it.backend == backend }?.catalog?.let { c ->
                 catModels = c.models.filter { !it.hidden }
                 catEffortLevels = c.effort_levels
@@ -191,25 +195,34 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     // instant. A failure only surfaces when there is nothing usable on screen,
     // and Retry bumps the reload key.
     LaunchedEffect(nodesReload) {
+        val gen = FleetCache.generation
         while (isActive) {
             runCatching { api.nodes() }
-                .onSuccess { FleetCache.nodes.value = it; nodesError = null }
+                .onSuccess { FleetCache.putNodes(gen, it); nodesError = null }
                 .onFailure { if (FleetCache.nodes.value == null) nodesError = it.message ?: "couldn't load nodes" }
             delay(15_000)
         }
     }
     LaunchedEffect(sel.node, sessionsReload) {
         val n = sel.node
-        if (n == null) { sessions = emptyList(); sessionsError = null; return@LaunchedEffect }
+        if (n == null) { sessions = emptyList(); sessionsError = null; sessionsStale = false; return@LaunchedEffect }
+        val gen = FleetCache.generation
         // Cached page first — the spinner is reserved for a truly cold node.
-        val cached = FleetCache.sessions[n]
+        val cached = FleetCache.sessionsOf(n)
         sessions = cached.orEmpty()
         sessionsLoading = cached == null
         sessionsError = null
+        sessionsStale = false
         while (isActive) {
             runCatching { api.sessions(n) }
-                .onSuccess { sessions = it; FleetCache.sessions[n] = it; sessionsError = null }
-                .onFailure { if (sessions.isEmpty()) sessionsError = it.message ?: "couldn't load sessions" }
+                .onSuccess { sessions = it; FleetCache.putSessions(n, gen, it); sessionsError = null; sessionsStale = false }
+                .onFailure {
+                    // Cold node: surface the error. Warm node: keep the last-good
+                    // list on screen but mark it stale rather than treating the
+                    // masked failure as a fresh, authoritative result.
+                    if (sessions.isEmpty()) sessionsError = it.message ?: "couldn't load sessions"
+                    else sessionsStale = true
+                }
             sessionsLoading = false
             delay(10_000)
         }
@@ -284,6 +297,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         SessionListPane(
             nodes = nodes, nodesLoading = nodesLoading, nodesError = nodesError,
             sessions = sessions, sessionsLoading = sessionsLoading, sessionsError = sessionsError,
+            sessionsStale = sessionsStale,
             selNode = sel.node, selSession = sel.session,
             onSelectNode = { onSel(SessionSel(node = it)) },
             onSelectSession = { onSel(sel.copy(session = it, drill = emptyList())) },
@@ -467,6 +481,7 @@ private fun SessionInspector(
 private fun SessionListPane(
     nodes: List<NodeView>, nodesLoading: Boolean, nodesError: String?,
     sessions: List<Session>, sessionsLoading: Boolean, sessionsError: String?,
+    sessionsStale: Boolean = false,
     selNode: String?, selSession: String?,
     onSelectNode: (String) -> Unit, onSelectSession: (String) -> Unit,
     onNewSession: () -> Unit,
@@ -534,6 +549,16 @@ private fun SessionListPane(
                                         )
                                     }
                                 }
+                            }
+                            // Warm-cache refresh is failing: keep the list but say
+                            // so, rather than passing off last-good as fresh.
+                            if (sessionsStale && sessions.isNotEmpty()) {
+                                Text(
+                                    "Couldn't refresh — showing last known.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.padding(start = 8.dp, top = 2.dp),
+                                )
                             }
                         }
                     }

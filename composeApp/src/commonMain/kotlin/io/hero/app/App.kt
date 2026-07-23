@@ -357,6 +357,13 @@ private fun MainScreen(
     // N-per-node pending fan-out — one request instead of a fan-out that scaled
     // with fleet size (and could time out). The node fetch still feeds FleetCache
     // so every other screen stays fresh for free.
+    // Scope the fleet cache to this {server, user} app-session before anything
+    // reads or writes it. Captured once per mount (so a mid-session "Forget",
+    // which clears the saved server, can't spuriously reset it); a server switch
+    // or re-login remounts MainScreen and re-binds, invalidating the cache by
+    // generation instead of relying on a clear() being threaded everywhere.
+    val cacheServer = remember { settings.getString(Keys.ServerUrl).orEmpty() }
+    LaunchedEffect(cacheServer, me.user) { FleetCache.bindIdentity(cacheServer, me.user) }
     // Register for remote push once per app open (Android via UnifiedPush, so a
     // permission prompt reaches the device even when the app is closed). A no-op
     // where unsupported (desktop) or when no distributor is installed.
@@ -370,11 +377,12 @@ private fun MainScreen(
     // only seeds the set — no notification burst on launch.
     var seen by remember { mutableStateOf<Set<String>?>(null) }
     LaunchedEffect(Unit) {
+        val gen = FleetCache.generation
         while (isActive) {
-            runCatching { FleetCache.nodes.value = api.nodes() }
+            runCatching { FleetCache.putNodes(gen, api.nodes()) }
             runCatching {
                 val items = api.attention()
-                FleetCache.attention.value = items
+                FleetCache.putAttention(gen, items)
                 val actionable = items.filter { it.kind == "permission" || it.kind == "question" }
                 attentionCount = actionable.size
                 val ids = actionable.map { it.node + ":" + it.id }.toSet()

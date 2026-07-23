@@ -61,7 +61,7 @@ private val attnJson = Json { ignoreUnknownKeys = true }
 fun AttentionScreen(api: Api, onOpen: (node: String, session: String) -> Unit) {
     val scope = rememberCoroutineScope()
     LaunchedRefresh(api)
-    val refresh: () -> Unit = { scope.launch { runCatching { FleetCache.attention.value = api.attention() } } }
+    val refresh: () -> Unit = { scope.launch { val gen = FleetCache.generation; runCatching { FleetCache.putAttention(gen, api.attention()) } } }
 
     Column(Modifier.fillMaxSize()) {
         TopToolbar("Attention")
@@ -89,11 +89,12 @@ fun AttentionScreen(api: Api, onOpen: (node: String, session: String) -> Unit) {
 @Composable
 private fun LaunchedRefresh(api: Api) {
     androidx.compose.runtime.LaunchedEffect(Unit) {
+        val gen = FleetCache.generation
         // Prime immediately, then poll.
-        runCatching { FleetCache.attention.value = api.attention() }
+        runCatching { FleetCache.putAttention(gen, api.attention()) }
         while (isActive) {
             delay(4000)
-            runCatching { FleetCache.attention.value = api.attention() }
+            runCatching { FleetCache.putAttention(gen, api.attention()) }
         }
     }
 }

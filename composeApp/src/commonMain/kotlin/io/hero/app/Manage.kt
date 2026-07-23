@@ -98,8 +98,9 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(reload) {
+        val gen = FleetCache.generation
         runCatching { api.nodes() }
-            .onSuccess { FleetCache.nodes.value = it; status = null }
+            .onSuccess { FleetCache.putNodes(gen, it); status = null }
             .onFailure { status = it.message }
     }
     // Cross-section focus (a user's "owns"/"shared" link): select once, then clear.
@@ -384,7 +385,10 @@ private fun NodeInspector(
     var harness by remember(n.node_id) { mutableStateOf<HarnessState?>(null) }
     LaunchedEffect(n.node_id, n.connected) {
         if (n.connected && n.scope == "admin") {
-            runCatching { harness = api.harness(n.node_id).also { FleetCache.harness[n.node_id] = it } }
+            val gen = FleetCache.generation
+            // A management-fresh read backfills the shared cache the pickers use.
+            runCatching { api.harness(n.node_id) }
+                .onSuccess { harness = it; FleetCache.putHarness(n.node_id, gen, it) }
                 .onFailure { status = it.message ?: "harness load failed" }
         }
     }
@@ -486,7 +490,9 @@ private fun HarnessConfigPanel(api: Api, nodeId: String, backend: String, onBack
     var status by remember(nodeId, backend) { mutableStateOf<String?>(null) }
     var reload by remember(nodeId, backend) { mutableStateOf(0) }
     LaunchedEffect(nodeId, backend, reload) {
-        runCatching { st = api.harness(nodeId).also { FleetCache.harness[nodeId] = it } }
+        val gen = FleetCache.generation
+        runCatching { api.harness(nodeId) }
+            .onSuccess { st = it; FleetCache.putHarness(nodeId, gen, it) }
             .onFailure { status = it.message ?: "harness load failed" }
     }
     Column(
@@ -717,7 +723,7 @@ private fun HarnessBackendCard(
                             api.setHarnessConfig(nodeId, next)
                             // The cached snapshot is now stale — drop it so the
                             // composer/new-session pickers re-read the node.
-                            FleetCache.harness.remove(nodeId)
+                            FleetCache.invalidateHarness(nodeId)
                             onResult(api.harnessApply(nodeId, b.backend))
                         }.onFailure { onResult(it.message ?: "error") }
                     }
@@ -725,7 +731,7 @@ private fun HarnessBackendCard(
                 OutlinedButton(onClick = {
                     scope.launch {
                         runCatching {
-                            FleetCache.harness.remove(nodeId)
+                            FleetCache.invalidateHarness(nodeId)
                             onResult(api.harnessInstall(nodeId, b.backend))
                         }.onFailure { onResult(it.message ?: "error") }
                     }
@@ -769,8 +775,9 @@ internal fun UsersScreen(api: Api, me: Me, onOpenNode: (String) -> Unit) {
     var query by remember { mutableStateOf("") }
 
     LaunchedEffect(reload) {
+        val gen = FleetCache.generation
         runCatching { api.users() }
-            .onSuccess { FleetCache.users.value = it; status = null }
+            .onSuccess { FleetCache.putUsers(gen, it); status = null }
             .onFailure { status = it.message }
     }
 
@@ -1014,19 +1021,25 @@ internal fun filterAudit(records: List<AuditRecord>, query: String): List<AuditR
 @Composable
 internal fun AuditScreen(api: Api) {
     // Cache-first: show the last fetch instantly, refresh (or re-fetch at the
-    // new limit) in the background.
-    var recs by remember { mutableStateOf(FleetCache.audit.value.orEmpty()) }
-    var loading by remember { mutableStateOf(FleetCache.audit.value == null) }
+    // new limit) in the background. The cache is keyed by limit, so switching
+    // limits never shows a different-limit set as this one's result.
+    var limit by remember { mutableStateOf(300) }
+    var recs by remember { mutableStateOf(FleetCache.auditOf(300).orEmpty()) }
+    var loading by remember { mutableStateOf(FleetCache.auditOf(300) == null) }
     var error by remember { mutableStateOf<String?>(null) }
     var reload by remember { mutableStateOf(0) }
     var query by remember { mutableStateOf("") }
-    var limit by remember { mutableStateOf(300) }
     LaunchedEffect(reload, limit) {
-        if (recs.isEmpty()) loading = true
-        // A failed fetch must not masquerade as an empty log: keep whatever was
-        // last shown and surface the error instead.
+        val gen = FleetCache.generation
+        // Seed from this limit's cache (not whatever limit was last shown); spin
+        // only when this limit is genuinely cold.
+        val cached = FleetCache.auditOf(limit)
+        recs = cached.orEmpty()
+        loading = cached == null
+        // A failed fetch must not masquerade as an empty log or as the previous
+        // limit's set: keep this limit's last-good (if any) and surface the error.
         runCatching { api.audit(limit) }
-            .onSuccess { recs = it; FleetCache.audit.value = it; error = null }
+            .onSuccess { recs = it; FleetCache.putAudit(limit, gen, it); error = null }
             .onFailure { error = it.message ?: "audit fetch failed" }
         loading = false
     }
@@ -1239,8 +1252,9 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
     var status by remember { mutableStateOf<String?>(null) }
     var defaultsByBackend by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     LaunchedEffect(node) {
-        val hs = FleetCache.harness[node]
-            ?: runCatching { api.harness(node) }.getOrNull()?.also { FleetCache.harness[node] = it }
+        val gen = FleetCache.generation
+        val hs = FleetCache.harnessOf(node)
+            ?: runCatching { api.harness(node) }.getOrNull()?.also { FleetCache.putHarness(node, gen, it) }
         // Only enabled harnesses are offerable — a disabled backend in the DTO is
         // management surface (install/enable it in Nodes), not a launch target.
         val bs = hs?.backends.orEmpty().filter { it.enabled }
@@ -1250,9 +1264,11 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
         if (backend.isEmpty() || backend !in backends) backend = backends.firstOrNull().orEmpty()
         // Recent working directories from this node's existing sessions — a derived
         // pick-list, not a filesystem browse (HERO never browses the machine). Free
-        // text still works for a brand-new path.
-        cwds = (FleetCache.sessions[node] ?: runCatching { api.sessions(node) }.getOrNull().orEmpty())
-            .map { it.cwd }.filter { it.isNotBlank() }.distinct().sorted()
+        // text still works for a brand-new path. A cold fetch is written back to
+        // the shared cache so it isn't re-downloaded by SessionsScreen's own poll.
+        val sess = FleetCache.sessionsOf(node)
+            ?: (runCatching { api.sessions(node) }.getOrNull()?.also { FleetCache.putSessions(node, gen, it) }.orEmpty())
+        cwds = sess.map { it.cwd }.filter { it.isNotBlank() }.distinct().sorted()
     }
     val models = modelsByBackend[backend].orEmpty()
     AlertDialog(
