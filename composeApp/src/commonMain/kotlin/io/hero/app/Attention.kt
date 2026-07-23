@@ -61,7 +61,7 @@ private val attnJson = Json { ignoreUnknownKeys = true }
 fun AttentionScreen(api: Api, onOpen: (node: String, session: String) -> Unit) {
     val scope = rememberCoroutineScope()
     LaunchedRefresh(api)
-    val refresh: () -> Unit = { scope.launch { val gen = FleetCache.generation; runCatching { FleetCache.putAttention(gen, api.attention()) } } }
+    val refresh: () -> Unit = { scope.launch { val gen = FleetCache.generation; runCatchingCancellable { FleetCache.putAttention(gen, api.attention()) } } }
 
     Column(Modifier.fillMaxSize()) {
         TopToolbar("Attention")
@@ -91,10 +91,10 @@ private fun LaunchedRefresh(api: Api) {
     androidx.compose.runtime.LaunchedEffect(Unit) {
         val gen = FleetCache.generation
         // Prime immediately, then poll.
-        runCatching { FleetCache.putAttention(gen, api.attention()) }
+        runCatchingCancellable { FleetCache.putAttention(gen, api.attention()) }
         while (isActive) {
             delay(4000)
-            runCatching { FleetCache.putAttention(gen, api.attention()) }
+            runCatchingCancellable { FleetCache.putAttention(gen, api.attention()) }
         }
     }
 }
@@ -107,7 +107,7 @@ private fun AttentionCard(api: Api, item: AttentionItem, onOpen: (String, String
     val send: (RespondReq) -> Unit = { req ->
         busy = true; err = null
         scope.launch {
-            runCatching { api.respond(item.node, item.id, req) }
+            runCatchingCancellable { api.respond(item.node, item.id, req) }
                 .onSuccess { onAnswered() }
                 .onFailure { busy = false; err = it.message ?: "failed" }
         }

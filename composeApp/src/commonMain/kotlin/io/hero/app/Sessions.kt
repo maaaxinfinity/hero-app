@@ -182,7 +182,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
             // by the Nodes inspector and invalidated on Save+apply/Install; a hit
             // here deliberately skips the heavy status RPC.
             val hs = FleetCache.harnessOf(n)
-                ?: runCatching { api.harness(n) }.getOrNull()?.also { FleetCache.putHarness(n, gen, it) }
+                ?: runCatchingCancellable { api.harness(n) }.getOrNull()?.also { FleetCache.putHarness(n, gen, it) }
             hs?.backends?.firstOrNull { it.backend == backend }?.catalog?.let { c ->
                 catModels = c.models.filter { !it.hidden }
                 catEffortLevels = c.effort_levels
@@ -197,7 +197,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     LaunchedEffect(nodesReload) {
         val gen = FleetCache.generation
         while (isActive) {
-            runCatching { api.nodes() }
+            runCatchingCancellable { api.nodes() }
                 .onSuccess { FleetCache.putNodes(gen, it); nodesError = null }
                 .onFailure { if (FleetCache.nodes.value == null) nodesError = it.message ?: "couldn't load nodes" }
             delay(15_000)
@@ -214,7 +214,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         sessionsError = null
         sessionsStale = false
         while (isActive) {
-            runCatching { api.sessions(n) }
+            runCatchingCancellable { api.sessions(n) }
                 .onSuccess { sessions = it; FleetCache.putSessions(n, gen, it); sessionsError = null; sessionsStale = false }
                 .onFailure {
                     // Cold node: surface the error. Warm node: keep the last-good
@@ -234,12 +234,12 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         val n = sel.node; val s = active
         if (n == null || s == null) { convo = ConvoState(); return@LaunchedEffect }
         convo = ConvoState()
-        runCatching { api.transcript(n, s, TRANSCRIPT_PAGE) }.getOrNull()?.let { page ->
+        runCatchingCancellable { api.transcript(n, s, TRANSCRIPT_PAGE) }.getOrNull()?.let { page ->
             convo = ConvoState(turns = page.turns, cursor = Cursor(page.total, page.start, TRANSCRIPT_PAGE))
         }
         if (readonly) return@LaunchedEffect // subagent transcripts are complete + read-only
         while (isActive) {
-            runCatching {
+            runCatchingCancellable {
                 api.liveFrames(n, s).collect { frame -> convo = convo.reduce(frame) }
             }
             if (!isActive) break
@@ -251,7 +251,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     // permission center shows (and answers) all of them.
     LaunchedEffect(sel.node, active, readonly) {
         while (sel.node != null && active != null && !readonly) {
-            runCatching { pend = api.pending(sel.node!!) }
+            runCatchingCancellable { pend = api.pending(sel.node!!) }
             delay(3000)
         }
         pend = emptyList()
@@ -318,7 +318,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                 // number of turns added so the pane can re-anchor its scroll.
                 val n = sel.node; val s = sel.active; val cur = convo.cursor
                 if (n == null || s == null || cur == null || !cur.hasMore) 0
-                else runCatching { api.transcript(n, s, cur.pageSize, offset = cur.earlierOffset()) }
+                else runCatchingCancellable { api.transcript(n, s, cur.pageSize, offset = cur.earlierOffset()) }
                     .getOrNull()?.let { page ->
                         convo = convo.prepend(page.turns, page.total, page.start)
                         page.turns.size
@@ -336,14 +336,14 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                     val m = switchModel; val e = if (catEffortLevels.isNotEmpty()) switchEffort else ""
                     scope.launch {
                         // The optimistic echo must not mask a failed send.
-                        runCatching { api.send(n, s, t, m, e) }
+                        runCatchingCancellable { api.send(n, s, t, m, e) }
                             .onFailure { convo = convo.reduce(LiveFrame.ErrorFrame("send failed: ${it.message ?: "error"}")) }
                     }
                 }
             },
             onRespond = { p, behavior ->
                 scope.launch {
-                    runCatching { api.respond(sel.node!!, p.id, behavior) }
+                    runCatchingCancellable { api.respond(sel.node!!, p.id, behavior) }
                         .onFailure { convo = convo.reduce(LiveFrame.ErrorFrame("respond failed: ${it.message ?: "error"}")) }
                 }
             },
@@ -366,7 +366,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                     model = convo.runtimeModel, pend = pend, turns = convo.turns,
                     onRespond = { p, behavior ->
                         scope.launch {
-                            runCatching { api.respond(sel.node!!, p.id, behavior) }
+                            runCatchingCancellable { api.respond(sel.node!!, p.id, behavior) }
                                 .onFailure { convo = convo.reduce(LiveFrame.ErrorFrame("respond failed: ${it.message ?: "error"}")) }
                         }
                     },

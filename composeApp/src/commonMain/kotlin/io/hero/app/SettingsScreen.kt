@@ -173,7 +173,7 @@ private fun UpdateControls() {
         OutlinedButton(enabled = !busy, onClick = {
             busy = true; status = "Checking…"
             scope.launch {
-                runCatching { checkForUpdate(updateAssetSuffix()) }
+                runCatchingCancellable { checkForUpdate(updateAssetSuffix()) }
                     .onSuccess { info ->
                         if (info == null) { status = "Up to date (v$AppVersion)"; pending = null }
                         else { status = "Update available: v${info.version}"; pending = info }

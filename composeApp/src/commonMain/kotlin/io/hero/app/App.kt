@@ -40,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
@@ -58,6 +59,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -111,16 +113,33 @@ private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (T
         var showSettings by remember { mutableStateOf(false) }
         var booting by remember { mutableStateOf(true) }
 
-        // Silent re-login: if "remember me" saved a session cookie, try it.
+        // Silent re-login: if "remember me" saved a session cookie, try it. The
+        // probe Api is closed unless it is promoted to the app session, so a
+        // failed (or cancelled) silent login never leaks its connection pool.
         LaunchedEffect(Unit) {
             val url = settings.getString(Keys.ServerUrl)
             val cookie = settings.getString(Keys.Cookie)
             if (settings.getString(Keys.Remember) == "1" && !url.isNullOrBlank() && !cookie.isNullOrBlank()) {
                 val a = Api(url, cookie)
-                val m = runCatching { a.me() }.getOrNull()
-                if (m != null) { api = a; me = m }
+                var kept = false
+                try {
+                    val m = runCatchingCancellable { a.me() }.getOrNull()
+                    if (m != null) { api = a; me = m; kept = true }
+                } finally {
+                    if (!kept) a.close()
+                }
             }
             booting = false
+        }
+
+        // The app session owns the current Api: whenever it is replaced (silent
+        // login, sign-in, sign-out) or AppContent leaves composition, close the
+        // PREVIOUS client so its OkHttp pool + engine coroutines don't accumulate
+        // until GC. `current` captures this generation's Api so onDispose closes
+        // the one being replaced, never the incoming one that is still in use.
+        DisposableEffect(api) {
+            val current = api
+            onDispose { current?.close() }
         }
 
         val screen = when {
@@ -192,6 +211,14 @@ private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSe
     var checkedApi by remember { mutableStateOf<Api?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    // checkedApi is the probe client for the entered server; a successful sign-in
+    // hands it off to the app session. handedOff guards that handoff so leaving
+    // the login screen closes an ABANDONED probe client but never the one now
+    // owned by the app session.
+    var handedOff by remember { mutableStateOf(false) }
+    DisposableEffect(Unit) {
+        onDispose { if (!handedOff) checkedApi?.close() }
+    }
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
@@ -228,8 +255,15 @@ private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSe
                                     busy = true; error = null
                                     scope.launch {
                                         val a = Api(url.trim().trimEnd('/'))
-                                        if (a.probe()) { checkedApi = a; step = 1 }
-                                        else error = "Not reachable, or not a HERO control plane."
+                                        if (a.probe()) {
+                                            // Re-check / Change server: close the previous
+                                            // probe client before adopting the new one.
+                                            checkedApi?.close()
+                                            checkedApi = a; step = 1
+                                        } else {
+                                            a.close() // failed probe: don't leak the client
+                                            error = "Not reachable, or not a HERO control plane."
+                                        }
                                         busy = false
                                     }
                                 },
@@ -255,7 +289,7 @@ private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSe
                                         try {
                                             val a = checkedApi ?: Api(url.trim().trimEnd('/'))
                                             if (a.login(user, pass)) {
-                                                val m = runCatching { a.me() }.getOrDefault(Me(user = user))
+                                                val m = runCatchingCancellable { a.me() }.getOrDefault(Me(user = user))
                                                 val server = url.trim().trimEnd('/')
                                                 // One atomic batch: server+user (+remember+cookie) or
                                                 // the cleared pair — never a half-written combination.
@@ -269,8 +303,13 @@ private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSe
                                                         it.remove(Keys.Remember); it.remove(Keys.Cookie)
                                                     }
                                                 }
+                                                // a is now owned by the app session; keep the
+                                                // login screen's DisposableEffect from closing it.
+                                                handedOff = true
                                                 onLogin(a, m)
                                             } else error = "Invalid credentials"
+                                        } catch (c: CancellationException) {
+                                            throw c // a navigation-cancel is not a sign-in failure
                                         } catch (e: Throwable) {
                                             error = e.message ?: "sign-in failed"
                                         } finally {
@@ -368,7 +407,7 @@ private fun MainScreen(
     // permission prompt reaches the device even when the app is closed). A no-op
     // where unsupported (desktop) or when no distributor is installed.
     LaunchedEffect(Unit) {
-        if (RemotePush.supported) runCatching { RemotePush.register(api) }
+        if (RemotePush.supported) runCatchingCancellable { RemotePush.register(api) }
     }
 
     var attentionCount by remember { mutableStateOf(0) }
@@ -379,8 +418,8 @@ private fun MainScreen(
     LaunchedEffect(Unit) {
         val gen = FleetCache.generation
         while (isActive) {
-            runCatching { FleetCache.putNodes(gen, api.nodes()) }
-            runCatching {
+            runCatchingCancellable { FleetCache.putNodes(gen, api.nodes()) }
+            runCatchingCancellable {
                 val items = api.attention()
                 FleetCache.putAttention(gen, items)
                 val actionable = items.filter { it.kind == "permission" || it.kind == "question" }

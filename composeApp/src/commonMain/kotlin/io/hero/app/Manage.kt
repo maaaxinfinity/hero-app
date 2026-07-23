@@ -99,7 +99,7 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
 
     LaunchedEffect(reload) {
         val gen = FleetCache.generation
-        runCatching { api.nodes() }
+        runCatchingCancellable { api.nodes() }
             .onSuccess { FleetCache.putNodes(gen, it); status = null }
             .onFailure { status = it.message }
     }
@@ -387,7 +387,7 @@ private fun NodeInspector(
         if (n.connected && n.scope == "admin") {
             val gen = FleetCache.generation
             // A management-fresh read backfills the shared cache the pickers use.
-            runCatching { api.harness(n.node_id) }
+            runCatchingCancellable { api.harness(n.node_id) }
                 .onSuccess { harness = it; FleetCache.putHarness(n.node_id, gen, it) }
                 .onFailure { status = it.message ?: "harness load failed" }
         }
@@ -442,7 +442,7 @@ private fun NodeInspector(
                     val target = n.node_id
                     removing = true
                     scope.launch {
-                        runCatching { api.removeNode(target) }
+                        runCatchingCancellable { api.removeNode(target) }
                             .onSuccess { onRemoved(target) }
                             .onFailure { status = it.message ?: "remove failed" }
                         removing = false
@@ -491,7 +491,7 @@ private fun HarnessConfigPanel(api: Api, nodeId: String, backend: String, onBack
     var reload by remember(nodeId, backend) { mutableStateOf(0) }
     LaunchedEffect(nodeId, backend, reload) {
         val gen = FleetCache.generation
-        runCatching { api.harness(nodeId) }
+        runCatchingCancellable { api.harness(nodeId) }
             .onSuccess { st = it; FleetCache.putHarness(nodeId, gen, it) }
             .onFailure { status = it.message ?: "harness load failed" }
     }
@@ -542,7 +542,7 @@ private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onErro
     var ownerUser by remember(nodeId) { mutableStateOf("") }
     var reload by remember(nodeId) { mutableStateOf(0) }
     LaunchedEffect(nodeId, reload) {
-        runCatching { acc = api.nodeAccess(nodeId) }.onFailure { onError(it.message ?: "access load failed") }
+        runCatchingCancellable { acc = api.nodeAccess(nodeId) }.onFailure { onError(it.message ?: "access load failed") }
     }
     val a = acc
     if (a == null) { HintText("Loading…"); return }
@@ -556,7 +556,7 @@ private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onErro
         TextButton(onClick = {
             val u = ownerUser.trim()
             if (u.isNotEmpty()) scope.launch {
-                runCatching { api.setOwner(nodeId, u) }.onFailure { onError(it.message ?: "transfer failed") }
+                runCatchingCancellable { api.setOwner(nodeId, u) }.onFailure { onError(it.message ?: "transfer failed") }
                 ownerUser = ""; reload++; onChanged()
             }
         }) { Text("Set") }
@@ -568,7 +568,7 @@ private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onErro
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(u, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
             TextButton(onClick = {
-                scope.launch { runCatching { api.removeShare(nodeId, u) }; reload++; onChanged() }
+                scope.launch { runCatchingCancellable { api.removeShare(nodeId, u) }; reload++; onChanged() }
             }) { Text("remove") }
         }
     }
@@ -580,7 +580,7 @@ private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onErro
         TextButton(onClick = {
             val u = shareUser.trim()
             if (u.isNotEmpty()) scope.launch {
-                runCatching { api.addShare(nodeId, u) }.onFailure { onError(it.message ?: "share failed") }
+                runCatchingCancellable { api.addShare(nodeId, u) }.onFailure { onError(it.message ?: "share failed") }
                 shareUser = ""; reload++; onChanged()
             }
         }) { Text("Share") }
@@ -611,7 +611,7 @@ private fun JoinPanel(api: Api) {
         OutlinedButton(onClick = {
             scope.launch {
                 status = null
-                runCatching { api.mintJoin(JoinReq(node_id = nodeId.trim())) }
+                runCatchingCancellable { api.mintJoin(JoinReq(node_id = nodeId.trim())) }
                     .onSuccess { result = it }.onFailure { status = it.message }
             }
         }) { Text("Generate") }
@@ -719,7 +719,7 @@ private fun HarnessBackendCard(
                     scope.launch {
                         // Rebuild the whole harness.json with this backend's slice merged in.
                         val next = buildMergedConfig(api, nodeId, b.backend, model, if (cat.supports_effort) effort else "", autoUpd)
-                        runCatching {
+                        runCatchingCancellable {
                             api.setHarnessConfig(nodeId, next)
                             // The cached snapshot is now stale — drop it so the
                             // composer/new-session pickers re-read the node.
@@ -730,7 +730,7 @@ private fun HarnessBackendCard(
                 }) { Text("Save + apply") }
                 OutlinedButton(onClick = {
                     scope.launch {
-                        runCatching {
+                        runCatchingCancellable {
                             FleetCache.invalidateHarness(nodeId)
                             onResult(api.harnessInstall(nodeId, b.backend))
                         }.onFailure { onResult(it.message ?: "error") }
@@ -744,7 +744,7 @@ private fun HarnessBackendCard(
 // buildMergedConfig fetches the current config and returns it with one backend's
 // slice replaced — so editing codex never drops a claude entry.
 private suspend fun buildMergedConfig(api: Api, nodeId: String, backend: String, model: String, effort: String, autoUpd: Boolean): JsonObject {
-    val cur = runCatching { api.harness(nodeId).config as? JsonObject }.getOrNull() ?: JsonObject(emptyMap())
+    val cur = runCatchingCancellable { api.harness(nodeId).config as? JsonObject }.getOrNull() ?: JsonObject(emptyMap())
     val out = buildJsonObject {
         cur.forEach { (k, v) -> if (k != backend) put(k, v) }
         val slice = buildJsonObject {
@@ -776,7 +776,7 @@ internal fun UsersScreen(api: Api, me: Me, onOpenNode: (String) -> Unit) {
 
     LaunchedEffect(reload) {
         val gen = FleetCache.generation
-        runCatching { api.users() }
+        runCatchingCancellable { api.users() }
             .onSuccess { FleetCache.putUsers(gen, it); status = null }
             .onFailure { status = it.message }
     }
@@ -938,7 +938,7 @@ private fun UserInspector(
                 enabled = pass.length >= 8,
                 onClick = {
                     scope.launch {
-                        runCatching { api.setPassword(u.user, pass) }
+                        runCatchingCancellable { api.setPassword(u.user, pass) }
                             .onSuccess { pass = ""; status = null }
                             .onFailure { status = it.message ?: "password change failed" }
                     }
@@ -947,7 +947,7 @@ private fun UserInspector(
             Spacer(Modifier.height(6.dp))
             OutlinedButton(onClick = {
                 scope.launch {
-                    runCatching { api.setAdmin(u.user, !u.admin) }
+                    runCatchingCancellable { api.setAdmin(u.user, !u.admin) }
                         .onFailure { status = it.message ?: "admin change failed" }
                     onChanged()
                 }
@@ -959,7 +959,7 @@ private fun UserInspector(
                     val target = u.user
                     deleting = true
                     scope.launch {
-                        runCatching { api.deleteUser(target) }
+                        runCatchingCancellable { api.deleteUser(target) }
                             .onSuccess { onDeleted(target) }
                             .onFailure { status = it.message ?: "delete failed" }
                         deleting = false
@@ -996,7 +996,7 @@ private fun CreateUserPanel(api: Api, onDone: () -> Unit) {
             enabled = user.isNotBlank() && pass.length >= 8,
             onClick = {
                 scope.launch {
-                    runCatching { api.createUser(CreateUserReq(user.trim(), pass, admin)) }
+                    runCatchingCancellable { api.createUser(CreateUserReq(user.trim(), pass, admin)) }
                         .onSuccess { onDone() }.onFailure { status = it.message }
                 }
             },
@@ -1038,7 +1038,7 @@ internal fun AuditScreen(api: Api) {
         loading = cached == null
         // A failed fetch must not masquerade as an empty log or as the previous
         // limit's set: keep this limit's last-good (if any) and surface the error.
-        runCatching { api.audit(limit) }
+        runCatchingCancellable { api.audit(limit) }
             .onSuccess { recs = it; FleetCache.putAudit(limit, gen, it); error = null }
             .onFailure { error = it.message ?: "audit fetch failed" }
         loading = false
@@ -1150,7 +1150,7 @@ internal fun ControlScreen(api: Api) {
 
     LaunchedEffect(reload) {
         loading = true
-        runCatching { fleet = api.fleetHero() }.onFailure { status = it.message }
+        runCatchingCancellable { fleet = api.fleetHero() }.onFailure { status = it.message }
         loading = false
     }
 
@@ -1191,7 +1191,7 @@ internal fun ControlScreen(api: Api) {
                             onClick = {
                                 scope.launch {
                                     busy = true
-                                    runCatching { api.controlSelfUpdate() }.onSuccess { status = it }.onFailure { status = it.message }
+                                    runCatchingCancellable { api.controlSelfUpdate() }.onSuccess { status = it }.onFailure { status = it.message }
                                     busy = false
                                     reload++ // it drains + restarts; refetch shows the new running version
                                 }
@@ -1204,7 +1204,7 @@ internal fun ControlScreen(api: Api) {
                                 enabled = f.defined,
                                 onCheckedChange = { want ->
                                     scope.launch {
-                                        runCatching { api.setFleetHeroAuto(want) }.onSuccess { reload++ }.onFailure { status = it.message }
+                                        runCatchingCancellable { api.setFleetHeroAuto(want) }.onSuccess { reload++ }.onFailure { status = it.message }
                                     }
                                 },
                             )
@@ -1254,7 +1254,7 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
     LaunchedEffect(node) {
         val gen = FleetCache.generation
         val hs = FleetCache.harnessOf(node)
-            ?: runCatching { api.harness(node) }.getOrNull()?.also { FleetCache.putHarness(node, gen, it) }
+            ?: runCatchingCancellable { api.harness(node) }.getOrNull()?.also { FleetCache.putHarness(node, gen, it) }
         // Only enabled harnesses are offerable — a disabled backend in the DTO is
         // management surface (install/enable it in Nodes), not a launch target.
         val bs = hs?.backends.orEmpty().filter { it.enabled }
@@ -1267,7 +1267,7 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
         // text still works for a brand-new path. A cold fetch is written back to
         // the shared cache so it isn't re-downloaded by SessionsScreen's own poll.
         val sess = FleetCache.sessionsOf(node)
-            ?: (runCatching { api.sessions(node) }.getOrNull()?.also { FleetCache.putSessions(node, gen, it) }.orEmpty())
+            ?: (runCatchingCancellable { api.sessions(node) }.getOrNull()?.also { FleetCache.putSessions(node, gen, it) }.orEmpty())
         cwds = sess.map { it.cwd }.filter { it.isNotBlank() }.distinct().sorted()
     }
     val models = modelsByBackend[backend].orEmpty()
@@ -1349,7 +1349,7 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
                 onClick = {
                     scope.launch {
                         status = null
-                        runCatching { api.startSession(node, StartSessionReq(cwd.trim(), msg, model, backend)) }
+                        runCatchingCancellable { api.startSession(node, StartSessionReq(cwd.trim(), msg, model, backend)) }
                             .onSuccess { if (it.isNotEmpty()) onStarted(it) else status = "create failed" }
                             .onFailure { status = it.message }
                     }

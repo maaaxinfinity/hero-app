@@ -25,6 +25,7 @@ import io.ktor.http.isSuccess
 import io.ktor.http.parameters
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.utils.io.readUTF8Line
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flow
@@ -60,16 +61,27 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     // as success — dialogs closing, lists refreshing, nothing changed).
     private suspend fun HttpResponse.orThrow(): HttpResponse {
         if (!status.isSuccess()) {
-            val msg = runCatching { bodyAsText() }.getOrNull()?.trim()?.take(300)?.ifBlank { null }
+            val msg = runCatchingCancellable { bodyAsText() }.getOrNull()?.trim()?.take(300)?.ifBlank { null }
             throw IllegalStateException(msg ?: "HTTP ${status.value}")
         }
         return this
+    }
+
+    /** close releases the underlying HttpClient: its connection pool, the OkHttp
+     *  engine's dispatcher coroutines, and any in-flight SSE calls (they run on
+     *  this client). The single app-session owner closes an Api when it replaces
+     *  it (probe/login/change-server/sign-out) or leaves composition; an Api must
+     *  not be used after close(). Mirrors the updater client's finally-close. */
+    fun close() {
+        client.close()
     }
 
     /** probe validates a base URL is a reachable HERO control plane by hitting the
      *  unauthenticated auth-methods endpoint (200 + JSON = it's really HERO). */
     suspend fun probe(): Boolean = try {
         client.get("$baseUrl/api/auth/methods").status.value == 200
+    } catch (c: CancellationException) {
+        throw c
     } catch (_: Throwable) {
         false
     }
@@ -118,10 +130,10 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
         // Surface the node's validation error (e.g. "cwd is required",
         // "initial_message: text is required") instead of silently returning "".
         if (!resp.status.isSuccess()) {
-            val msg = runCatching { resp.bodyAsText() }.getOrNull()?.trim()?.ifBlank { null }
+            val msg = runCatchingCancellable { resp.bodyAsText() }.getOrNull()?.trim()?.ifBlank { null }
             throw IllegalStateException(msg ?: "create failed (${resp.status.value})")
         }
-        return runCatching { resp.body<Map<String, String>>()["id"] ?: "" }.getOrDefault("")
+        return runCatchingCancellable { resp.body<Map<String, String>>()["id"] ?: "" }.getOrDefault("")
     }
 
     suspend fun pending(node: String): List<Pending> =
@@ -256,7 +268,7 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
 
     /** vapidKey fetches the server's VAPID applicationServerKey (base64url) for a
      *  UnifiedPush/Web Push subscription; null when push is unavailable. */
-    suspend fun vapidKey(): String? = runCatching {
+    suspend fun vapidKey(): String? = runCatchingCancellable {
         client.get("$baseUrl/api/push/vapid-key").body<Map<String, String>>()["key"]
     }.getOrNull()
 
@@ -321,3 +333,20 @@ data class TranscriptPage(
 )
 
 private fun String.enc(): String = this.encodeURLPathPart()
+
+// runCatchingCancellable is runCatching that never swallows coroutine
+// cancellation. kotlin.runCatching catches Throwable, and CancellationException
+// is a Throwable, so a cancelled effect wrapped in runCatching falls into
+// onFailure and keeps running its non-suspend tail — writing loading=false,
+// publishing a stale snapshot, or rendering a navigation-cancel as a business
+// error. This rethrows CancellationException so the cancelled coroutine tears
+// down, and only turns genuine failures into Result.failure. Used at every
+// suspend-call site across the effects/handlers instead of bare runCatching.
+internal inline fun <T> runCatchingCancellable(block: () -> T): Result<T> =
+    try {
+        Result.success(block())
+    } catch (c: CancellationException) {
+        throw c
+    } catch (t: Throwable) {
+        Result.failure(t)
+    }

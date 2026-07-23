@@ -64,18 +64,22 @@ fun QuickSwitcher(api: Api, onDismiss: () -> Unit, onPick: (node: String, sessio
     val listState = rememberLazyListState()
 
     LaunchedEffect(Unit) {
-        runCatching {
+        runCatchingCancellable {
             coroutineScope {
                 val nodes = api.nodes().filter { it.connected }
                 entries = nodes.map { n ->
                     async {
-                        runCatching { api.sessions(n.node_id).map { s -> SwitchEntry(n.node_id, s) } }
+                        // Per-node fan-out: an offline/errored node collapses to an
+                        // empty slice, but a cancelled child must still propagate so
+                        // awaitAll/coroutineScope tear down instead of "succeeding" empty.
+                        runCatchingCancellable { api.sessions(n.node_id).map { s -> SwitchEntry(n.node_id, s) } }
                             .getOrDefault(emptyList())
                     }
                 }.awaitAll().flatten()
             }
         }
         loading = false
+        // Not a suspend point — a genuine "focus target not attached yet" catch.
         runCatching { focusRequester.requestFocus() }
     }
 
@@ -93,7 +97,7 @@ fun QuickSwitcher(api: Api, onDismiss: () -> Unit, onPick: (node: String, sessio
         highlighted = highlighted.coerceIn(0, (filtered.size - 1).coerceAtLeast(0))
     }
     LaunchedEffect(highlighted) {
-        if (filtered.isNotEmpty()) runCatching { listState.animateScrollToItem(highlighted) }
+        if (filtered.isNotEmpty()) runCatchingCancellable { listState.animateScrollToItem(highlighted) }
     }
 
     Dialog(onDismissRequest = onDismiss) {
