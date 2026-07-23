@@ -3,8 +3,17 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- UnifiedPush: discover installed distributors (ntfy, etc.). -->
+    <queries>
+        <intent>
+            <action android:name="org.unifiedpush.android.distributor.REGISTER" />
+        </intent>
+    </queries>
 
     <application
+        android:name=".HeroApplication"
         android:allowBackup="true"
         android:label="HERO"
         android:icon="@mipmap/ic_launcher"
@@ -31,5 +40,29 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- UnifiedPush message receiver (self-hosted push transport). -->
+        <service
+            android:name=".HeroPushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- FCM message receiver (the optional Google transport; inert unless
+             google-services.json configured Firebase at build time). -->
+        <service
+            android:name=".HeroFirebaseService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- Inline Allow/Deny answers from a notification action. -->
+        <receiver
+            android:name=".PushActionReceiver"
+            android:exported="false" />
     </application>
 </manifest>

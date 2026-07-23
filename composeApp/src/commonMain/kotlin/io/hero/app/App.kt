@@ -343,14 +343,37 @@ private fun MainScreen(
     // N-per-node pending fan-out — one request instead of a fan-out that scaled
     // with fleet size (and could time out). The node fetch still feeds FleetCache
     // so every other screen stays fresh for free.
+    // Register for remote push once per app open (Android via UnifiedPush, so a
+    // permission prompt reaches the device even when the app is closed). A no-op
+    // where unsupported (desktop) or when no distributor is installed.
+    LaunchedEffect(Unit) {
+        if (RemotePush.supported) runCatching { RemotePush.register(api) }
+    }
+
     var attentionCount by remember { mutableStateOf(0) }
+    // seen tracks the actionable items already surfaced, so a newly-arrived one
+    // fires a local OS notification (desktop tray) exactly once. The first poll
+    // only seeds the set — no notification burst on launch.
+    var seen by remember { mutableStateOf<Set<String>?>(null) }
     LaunchedEffect(Unit) {
         while (isActive) {
             runCatching { FleetCache.nodes.value = api.nodes() }
             runCatching {
                 val items = api.attention()
                 FleetCache.attention.value = items
-                attentionCount = items.count { it.kind == "permission" || it.kind == "question" }
+                val actionable = items.filter { it.kind == "permission" || it.kind == "question" }
+                attentionCount = actionable.size
+                val ids = actionable.map { it.node + ":" + it.id }.toSet()
+                seen?.let { prior ->
+                    actionable.filter { (it.node + ":" + it.id) !in prior }.forEach {
+                        notifyLocal(
+                            "HERO — " + it.node,
+                            (if (it.kind == "question") "Question" else "Wants to use " + it.tool_name.ifEmpty { "a tool" }) +
+                                " · " + it.title.ifEmpty { "session " + it.session_id.take(8) },
+                        )
+                    }
+                }
+                seen = ids
             }
             delay(7000)
         }

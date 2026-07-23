@@ -9,6 +9,16 @@ plugins {
     alias(libs.plugins.kotlinSerialization)
 }
 
+// The google-services plugin materializes Firebase config from
+// google-services.json (FCM). That file is a credential and is gitignored, so a
+// public checkout won't have it — apply the plugin only when it's present. FCM
+// then stays inert at runtime (RemotePush falls back to UnifiedPush) rather than
+// failing the build. firebase-messaging is still linked (see androidMain) so the
+// service compiles regardless.
+if (file("google-services.json").exists()) {
+    apply(plugin = libs.plugins.googleServices.get().pluginId)
+}
+
 kotlin {
     androidTarget {
         compilations.all {
@@ -40,6 +50,12 @@ kotlin {
             dependencies {
                 implementation(libs.androidx.activity.compose)
                 implementation(libs.ktor.client.okhttp)
+                // UnifiedPush: self-hosted push transport (no Google dependency).
+                implementation(libs.unifiedpush.connector)
+                // FCM: the optional second transport. Linked so HeroFirebaseService
+                // compiles; inert at runtime unless google-services.json is present
+                // (then RemotePush prefers FCM, else falls back to UnifiedPush).
+                implementation(libs.firebase.messaging)
             }
         }
         val desktopMain by getting {

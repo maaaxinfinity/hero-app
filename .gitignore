@@ -9,3 +9,7 @@ captures/
 # signing secrets — never commit
 composeApp/keystore.jks
 keystore.properties
+
+# Firebase FCM config — never commit (public repo); provided locally / in CI
+google-services.json
+**/google-services.json

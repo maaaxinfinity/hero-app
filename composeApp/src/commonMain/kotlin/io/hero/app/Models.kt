@@ -301,6 +301,18 @@ data class RespondReq(
 @Serializable
 data class MessageResult(val message: String = "")
 
+// PushSub is what the app POSTs to /api/push/subscribe. A UnifiedPush/Web Push
+// registration fills endpoint+keys; a native FCM registration fills fcm_token.
+// The control plane stamps the owner from the session — never from here.
+@Serializable
+data class PushKeys(val p256dh: String = "", val auth: String = "")
+@Serializable
+data class PushSub(
+    val endpoint: String = "",
+    val keys: PushKeys = PushKeys(),
+    val fcm_token: String = "",
+)
+
 // ---- control-plane self-update (the CP binary itself; nodes/harnesses are
 // managed separately). Mirrors GET/PUT /api/fleet/hero. ----
 @Serializable

@@ -241,6 +241,25 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     suspend fun audit(limit: Int = 200): List<AuditRecord> =
         client.get("$baseUrl/api/audit?limit=$limit").body()
 
+    // ---- native push registration (control-plane fleet web push / FCM) ----
+    suspend fun subscribePush(sub: PushSub) {
+        client.post("$baseUrl/api/push/subscribe") {
+            contentType(ContentType.Application.Json); setBody(sub)
+        }.orThrow()
+    }
+
+    suspend fun unsubscribePush(endpoint: String) {
+        client.post("$baseUrl/api/push/unsubscribe") {
+            contentType(ContentType.Application.Json); setBody(mapOf("endpoint" to endpoint))
+        }.orThrow()
+    }
+
+    /** vapidKey fetches the server's VAPID applicationServerKey (base64url) for a
+     *  UnifiedPush/Web Push subscription; null when push is unavailable. */
+    suspend fun vapidKey(): String? = runCatching {
+        client.get("$baseUrl/api/push/vapid-key").body<Map<String, String>>()["key"]
+    }.getOrNull()
+
     // ---- control-plane self-update (the CP binary; nodes/harnesses are separate) ----
     suspend fun fleetHero(): HeroFleet =
         client.get("$baseUrl/api/fleet/hero").body()
