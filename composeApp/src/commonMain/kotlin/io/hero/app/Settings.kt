@@ -2,8 +2,10 @@ package io.hero.app
 
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 // Settings is a tiny persistent key/value store (Android SharedPreferences,
 // desktop a properties file) so the app can remember the server, the user, the
@@ -61,13 +63,26 @@ class Settings(private val io: SettingsIo = defaultSettingsIo()) {
     // (including a no-op that changed nothing, which skips the write entirely),
     // false if the durable write failed — in which case both the old on-disk file
     // and the old published snapshot are kept.
+    //
+    // Cancellation contract (the commit OWNER): waiting for the write lock is
+    // still cancellable — a mutation that was never admitted just goes away. But
+    // once the durable write starts, the commit segment owns the transaction and
+    // runs NonCancellable to its terminal state: committed AND published, or
+    // failed. Without this, cancelling the caller (theme/sidebar/sign-out are
+    // launched from composition-owned scopes) after the platform io already
+    // committed would drop the success on the withContext resume — disk at the
+    // new generation, memory still publishing the old one — and the NEXT update
+    // would re-persist from the stale in-memory base, silently overwriting the
+    // keys that had just been made durable.
     suspend fun update(mutate: (MutableMap<String, String>) -> Unit): Boolean = writeLock.withLock {
         val current = _snapshot.value.values
         val next = HashMap(current).apply(mutate)
         if (next == current) return@withLock true // no-op: nothing to persist
-        val ok = io.persist(next)
-        if (ok) _snapshot.value = SettingsSnapshot(next)
-        ok
+        withContext(NonCancellable) {
+            val ok = io.persist(next)
+            if (ok) _snapshot.value = SettingsSnapshot(next)
+            ok
+        }
     }
 }
 

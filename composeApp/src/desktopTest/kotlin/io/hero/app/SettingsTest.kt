@@ -8,8 +8,12 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 
 // The pure snapshot codec and the Settings transaction core are testable without
 // a Compose UI. Real file I/O is exercised through DesktopSettingsIo pointed at a
@@ -148,6 +152,74 @@ class SettingsTest {
         assertFalse(s.update { it["a"] = "2" })
         assertEquals("1", s.getString("a")) // old published snapshot kept
         assertEquals(mapOf("a" to "1"), io.stored) // old on-disk kept
+    }
+
+    // ---- commit owner vs caller cancellation ---------------------------------
+
+    // BarrierIo makes the cancellation window deterministic: `persist` performs
+    // its durable commit (stored is replaced), signals `committed`, then parks on
+    // `release` — exactly the platform actuals' shape, where the file rename /
+    // SharedPreferences commit has already happened but the suspension has not
+    // resumed yet.
+    private class BarrierIo : SettingsIo {
+        var stored: Map<String, String> = emptyMap()
+        var persistCalls = 0
+        val committed = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        override fun load(): Map<String, String> = emptyMap()
+        override suspend fun persist(values: Map<String, String>): Boolean {
+            persistCalls++
+            stored = HashMap(values) // the durable commit happens HERE
+            committed.complete(Unit)
+            release.await() // hold the resume until the test decides
+            return true
+        }
+    }
+
+    // The barrier regression from the review: the underlying commit completes,
+    // the CALLER is cancelled before persist resumes, and memory must still
+    // publish the same generation the disk now holds. Under the old cancellable
+    // commit segment the success was dropped on resume: disk new, snapshot old,
+    // and the follow-up update overwrote the just-persisted key from the stale
+    // in-memory base.
+    @Test
+    fun commitThenCancelBeforeResumeStillPublishes() = runBlocking {
+        val io = BarrierIo()
+        val s = Settings(io)
+        val job = launch { s.update { it["k"] = "v" } }
+        io.committed.await() // barrier: bytes are durable, persist not yet resumed
+        job.cancel() // the composition scope goes away
+        io.release.complete(Unit)
+        job.join()
+        // Memory and disk publish the SAME generation.
+        assertEquals("v", s.getString("k"))
+        assertEquals("v", io.stored["k"])
+        // And a later update builds on the COMMITTED snapshot — it must not
+        // overwrite the just-persisted key from a stale base.
+        assertTrue(s.update { it["other"] = "1" })
+        assertEquals("v", io.stored["k"])
+        assertEquals("1", io.stored["other"])
+    }
+
+    // The counterpart boundary: a mutation cancelled while still QUEUED on the
+    // write lock (not yet admitted to the commit segment) persists nothing and
+    // publishes nothing — caller cancellation cancels the waiting, never the
+    // owner.
+    @Test
+    fun cancelWhileQueuedPersistsNothing() = runBlocking {
+        val io = BarrierIo()
+        val s = Settings(io)
+        val first = launch { s.update { it["a"] = "1" } }
+        io.committed.await() // first holds the lock inside its commit segment
+        val second = launch { s.update { it["b"] = "2" } }
+        yield() // let second suspend on the write lock
+        second.cancel()
+        second.join()
+        io.release.complete(Unit)
+        first.join()
+        assertEquals(mapOf("a" to "1"), io.stored) // only the admitted commit landed
+        assertEquals(1, io.persistCalls)
+        assertNull(s.getString("b"))
     }
 
     @Test
