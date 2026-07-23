@@ -186,7 +186,10 @@ internal fun NodesScreen(api: Api, me: Me, settings: Settings, focus: String? = 
                             api, n,
                             onConfigureHarness = { configBackend = it },
                             onChanged = { reload++ },
-                            onRemoved = { selected = null; reload++ },
+                            // Drop a stale completion: only close + refresh if the
+                            // removed node is still the selected target (the user
+                            // may have switched to another node meanwhile).
+                            onRemoved = { removed -> if (selected == removed) { selected = null; reload++ } },
                         )
                     }
                 }
@@ -367,10 +370,14 @@ private fun NodeRow(n: NodeView, selected: Boolean, onClick: () -> Unit) {
 private fun NodeInspector(
     api: Api, n: NodeView,
     onConfigureHarness: (String) -> Unit,
-    onChanged: () -> Unit, onRemoved: () -> Unit,
+    onChanged: () -> Unit, onRemoved: (String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     var status by remember(n.node_id) { mutableStateOf<String?>(null) }
+    // Single-flight the destructive Remove: disabled while a delete is in flight
+    // so a rapid re-arm can't launch a second call. Keyed to n.node_id so it
+    // resets when the inspector switches targets.
+    var removing by remember(n.node_id) { mutableStateOf(false) }
     // Harness install state is loaded once here so the section can show each
     // backend's version/status line; the config page re-fetches on entry.
     var harness by remember(n.node_id) { mutableStateOf<HarnessState?>(null) }
@@ -423,11 +430,17 @@ private fun NodeInspector(
                 }
             }
             PanelSection("Danger") {
-                ConfirmButton("Remove node", targetKey = n.node_id) {
+                ConfirmButton("Remove node", targetKey = n.node_id, enabled = !removing) {
+                    // Capture the target at launch; the parent applies onRemoved
+                    // only if this node is still the selected one, so a late
+                    // completion can't close/refresh a different node's inspector.
+                    val target = n.node_id
+                    removing = true
                     scope.launch {
-                        runCatching { api.removeNode(n.node_id) }
-                            .onSuccess { onRemoved() }
+                        runCatching { api.removeNode(target) }
+                            .onSuccess { onRemoved(target) }
                             .onFailure { status = it.message ?: "remove failed" }
+                        removing = false
                     }
                 }
             }
@@ -822,7 +835,9 @@ internal fun UsersScreen(api: Api, me: Me, onOpenNode: (String) -> Unit) {
                         api, u, me,
                         onOpenNode = onOpenNode,
                         onChanged = { reload++ },
-                        onDeleted = { selected = null; reload++ },
+                        // Drop a stale completion: only close + refresh if the
+                        // deleted user is still the selected target.
+                        onDeleted = { deleted -> if (selected == deleted) { selected = null; reload++ } },
                     )
                 }
             }
@@ -869,11 +884,13 @@ private fun UserRow(u: UserInfo, selected: Boolean, onClick: () -> Unit) {
 @Composable
 private fun UserInspector(
     api: Api, u: UserInfo, me: Me,
-    onOpenNode: (String) -> Unit, onChanged: () -> Unit, onDeleted: () -> Unit,
+    onOpenNode: (String) -> Unit, onChanged: () -> Unit, onDeleted: (String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     var status by remember(u.user) { mutableStateOf<String?>(null) }
     var pass by remember(u.user) { mutableStateOf("") }
+    // Single-flight the destructive Delete (see NodeInspector.removing).
+    var deleting by remember(u.user) { mutableStateOf(false) }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -930,11 +947,14 @@ private fun UserInspector(
         }
         if (u.user != me.user) {
             PanelSection("Danger") {
-                ConfirmButton("Delete user", targetKey = u.user) {
+                ConfirmButton("Delete user", targetKey = u.user, enabled = !deleting) {
+                    val target = u.user
+                    deleting = true
                     scope.launch {
-                        runCatching { api.deleteUser(u.user) }
-                            .onSuccess { onDeleted() }
+                        runCatching { api.deleteUser(target) }
+                            .onSuccess { onDeleted(target) }
                             .onFailure { status = it.message ?: "delete failed" }
+                        deleting = false
                     }
                 }
             }

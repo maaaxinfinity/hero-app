@@ -135,14 +135,17 @@ fun KeyHandler(handler: (KeyEvent) -> Boolean) {
  *  fires on the second; disarms after 3s untouched. Two deliberate clicks for
  *  destructive actions, without a modal. targetKey names the entity the click
  *  would destroy: a target switch inside the 3s window disarms instantly, so
- *  the confirm can never fire against a different target than the one armed. */
+ *  the confirm can never fire against a different target than the one armed.
+ *  enabled=false (e.g. while the previous confirm is in flight) blocks both arm
+ *  and fire, so a rapid re-arm can't launch a second mutation (single-flight). */
 @Composable
-internal fun ConfirmButton(label: String, targetKey: Any? = null, onConfirm: () -> Unit) {
+internal fun ConfirmButton(label: String, targetKey: Any? = null, enabled: Boolean = true, onConfirm: () -> Unit) {
     var armed by remember(targetKey) { mutableStateOf(false) }
     LaunchedEffect(armed) {
         if (armed) { delay(3000); armed = false }
     }
     OutlinedButton(
+        enabled = enabled,
         onClick = { if (armed) { armed = false; onConfirm() } else armed = true },
         colors = ButtonDefaults.outlinedButtonColors(
             contentColor = if (armed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
