@@ -20,6 +20,13 @@
 # discovers KotlinxSerializationExtensionProvider implementations; stripping
 # the provider behind its surviving services entry crashes Api's constructor.
 -keep class io.ktor.serialization.kotlinx.** { *; }
+
+# The release-artifact smoke (releaseArtifactSmoke) reads the jar's baked-in
+# version via io.hero.app.VersionKt.AppVersion to tie the shipped artifact to
+# the release tag. AppVersion is a const val, so Kotlin inlines it at every
+# real call site and nothing else references the class — without this keep,
+# shrinking drops the jar's only machine-readable version identity.
+-keep class io.hero.app.VersionKt { *; }
 -dontwarn org.conscrypt.**
 -dontwarn org.bouncycastle.**
 -dontwarn org.openjsse.**

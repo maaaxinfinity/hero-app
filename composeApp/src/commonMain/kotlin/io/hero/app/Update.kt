@@ -12,9 +12,12 @@ import io.ktor.utils.io.readAvailable
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-// AppVersion is compared against the latest GitHub release tag. Bump it before
-// tagging a release so the running app can tell it is out of date.
-const val AppVersion = "0.5.19"
+// AppVersion (the runtime constant compared against the latest release tag) is
+// no longer hand-maintained here: it is GENERATED into Version.kt from
+// gradle.properties#appVersion, the single version source that also drives
+// Android versionName/versionCode and desktop packageVersion. To bump the
+// version, edit gradle.properties (appVersion + appVersionCode) — never a
+// source file.
 const val Repo = "maaaxinfinity/hero-app"
 
 @Serializable
@@ -56,17 +59,34 @@ suspend fun checkForUpdate(assetSuffix: String): UpdateInfo? {
     }
 }
 
-// isNewer compares dotted/dashed numeric versions (v-prefix tolerated).
+// isNewer compares dotted/dashed numeric versions (a "v" prefix is tolerated).
+// FAIL CLOSED: a version that doesn't fully parse — empty, or with any
+// non-numeric segment ("v0.6.0-rc1", "abc", "0..1") — is never "newer". A
+// malformed or experimental tag must not raise an update prompt, and a
+// malformed local version must not turn every release into an install loop;
+// the release gate only ever publishes vMAJOR.MINOR.PATCH tags, so anything
+// outside that grammar is unknown, not orderable.
 fun isNewer(tag: String, current: String): Boolean {
-    fun parse(s: String) = s.removePrefix("v").split(".", "-").mapNotNull { it.toIntOrNull() }
-    val a = parse(tag)
-    val b = parse(current)
+    val a = parseVersion(tag) ?: return false
+    val b = parseVersion(current) ?: return false
     for (i in 0 until maxOf(a.size, b.size)) {
         val x = a.getOrElse(i) { 0 }
         val y = b.getOrElse(i) { 0 }
         if (x != y) return x > y
     }
     return false
+}
+
+// parseVersion accepts the release version grammar — an optional "v" prefix,
+// then dot/dash-separated decimal segments ("0.5.20", "v1.2", "0.5.20-1") —
+// and returns null for anything else: empty input, a non-numeric or empty
+// segment, or a number that overflows Int. The old parser silently DROPPED bad
+// segments (mapNotNull), so "v1.junk.9" quietly became [1, 9]; unknown input
+// must be unorderable, not guessed at.
+internal fun parseVersion(s: String): List<Int>? {
+    val body = s.removePrefix("v")
+    if (body.isEmpty()) return null
+    return body.split(".", "-").map { seg -> seg.toIntOrNull() ?: return null }
 }
 
 // installUpdate downloads the public asset and applies it: Android launches the

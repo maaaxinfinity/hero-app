@@ -37,7 +37,8 @@ composeApp/
   src/androidMain/…               # MainActivity, manifest, FileProvider, APK updater
   src/desktopMain/kotlin/main.kt  # desktop entry: window sizing, key routing
 gradle/libs.versions.toml         # version catalog
-.github/workflows/release.yml     # tag v* → build APK + desktop jars → GitHub release
+gradle.properties                 # appVersion/appVersionCode: the single release version source
+.github/workflows/release.yml     # tag v* → verify identity → build + smoke → GitHub release
 ```
 
 ## UI
@@ -81,6 +82,7 @@ Enter-to-send (Shift+Enter for newline).
 ./gradlew :composeApp:run                              # desktop (JVM), quickest
 ./gradlew :composeApp:assembleRelease                  # signed Android APK
 ./gradlew :composeApp:packageReleaseUberJarForCurrentOS # desktop uber jar
+./gradlew :composeApp:releaseArtifactSmoke             # build + smoke the FINAL desktop jar
 # Android UI in an emulator/device: open in Android Studio, run composeApp
 ```
 
@@ -90,11 +92,35 @@ endpoints the web console uses.
 
 ## Releases & in-app update
 
-Pushing a `v*` tag (or running the **Release** workflow manually) builds on
-GitHub Actions and publishes a release with:
+The release version has **one** edit point — `gradle.properties`:
+
+```properties
+appVersion=0.5.20      # → Android versionName, desktop packageVersion,
+                       #   runtime AppVersion (generated Version.kt)
+appVersionCode=26      # → Android versionCode; strictly +1 every release
+```
+
+To cut a release: bump both lines, commit, tag that commit `v<appVersion>`
+(e.g. `v0.5.20`) and push the tag. Nothing else is hand-edited — `Update.kt`
+no longer carries a version constant (the build generates it), and
+`build.gradle.kts` derives every binary identity from these two properties.
+
+Pushing the `v*` tag (or running the **Release** workflow manually against an
+**existing** tag) builds on GitHub Actions and publishes a release with:
 
 - `hero-app.apk` — signed Android APK
 - `hero-app-linux.jar` / `hero-app-macos.jar` / `hero-app-windows.jar` — desktop
+
+The workflow refuses to publish when identities drift: the tag must equal
+`v<appVersion>` and point at the built commit (manual runs check out the tag
+itself and `--verify-tag` on publish — a missing tag is an error, never
+implicitly created), the tree must be clean, `appVersionCode` must be strictly
+greater than the latest public release's, the APK's embedded
+versionName/versionCode must match, and every desktop jar passes
+`releaseArtifactSmoke` — a real `java -cp <final-jar>` run that constructs the
+app's `Api`, completes a loopback HTTP request, and asserts the OkHttp engine
+plus the jar's baked-in `AppVersion` (the gate the broken `v0.5.7`/`v0.5.8`
+jars would have failed).
 
 Settings has an **Updates** section: tap **Check for updates**, then
 **Install**. The release is public, so no token is involved. Every download is
@@ -107,8 +133,10 @@ system installer via a `FileProvider` on the committed APK. Desktop is a portabl
 jar with no installer to hand off to and no launcher path it can safely overwrite,
 so it does **not** auto-relaunch: it downloads and verifies the new per-OS jar,
 publishes it to a stable path (under your home directory), and shows you the exact
-path plus the `java -jar …` command to run it / swap it in. `AppVersion` in
-`Update.kt` gates "is this newer".
+path plus the `java -jar …` command to run it / swap it in. The generated
+`AppVersion` constant gates "is this newer"; versions outside the release
+grammar (`vMAJOR.MINOR.PATCH`, numeric segments only) fail closed — an
+unparseable tag or local version is never treated as an update.
 
 ## Status
 

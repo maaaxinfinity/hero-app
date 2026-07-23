@@ -1,23 +1,159 @@
 name: Release
 
+# Release identity is guarded end to end. gradle.properties#appVersion/
+# #appVersionCode is the single version source (it derives Android
+# versionName/versionCode, desktop packageVersion, and the runtime AppVersion
+# constant), and the verify job refuses to build unless the tag IS
+# v<appVersion> and points at the checked-out commit. Build jobs then pin that
+# exact SHA, prove the artifacts embed the verified identity (APK badging;
+# desktop releaseArtifactSmoke on the final jar's real classpath), and the
+# release job re-checks the tag before publishing with --verify-tag — a manual
+# run can only republish an EXISTING tag, never mint one from a default branch.
+
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (for manual runs, e.g. v0.1.0)"
+        description: "Existing release tag to publish (e.g. v0.5.20). Must already exist on the remote; the run builds exactly that tag."
         required: true
-        default: "v0.0.0-dev"
 
 permissions:
   contents: write
 
 jobs:
+  # Gate every release identity BEFORE anything is built:
+  #   - the tag parses as vMAJOR.MINOR.PATCH and points at this checkout's HEAD
+  #     (workflow_dispatch checks out ref: inputs.tag, so a missing remote tag
+  #     fails here instead of silently building whatever branch was selected);
+  #   - the working tree is clean;
+  #   - the tag equals v<appVersion> from gradle.properties (the single source
+  #     every binary identity derives from);
+  #   - version and appVersionCode are strictly greater than the latest public
+  #     release's (Android refuses to upgrade over an equal/greater
+  #     versionCode, and a stale version would re-offer itself as an update).
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.gate.outputs.tag }}
+      sha: ${{ steps.gate.outputs.sha }}
+      version: ${{ steps.gate.outputs.version }}
+      version_code: ${{ steps.gate.outputs.version_code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0 # full history + all tags: the gate inspects the previous release's tree
+      - name: Release identity gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            TAG="$TAG_INPUT"
+          else
+            case "$GITHUB_REF" in
+              refs/tags/*) ;;
+              *) echo "::error::push trigger is not a tag ref: $GITHUB_REF"; exit 1 ;;
+            esac
+            TAG="$GITHUB_REF_NAME"
+          fi
+
+          # Grammar: releases are exactly vMAJOR.MINOR.PATCH (what isNewer and
+          # the single version source allow).
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release tag must be vMAJOR.MINOR.PATCH, got '$TAG'"; exit 1
+          fi
+
+          # The tag must exist and HEAD must be exactly the commit it points at.
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG does not exist on the remote"; exit 1
+          fi
+          TAG_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+            echo "::error::tag $TAG points at $TAG_SHA but the checkout is $HEAD_SHA"; exit 1
+          fi
+          # For tag pushes the workflow's trigger SHA must be this same commit
+          # (^{commit} peels annotated tag objects).
+          if [ "$EVENT" = "push" ] && [ "$(git rev-parse "$GITHUB_SHA^{commit}")" != "$HEAD_SHA" ]; then
+            echo "::error::trigger SHA $GITHUB_SHA is not the tag commit $HEAD_SHA"; exit 1
+          fi
+
+          # A release is built from exactly the tagged tree — nothing else.
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "::error::working tree is dirty"; exit 1
+          fi
+
+          # Single version source: the tag IS v<appVersion>.
+          VERSION=$(sed -n 's/^appVersion=//p' gradle.properties)
+          VERSION_CODE=$(sed -n 's/^appVersionCode=//p' gradle.properties)
+          if [ -z "$VERSION" ] || [ -z "$VERSION_CODE" ]; then
+            echo "::error::gradle.properties must define appVersion and appVersionCode"; exit 1
+          fi
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG != v<appVersion> (gradle.properties says appVersion=$VERSION)"; exit 1
+          fi
+
+          # Monotonicity against the latest PUBLIC release. 404 = first release;
+          # any other API failure fails closed rather than skipping the check.
+          set +e
+          PREV_TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/tmp/gh-err)
+          GH_STATUS=$?
+          set -e
+          if [ $GH_STATUS -ne 0 ]; then
+            if grep -q '404' /tmp/gh-err; then
+              echo "no previous public release — skipping the monotonicity check"
+              PREV_TAG=""
+            else
+              cat /tmp/gh-err
+              echo "::error::could not query the latest public release"; exit 1
+            fi
+          fi
+          if [ -n "$PREV_TAG" ]; then
+            if [ "$PREV_TAG" = "$TAG" ]; then
+              echo "::error::a public release for $TAG already exists"; exit 1
+            fi
+            if [ "$(printf '%s\n%s\n' "$PREV_TAG" "$TAG" | sort -V | tail -1)" != "$TAG" ]; then
+              echo "::error::$TAG does not sort after the latest public release $PREV_TAG"; exit 1
+            fi
+            # versionCode of the previous release, read from its tagged tree:
+            # gradle.properties (single-source era) or build.gradle.kts (legacy).
+            PREV_CODE=$(git show "refs/tags/$PREV_TAG:gradle.properties" 2>/dev/null | sed -n 's/^appVersionCode=//p' || true)
+            if [ -z "$PREV_CODE" ]; then
+              PREV_CODE=$(git show "refs/tags/$PREV_TAG:composeApp/build.gradle.kts" 2>/dev/null | sed -n 's/^ *versionCode = \([0-9][0-9]*\)$/\1/p' | head -1 || true)
+            fi
+            if [ -z "$PREV_CODE" ]; then
+              echo "::error::cannot determine the versionCode of the latest public release $PREV_TAG (is its tag present in this repo?)"; exit 1
+            fi
+            if [ "$VERSION_CODE" -le "$PREV_CODE" ]; then
+              echo "::error::appVersionCode $VERSION_CODE must be strictly greater than $PREV_TAG's $PREV_CODE"; exit 1
+            fi
+            echo "monotonicity: $PREV_TAG (versionCode $PREV_CODE) -> $TAG (versionCode $VERSION_CODE)"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "sha=$HEAD_SHA"
+            echo "version=$VERSION"
+            echo "version_code=$VERSION_CODE"
+          } >> "$GITHUB_OUTPUT"
+          echo "verified: $TAG @ $HEAD_SHA (appVersion=$VERSION, appVersionCode=$VERSION_CODE)"
+
   android:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Build exactly the commit the gate verified the tag points at.
+          ref: ${{ needs.verify.outputs.sha }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -61,6 +197,32 @@ jobs:
             echo "::error::release APK is debug-signed — refusing to publish"
             exit 1
           fi
+      # Artifact-level identity gate: the APK's EMBEDDED versionName/versionCode
+      # must equal the values the tag was verified against — a mismatch here
+      # would ship a binary that immediately re-offers its own release as an
+      # update (versionName drift) or that installs refuse to upgrade onto
+      # (versionCode drift).
+      - name: Verify the APK embeds the verified release identity
+        run: |
+          apk=composeApp/build/outputs/apk/release/composeApp-release.apk
+          aapt2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+          if [ -z "$aapt2" ]; then echo "::error::aapt2 not found in Android SDK"; exit 1; fi
+          badging=$("$aapt2" dump badging "$apk" | head -1)
+          echo "$badging"
+          vn=$(printf '%s' "$badging" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+          vc=$(printf '%s' "$badging" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
+          if [ "$vn" != "${{ needs.verify.outputs.version }}" ]; then
+            echo "::error::APK versionName '$vn' != verified appVersion '${{ needs.verify.outputs.version }}'"; exit 1
+          fi
+          if [ "$vc" != "${{ needs.verify.outputs.version_code }}" ]; then
+            echo "::error::APK versionCode '$vc' != verified appVersionCode '${{ needs.verify.outputs.version_code }}'"; exit 1
+          fi
+      - name: Refuse to publish from a tree the build dirtied
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "::error::the build modified the checkout — artifacts would not match the tag"; exit 1
+          fi
       - name: Name the artifact
         run: cp composeApp/build/outputs/apk/release/composeApp-release.apk hero-app.apk
       - uses: actions/upload-artifact@v4
@@ -69,6 +231,7 @@ jobs:
           path: hero-app.apk
 
   desktop:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -82,27 +245,50 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Build exactly the commit the gate verified the tag points at.
+          ref: ${{ needs.verify.outputs.sha }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - name: Build desktop uber jar
+      # releaseArtifactSmoke runs on the FINAL uber jar's real classpath (java
+      # -cp <final-jar>:<smoke-classes>): constructs the app's Api, completes a
+      # loopback HTTP request through it, asserts the engine is OkHttp and the
+      # jar's baked-in AppVersion matches the version source. This is the gate
+      # v0.5.7/v0.5.8 lacked — their jars packaged green while ProGuard had
+      # stripped the engine class behind a surviving ServiceLoader entry.
+      - name: Build desktop uber jar and smoke the final artifact
         shell: bash
         run: |
           chmod +x gradlew || true
-          ./gradlew :composeApp:packageReleaseUberJarForCurrentOS --no-daemon
+          ./gradlew :composeApp:packageReleaseUberJarForCurrentOS :composeApp:releaseArtifactSmoke --no-daemon
+      - name: Refuse to publish from a tree the build dirtied
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "::error::the build modified the checkout — artifacts would not match the tag"; exit 1
+          fi
+      # Pin the copied jar to the verified version: if packageVersion ever
+      # drifted from the source again, no file matches and this step fails
+      # instead of shipping a mislabeled jar.
       - name: Name the artifact per-OS
         shell: bash
         run: |
-          jar=$(ls composeApp/build/compose/jars/*.jar | head -1)
-          cp "$jar" "hero-app-${{ matrix.label }}.jar"
+          v="${{ needs.verify.outputs.version }}"
+          set -- composeApp/build/compose/jars/*-"$v"-release.jar
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected exactly one *-$v-release.jar, found: $*"; exit 1
+          fi
+          cp "$1" "hero-app-${{ matrix.label }}.jar"
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.label }}
           path: hero-app-${{ matrix.label }}.jar
 
   release:
-    needs: [android, desktop]
+    needs: [verify, android, desktop]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -111,12 +297,23 @@ jobs:
           merge-multiple: true
       - name: List artifacts
         run: ls -R dist
+      # --verify-tag: publishing requires the tag to already exist on the
+      # remote — gh must never mint the tag itself (it would cut it from the
+      # default branch, not from what was built). The rev re-check closes the
+      # window where the tag is force-moved between verify and publish.
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          SHA: ${{ needs.verify.outputs.sha }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          set -euo pipefail
+          actual=$(gh api "repos/${{ github.repository }}/commits/$TAG" --jq .sha)
+          if [ "$actual" != "$SHA" ]; then
+            echo "::error::tag $TAG now points at $actual but the artifacts were built from $SHA"; exit 1
+          fi
           gh release create "$TAG" dist/* \
             --repo "${{ github.repository }}" \
+            --verify-tag \
             --title "$TAG" \
             --generate-notes
