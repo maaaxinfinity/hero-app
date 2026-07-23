@@ -123,11 +123,12 @@ kotlin.sourceSets.getByName("commonMain").kotlin.srcDir(generateVersionKt)
 // passwords from GitHub secrets into env. A RELEASE build MUST be signed with the
 // real release keystore: a debug-signed release has a different certificate that
 // Android refuses to upgrade over a real install, so it is never publishable.
-// When no keystore is configured the release build FAILS CLOSED (see the
-// taskGraph guard after the android block). The debug fallback is offered only
-// for a local build explicitly opted into with -PallowDebugSigningForRelease —
-// a flag CI never passes, so a missing/misconfigured secret can't silently ship
-// a debug-signed APK.
+// When the keystore is missing OR incomplete the release VARIANT fails closed —
+// for every APK *and AAB* packaging/signing entry point, not an enumerated task
+// pair (see the guard + poisoned signing config below). The debug fallback is
+// offered only for a local build explicitly opted into with
+// -PallowDebugSigningForRelease=true — a flag CI never passes — and marks its
+// artifact identity so it can never masquerade as a publishable release.
 val keystoreProps = Properties().apply {
     val f = rootProject.file("keystore.properties")
     if (f.exists()) f.inputStream().use { load(it) }
@@ -135,8 +136,29 @@ val keystoreProps = Properties().apply {
 fun releaseSecret(propKey: String, envKey: String): String? =
     keystoreProps.getProperty(propKey) ?: System.getenv(envKey)
 val releaseStoreFile = file(releaseSecret("storeFile", "KEYSTORE_FILE") ?: "keystore.jks")
-val hasReleaseKeystore = releaseStoreFile.exists()
-val allowDebugSigningForRelease = hasProperty("allowDebugSigningForRelease")
+val releaseStorePassword = releaseSecret("storePassword", "KEYSTORE_PASSWORD")
+val releaseKeyAlias = releaseSecret("keyAlias", "KEY_ALIAS")
+val releaseKeyPassword = releaseSecret("keyPassword", "KEY_PASSWORD")
+// A usable release identity is the keystore FILE plus all three secrets; a
+// present file with missing alias/passwords is misconfiguration, not a
+// half-usable keystore, and must fail the same way as no keystore at all.
+val hasReleaseKeystore = releaseStoreFile.exists() &&
+    !releaseStorePassword.isNullOrBlank() && !releaseKeyAlias.isNullOrBlank() && !releaseKeyPassword.isNullOrBlank()
+// The opt-in accepts ONLY the normalized exact string "true". The old check
+// keyed on property PRESENCE, so -PallowDebugSigningForRelease=false — an
+// automation flag that reads as "definitely off" — silently ENABLED the debug
+// fallback. Unknown, empty and false-like values now fail loudly instead of
+// being guessed at: presence is not consent.
+val allowDebugSigningForRelease = when (val raw = providers.gradleProperty("allowDebugSigningForRelease").orNull) {
+    null -> false
+    else -> when (raw.trim().lowercase()) {
+        "true" -> true
+        else -> throw GradleException(
+            "allowDebugSigningForRelease must be exactly 'true' when passed (got \"$raw\"): " +
+                "the flag debug-signs a RELEASE build, so it is never inferred from presence or truthy-looking values.",
+        )
+    }
+}
 
 android {
     namespace = "io.hero.app"
@@ -151,29 +173,36 @@ android {
     }
     signingConfigs {
         create("release") {
-            if (hasReleaseKeystore) {
-                storeFile = releaseStoreFile
-                storePassword = releaseSecret("storePassword", "KEYSTORE_PASSWORD")
-                keyAlias = releaseSecret("keyAlias", "KEY_ALIAS")
-                keyPassword = releaseSecret("keyPassword", "KEY_PASSWORD")
-            }
+            // ALWAYS bound to the release keystore identity. On an unconfigured
+            // checkout the storeFile path does not exist — deliberately: the
+            // config stays valid to EVALUATE (assembleDebug and unit tests work),
+            // but any release APK/AAB packaging or signing task then fails at
+            // validateSigningRelease / signing time. That poisoned config is the
+            // variant-level fail-closed backstop for entry points the friendly
+            // guard below doesn't recognize (bundleRelease scheduled a debug-signed
+            // AAB straight past the old two-task-name guard).
+            storeFile = releaseStoreFile
+            storePassword = releaseStorePassword
+            keyAlias = releaseKeyAlias
+            keyPassword = releaseKeyPassword
         }
     }
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
-            // With a real keystore, sign for real. Without one, keep configuration
-            // valid (so assembleDebug and unit tests still evaluate on an
-            // unconfigured checkout) by pointing at the debug config — but the
-            // taskGraph guard below turns an *actual* release assembly into a hard
-            // failure unless -PallowDebugSigningForRelease was explicitly given.
-            signingConfig = if (hasReleaseKeystore) {
-                signingConfigs.getByName("release")
-            } else {
-                if (allowDebugSigningForRelease) {
-                    logger.warn("allowDebugSigningForRelease is set — signing the RELEASE build with the DEBUG key; this artifact is NOT publishable")
-                }
+            // With a real keystore, sign for real. The ONLY path off the release
+            // keystore is the strict local opt-in, and that path is isolated by
+            // artifact identity: versionName carries "+debugsigned", so the output
+            // can never be mistaken for (or upgrade-block) a publishable release.
+            signingConfig = if (!hasReleaseKeystore && allowDebugSigningForRelease) {
+                logger.warn(
+                    "allowDebugSigningForRelease=true — signing the RELEASE build with the DEBUG key; " +
+                        "versionName is suffixed '+debugsigned' and this artifact is NOT publishable",
+                )
+                versionNameSuffix = "+debugsigned"
                 signingConfigs.getByName("debug")
+            } else {
+                signingConfigs.getByName("release")
             }
         }
     }
@@ -183,24 +212,51 @@ android {
     }
 }
 
-// Fail closed: a release APK must never be debug-signed. Configuration above
-// stays valid on an unconfigured checkout (so assembleDebug and unit tests run),
-// but scheduling an actual release-packaging task without a real keystore aborts
-// the build here. A contributor who deliberately wants a local debug-signed
-// release opts in with -PallowDebugSigningForRelease; CI never passes that flag,
-// so a release job with a missing/misconfigured keystore fails instead of
-// publishing an unupgradable debug-signed APK.
+// Fail closed: a release APK or AAB must never leave this build without the
+// real release keystore. Configuration above stays valid on an unconfigured
+// checkout (so assembleDebug and unit tests run), but scheduling Android
+// release ARTIFACT work aborts the build here. The old guard enumerated two
+// task names (assembleRelease/packageRelease) and bundleRelease walked straight
+// past it to a debug-signed AAB; this one binds to the release variant's
+// artifact pipeline itself:
+//   - the AGP task TYPES that package/sign a release APK or AAB, wherever they
+//     were scheduled from (assembleRelease, bundleRelease, direct
+//     packageRelease/packageReleaseBundle/signReleaseBundle, or a publish chain
+//     that depends on them);
+//   - plus the two variant lifecycle entries (plain lifecycle tasks carry no
+//     AGP type) for a clear early message under --dry-run.
+// The type+name match deliberately EXCLUDES innocent release-variant work
+// (unit tests, resource linking, class jars) and compose desktop's
+// packageRelease* jar tasks (Compose-plugin types, no Android signing), so an
+// unconfigured checkout still runs tests and desktop packaging. Anything this
+// guard could ever miss still dies at execution on the poisoned signing config
+// above: there is no debug-signed fallback left on the release variant.
 if (!hasReleaseKeystore && !allowDebugSigningForRelease) {
+    // The tasks that produce or sign the release APK/AAB artifact:
+    // PackageApplication (packageRelease), PackageBundleTask
+    // (packageReleaseBundle), FinalizeBundleTask (signReleaseBundle),
+    // ValidateSigningTask (validateSigningRelease).
+    val releaseArtifactTaskTypes =
+        listOf("PackageApplication", "PackageBundleTask", "FinalizeBundleTask", "ValidateSigningTask")
     gradle.taskGraph.whenReady {
         val releaseTask = gradle.taskGraph.allTasks.firstOrNull { t ->
-            t.project == project && (t.name == "assembleRelease" || t.name == "packageRelease")
+            t.project == project && t.name.contains("Release") &&
+                (
+                    t.name == "assembleRelease" || t.name == "bundleRelease" ||
+                        (
+                            t.javaClass.name.startsWith("com.android.build.") &&
+                                releaseArtifactTaskTypes.any { t.javaClass.name.contains(it) }
+                            )
+                    )
         }
         if (releaseTask != null) {
             throw GradleException(
-                "Refusing to build ${releaseTask.path}: no release keystore is configured, so the APK " +
-                    "would be signed with the debug key and could never upgrade a real release install. " +
+                "Refusing to build ${releaseTask.path}: the release keystore is missing or incomplete " +
+                    "(store file + storePassword + keyAlias + keyPassword), so this release APK/AAB could " +
+                    "not be signed with the release certificate and could never upgrade a real install. " +
                     "Configure keystore.properties or the KEYSTORE_* env (see .github/workflows/release.yml), " +
-                    "or pass -PallowDebugSigningForRelease to build a local debug-signed APK on purpose.",
+                    "or pass -PallowDebugSigningForRelease=true to build a LOCAL debug-signed artifact " +
+                    "(versionName gets '+debugsigned'; never publishable).",
             )
         }
     }
