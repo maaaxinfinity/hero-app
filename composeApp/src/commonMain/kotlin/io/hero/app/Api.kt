@@ -284,9 +284,19 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
             // bound must not apply here (reconnect loops live in the callers).
             timeout { requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS }
         }.execute { resp ->
+            // A non-2xx (401 after logout, 502/offline via a proxy) is an error,
+            // not an empty stream: surface it so the caller's reconnect/error path
+            // runs instead of treating a short error body as a cleanly-ended stream.
+            if (!resp.status.isSuccess()) {
+                throw IllegalStateException("stream ${resp.status.value}")
+            }
             val ch = resp.bodyAsChannel()
             while (true) {
-                val line = ch.readUTF8Line() ?: break
+                // Hard per-line ceiling: readUTF8Line() with no max accumulates a
+                // response that never sends a newline up to ~2^31 chars. Bound it
+                // to the node RPC wire ceiling; an over-limit line throws and ends
+                // the stream rather than exhausting memory.
+                val line = ch.readUTF8Line(MAX_SSE_LINE) ?: break
                 if (line.startsWith("data:")) {
                     val data = line.removePrefix("data:").trim()
                     if (data.isNotEmpty()) {
@@ -297,6 +307,10 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
         }
     }
 }
+
+// MAX_SSE_LINE bounds one SSE line to the node RPC message ceiling (16 MiB); a
+// grouped frame is already capped there upstream, so a longer line is malformed.
+private const val MAX_SSE_LINE = 16 * 1024 * 1024
 
 /** TranscriptPage fuses a transcript page body with its X-Transcript-* cursor. */
 data class TranscriptPage(
