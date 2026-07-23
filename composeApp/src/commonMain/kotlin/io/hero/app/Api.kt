@@ -23,6 +23,7 @@ import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.contentType
+import io.ktor.http.encodeURLParameter
 import io.ktor.http.encodeURLPathPart
 import io.ktor.http.isSuccess
 import io.ktor.http.parameters
@@ -215,7 +216,9 @@ class Api(
     // ---- conversation: structured window (history + grouped live tail) ----
 
     /** transcript fetches one grouped display page. offset=null → newest page; the
-     *  X-Transcript-* headers carry the cursor for prepending older pages. */
+     *  X-Transcript-* headers carry the cursor for prepending older pages, plus —
+     *  while the node has a live /parts feed — the stream watermark captured
+     *  BEFORE the page was read (directly usable as a Last-Event-ID). */
     suspend fun transcript(node: String, id: String, limit: Int, offset: Int? = null): TranscriptPage = read("transcript") {
         val resp = client.get("$baseUrl/api/nodes/${node.enc()}/sessions/${id.enc()}/transcript") {
             parameter("limit", limit)
@@ -228,16 +231,36 @@ class Api(
             total = h["X-Transcript-Total"]?.toIntOrNull() ?: turns.size,
             start = h["X-Transcript-Start"]?.toIntOrNull() ?: 0,
             hasMore = h["X-Transcript-Has-More"].equals("true", ignoreCase = true),
+            streamSeq = h[TRANSCRIPT_SEQ_HEADER]?.takeIf { it.isNotEmpty() },
         )
     }
 
     /** liveFrames is the grouped, typed live tail for one session: the /parts SSE
-     *  (structured frames only — no raw jsonl), filtered to this session and decoded.
-     *  [onSubscribed] runs once the SSE handshake is validated, before any frame is
-     *  consumed — the caller's truth-up hook (re-read the newest transcript page and
-     *  merge), so the snapshot→subscribe gap and outage windows are recovered. */
-    fun liveFrames(node: String, session: String, onSubscribed: suspend () -> Unit = {}): Flow<LiveFrame> =
-        sseFrames("$baseUrl/api/nodes/${node.enc()}/parts", onSubscribed)
+     *  (structured frames only — no raw jsonl), scoped server-side to this session
+     *  (the client filter stays as belt and braces), opted into the resume cursor
+     *  (`replay=1` — every sequenced frame carries `id: <epoch>-<seq>`), and asking
+     *  the server to drop `part.delta` before the wire (an old server keeps
+     *  sending them; reduce's Delta branch still absorbs those).
+     *
+     *  [lastEventId] (the last id applied, or a transcript watermark) is sent as
+     *  `Last-Event-ID`; [onEventId] reports each frame's id AFTER the collector
+     *  has applied it (so a resume from it can never skip an unapplied frame);
+     *  [onSubscribed] runs once the handshake is validated, before any frame is
+     *  consumed, with the server's verdict: resumed=true means every sequenced
+     *  frame after [lastEventId] will be delivered — the caller may skip its
+     *  truth-up re-read; false (gap, stripped header, epoch change, old server)
+     *  means the caller must reconcile from a fresh transcript snapshot. */
+    fun liveFrames(
+        node: String, session: String,
+        lastEventId: String? = null,
+        onEventId: (String) -> Unit = {},
+        onSubscribed: suspend (resumed: Boolean) -> Unit = {},
+    ): Flow<LiveFrame> =
+        sseFrames(
+            "$baseUrl/api/nodes/${node.enc()}/parts" +
+                "?session=${session.encodeURLParameter()}&replay=1&include_deltas=false",
+            lastEventId, onEventId, onSubscribed,
+        )
             .filter { it.session_id.isEmpty() || it.session_id == session }
             .mapNotNull { decodeLiveFrame(it, json) }
 
@@ -397,12 +420,20 @@ class Api(
      *  2xx that is not actually an SSE stream (204 no-body, or a proxy's 200
      *  HTML/JSON page) the permanent [StreamProtocolException] — previously such a
      *  body was ignored line by line and bare-reconnected forever. [onSubscribed]
-     *  fires after validation, before the first read (the caller's truth-up hook). */
-    private fun sseFrames(url: String, onSubscribed: suspend () -> Unit = {}): Flow<Event> = flow {
+     *  fires after validation, before the first read, carrying the resume verdict
+     *  ([resumedHandshake] over the X-Parts-* answer to [lastEventId]); callers
+     *  without a cursor get resumed=false — the status-quo truth-up posture. */
+    private fun sseFrames(
+        url: String,
+        lastEventId: String? = null,
+        onEventId: (String) -> Unit = {},
+        onSubscribed: suspend (resumed: Boolean) -> Unit = {},
+    ): Flow<Event> = flow {
         client.prepareGet(url) {
             // A quiet stream is not a stuck request — the client's unary 30s
             // bound must not apply here (reconnect loops live in the callers).
             timeout { requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS }
+            if (lastEventId != null) header(LAST_EVENT_ID_HEADER, lastEventId)
         }.execute { resp ->
             // A non-2xx (401 after logout, 502/offline via a proxy) is an error,
             // not an empty stream: surface it so the caller's reconnect/error path
@@ -420,14 +451,28 @@ class Api(
             if (ct == null || !ct.match(ContentType.Text.EventStream)) {
                 throw StreamProtocolException("not an event stream: ${ct ?: "no content type"}")
             }
-            onSubscribed()
+            onSubscribed(resumedHandshake(lastEventId, resp.headers[PARTS_EPOCH_HEADER], resp.headers[PARTS_REPLAY_HEADER]))
             val lines = SseLineReader(resp.bodyAsChannel(), MAX_SSE_LINE)
+            // The server writes `id: <epoch>-<seq>` BEFORE its frame's data line.
+            // The id is committed via [onEventId] only after emit() returns — the
+            // collector has applied (or knowingly skipped) the frame by then, so
+            // resuming from a committed id never skips an unapplied frame
+            // (EventSource's dispatch-time semantics). Comment lines (the ": hb"
+            // heartbeat) and blank separators fall through both branches ignored.
+            var pendingId: String? = null
             while (true) {
                 val line = lines.readLine() ?: break
-                if (line.startsWith("data:")) {
-                    val data = line.removePrefix("data:").trim()
-                    if (data.isNotEmpty()) {
-                        emit(json.decodeFromString(Event.serializer(), data))
+                when {
+                    line.startsWith("data:") -> {
+                        val data = line.removePrefix("data:").trim()
+                        if (data.isNotEmpty()) {
+                            emit(json.decodeFromString(Event.serializer(), data))
+                        }
+                        pendingId?.let(onEventId)
+                        pendingId = null
+                    }
+                    line.startsWith("id:") -> {
+                        line.removePrefix("id:").trim().takeIf { it.isNotEmpty() }?.let { pendingId = it }
                     }
                 }
             }
@@ -573,6 +618,45 @@ class StreamProtocolException(message: String) : IllegalStateException(message)
 internal fun isPermanentStreamError(t: Throwable): Boolean =
     t is StreamAuthException || t is StreamProtocolException
 
+// ---- /parts live-stream resume cursor (control-plane-api.md § live-stream resume) ----
+
+/** The SSE resume request header (what EventSource would send). */
+internal const val LAST_EVENT_ID_HEADER = "Last-Event-ID"
+
+/** The stream epoch announced on every replay=1 handshake. */
+internal const val PARTS_EPOCH_HEADER = "X-Parts-Stream-Epoch"
+
+/** The server's answer to a Last-Event-ID: "resume" or "gap". */
+internal const val PARTS_REPLAY_HEADER = "X-Parts-Replay"
+
+/** The transcript snapshot watermark — directly usable as a Last-Event-ID. */
+internal const val TRANSCRIPT_SEQ_HEADER = "X-Transcript-Stream-Seq"
+
+/** eventIdEpoch extracts the epoch of one `<epoch>-<seq>` stream id; null when
+ *  the id doesn't have that shape. A malformed id must never crash the stream —
+ *  it just cannot prove epoch continuity, so a resume claim over it is refused
+ *  and the caller falls back to the truth-up path. Pure; unit-tested. */
+internal fun eventIdEpoch(id: String): String? {
+    val cut = id.lastIndexOf('-')
+    if (cut <= 0 || cut == id.length - 1) return null
+    for (i in cut + 1 until id.length) if (id[i] !in '0'..'9') return null
+    return id.substring(0, cut)
+}
+
+/** resumedHandshake decides whether one validated /parts handshake RESUMED the
+ *  stream after [sentId]: every sequenced frame since it will be delivered
+ *  exactly once, so the reconnect-time truth-up re-read may be skipped — the
+ *  point of the resume cursor. Resume is claimed only by an explicit
+ *  `X-Parts-Replay: resume` answering an id we actually sent, cross-checked
+ *  against the announced epoch when present (an epoch change invalidates the
+ *  id even if an intermediary mangled the verdict). Everything else — gap, a
+ *  stripped header (the contract says assume gap), an old server that sent
+ *  neither ids nor headers, no id sent — reports false: the caller must
+ *  reconcile from a fresh snapshot, the pre-cursor status quo. Pure. */
+internal fun resumedHandshake(sentId: String?, epoch: String?, replay: String?): Boolean =
+    sentId != null && replay.equals("resume", ignoreCase = true) &&
+        (epoch == null || eventIdEpoch(sentId) == epoch)
+
 /** SseLineReader reads newline-delimited SSE lines with a STRICT encoded-byte
  *  ceiling, counted BEFORE any String is materialized. Ktor's readUTF8Line(max)
  *  is only a soft bound: it checks the running total while the delimiter hasn't
@@ -643,12 +727,17 @@ internal class SseLineReader(private val ch: ByteReadChannel, private val maxByt
     }
 }
 
-/** TranscriptPage fuses a transcript page body with its X-Transcript-* cursor. */
+/** TranscriptPage fuses a transcript page body with its X-Transcript-* cursor
+ *  and, when the node has a live /parts feed, the snapshot watermark
+ *  ([streamSeq], `<epoch>-<seq>` captured BEFORE the page was read) — the
+ *  Last-Event-ID that closes the snapshot→subscribe gap. null on an old server
+ *  or while no live feed exists; `<epoch>-0` is legal (a silent session). */
 data class TranscriptPage(
     val turns: List<Turn>,
     val total: Int,
     val start: Int,
     val hasMore: Boolean,
+    val streamSeq: String? = null,
 )
 
 private fun String.enc(): String = this.encodeURLPathPart()

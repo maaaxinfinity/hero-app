@@ -258,7 +258,10 @@ fun ConvoState.reduce(f: LiveFrame): ConvoState = when (f) {
             )
         }
     }
-    is LiveFrame.Delta -> this // v1: rely on committed `part` frames
+    // v1: rely on committed `part` frames. The subscription asks the server to
+    // drop deltas (include_deltas=false), but an OLD server ignores the param
+    // and keeps sending them — this branch must stay a no-op sink, not vanish.
+    is LiveFrame.Delta -> this
     is LiveFrame.Status -> copy(status = f.status)
     // Exit only stamps the canonical uuid and settles — the UI id is untouched,
     // so the row is not rebuilt when a live turn goes terminal.

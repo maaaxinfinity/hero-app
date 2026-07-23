@@ -135,6 +135,51 @@ internal fun sessionLive(status: String?): Boolean = when (status?.trim()?.lower
     else -> true
 }
 
+/** LiveResync owns the resume cursor for ONE conversation subscription loop:
+ *  the Last-Event-ID to reconnect with (the last SSE id the collector applied,
+ *  or a transcript watermark standing in for it) and the reconnect-time
+ *  reconciliation it drives. A handshake the server RESUMED delivers every
+ *  sequenced frame after that id — the truth-up re-read is SKIPPED, which
+ *  downgrades the old "re-read the newest page on every reconnect" to gap and
+ *  no-id reconnects only. A handshake that did not resume (gap, stripped
+ *  header, epoch change, old server, no id yet) drops the spent id, re-reads
+ *  the newest page through [fetchPage]/[apply], and adopts that snapshot's
+ *  fresh watermark (when present) so the NEXT reconnect can resume. Frames
+ *  replayed across a watermark re-deliver work the page already holds — reduce
+ *  dedupes them (its existing re-delivery contract). Old servers send neither
+ *  ids nor watermarks, so the cursor stays null and every reconnect truth-ups —
+ *  the exact pre-cursor behavior. Pure given its two hooks; unit-tested. */
+internal class LiveResync(
+    private val fetchPage: suspend () -> TranscriptPage,
+    private val apply: (TranscriptPage) -> Unit,
+) {
+    /** The Last-Event-ID for the next (re)subscribe; null = none (truth-up). */
+    var lastEventId: String? = null
+        private set
+
+    /** seed adopts a transcript snapshot watermark; absent (old server, no
+     *  live feed) leaves the cursor unchanged. */
+    fun seed(watermark: String?) {
+        if (!watermark.isNullOrEmpty()) lastEventId = watermark
+    }
+
+    /** record tracks one applied frame's SSE id (Api commits it post-emit). */
+    fun record(id: String) {
+        lastEventId = id
+    }
+
+    /** onSubscribed runs the reconnect-time reconciliation for one validated
+     *  handshake: resume keeps the stream contiguous (no re-read); anything
+     *  else truth-ups from a fresh newest page and re-seeds off its watermark. */
+    suspend fun onSubscribed(resumed: Boolean) {
+        if (resumed) return
+        lastEventId = null // the sent id (if any) is spent — gap or epoch change
+        val page = fetchPage()
+        apply(page)
+        seed(page.streamSeq)
+    }
+}
+
 /** anchorAfterPrepend computes the LazyColumn (item index, scroll offset) that
  *  keeps the pre-prepend first visible row stationary after an earlier page
  *  lands above it. [anchorKey] is that row's stable display key recorded before
@@ -331,21 +376,32 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
             delay(pollDelayMillis(10_000))
         }
     }
-    // Seed the newest transcript page, then subscribe the grouped live tail and
-    // reconcile it. Keyed on (node, active session) so it cancels + restarts on
-    // switch. Every successful (re)subscribe TRUTH-UPS: it re-reads the newest
-    // page and merges by stable turn identity, so frames committed in the
-    // snapshot→subscribe gap or during an outage are recovered instead of lost
-    // until reopen. Transient stream failures (EOF, resets, 5xx) reconnect with
-    // capped full-jitter backoff; permanent ones (401/403 auth, a non-SSE
-    // endpoint) stop the loop and surface an error row — the app's existing 401
-    // posture (explicit error, no silent retry), matching orThrow/me().
+    // Seed the newest transcript page, then subscribe the grouped live tail
+    // (session-scoped, replay=1 resume cursor) and reconcile it. Keyed on
+    // (node, active session) so it cancels + restarts on switch. The seed
+    // page's watermark doubles as the first subscribe's Last-Event-ID, closing
+    // the snapshot→subscribe gap without a re-read; a (re)subscribe the server
+    // RESUMED continues the stream exactly where the applied ids left off — no
+    // truth-up. Only a subscribe WITHOUT a usable cursor (gap, epoch change,
+    // stripped headers, old server, no id yet) TRUTH-UPS: it re-reads the
+    // newest page and merges by stable turn identity, so frames committed
+    // during an outage are recovered instead of lost until reopen (LiveResync
+    // owns that decision). Transient stream failures (EOF, resets, 5xx)
+    // reconnect with capped full-jitter backoff; permanent ones (401/403 auth,
+    // a non-SSE endpoint) stop the loop and surface an error row — the app's
+    // existing 401 posture (explicit error, no silent retry), matching
+    // orThrow/me().
     LaunchedEffect(sel.node, active) {
         val n = sel.node; val s = active
         if (n == null || s == null) { convo = ConvoState(); return@LaunchedEffect }
         convo = ConvoState()
+        val sync = LiveResync(
+            fetchPage = { api.transcript(n, s, TRANSCRIPT_PAGE) },
+            apply = { page -> convo = convo.truthUp(page.turns, page.total, page.start) },
+        )
         runCatchingCancellable { api.transcript(n, s, TRANSCRIPT_PAGE) }.getOrNull()?.let { page ->
             convo = ConvoState(turns = page.turns, cursor = Cursor(page.total, page.start, TRANSCRIPT_PAGE))
+            sync.seed(page.streamSeq)
         }
         // Whether a drilled-in subagent still needs the live tail is the
         // SERVER's call (its status in the sessions list) — "readonly" only
@@ -355,11 +411,15 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         var attempt = 0
         while (isActive) {
             val err = runCatchingCancellable {
-                api.liveFrames(n, s, onSubscribed = {
-                    val page = api.transcript(n, s, TRANSCRIPT_PAGE)
-                    convo = convo.truthUp(page.turns, page.total, page.start)
-                    attempt = 0
-                }).collect { frame -> convo = convo.reduce(frame) }
+                api.liveFrames(
+                    n, s,
+                    lastEventId = sync.lastEventId,
+                    onEventId = sync::record,
+                    onSubscribed = { resumed ->
+                        sync.onSubscribed(resumed)
+                        attempt = 0
+                    },
+                ).collect { frame -> convo = convo.reduce(frame) }
             }.exceptionOrNull()
             if (!isActive) break
             if (err != null && isPermanentStreamError(err)) {
