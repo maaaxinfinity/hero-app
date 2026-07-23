@@ -68,20 +68,41 @@ data class ConvoState(
 )
 
 /** reduce folds one live frame into the conversation. Immutable copies so Compose
- *  sees new references; `Unknown`/`Delta` are no-ops (v1 renders committed parts). */
+ *  sees new references; `Unknown`/`Delta` are no-ops (v1 renders committed parts).
+ *  UserTurn/Part tolerate RE-DELIVERY: after a truth-up (or a snapshot taken
+ *  mid-turn) the stream replays work the merged page already contains — those
+ *  frames must fold away instead of duplicating turns or parts. */
 fun ConvoState.reduce(f: LiveFrame): ConvoState = when (f) {
     is LiveFrame.UserTurn -> {
-        val dup = turns.lastOrNull()?.let { it.role == "user" && it.content == f.content } == true
-        if (dup) copy(openAssistant = false, status = null)
+        // Duplicate if it's the optimistic echo (last turn, same content) or a
+        // commit the loaded window already holds (same non-empty ts + content —
+        // an SSE re-delivery across a truth-up, never a genuinely repeated
+        // message, which gets its own ts).
+        val echoDup = turns.lastOrNull()?.let { it.role == "user" && it.content == f.content } == true
+        val committedDup = !f.ts.isNullOrEmpty() && turns.any { it.role == "user" && it.ts == f.ts && it.content == f.content }
+        if (echoDup || committedDup) copy(openAssistant = false, status = null)
         else copy(turns = turns + Turn(role = "user", content = f.content, ts = f.ts ?: ""),
             openAssistant = false, status = null)
     }
     is LiveFrame.Part -> {
-        if (openAssistant && turns.lastOrNull()?.role == "assistant") {
-            val last = turns.last()
-            copy(turns = turns.dropLast(1) + last.copy(parts = last.parts + f.part))
-        } else {
-            copy(
+        val resumeIdx = if (openAssistant || f.ts.isNullOrEmpty()) -1
+        else turns.indexOfLast { it.role == "assistant" && it.ts == f.ts }
+        when {
+            openAssistant && turns.lastOrNull()?.role == "assistant" -> {
+                val last = turns.last()
+                copy(turns = turns.dropLast(1) + last.copy(parts = last.parts + f.part))
+            }
+            // Not open, but the frame's ts names a turn the seed/truth-up page
+            // already holds: a part the page committed is a re-delivery (no-op);
+            // a new one RESUMES that turn in place instead of opening a split
+            // duplicate turn for the same ts.
+            resumeIdx >= 0 && f.part in turns[resumeIdx].parts -> this
+            resumeIdx >= 0 -> {
+                val t = turns[resumeIdx]
+                val updated = turns.toMutableList().also { it[resumeIdx] = t.copy(parts = t.parts + f.part) }
+                copy(turns = updated, openAssistant = resumeIdx == turns.lastIndex, status = null)
+            }
+            else -> copy(
                 turns = turns + Turn(role = "assistant", parts = listOf(f.part), ts = f.ts ?: "", model = f.model),
                 openAssistant = true, status = null,
             )
@@ -114,6 +135,62 @@ fun ConvoState.prepend(page: List<Turn>, total: Int, start: Int): ConvoState =
         turns = page + turns,
         cursor = Cursor(total, start, cursor?.pageSize ?: page.size.coerceAtLeast(1)),
     )
+
+/** truthUp reconciles a freshly re-read NEWEST transcript page into the loaded
+ *  window after every SSE (re)subscribe: turns committed in the snapshot→subscribe
+ *  gap or during an outage appear exactly once, already-loaded turns are replaced
+ *  by their authoritative versions, older prepended history stays put, and
+ *  client-only rows behind the window (error lines, an uncommitted optimistic
+ *  user echo) survive at the tail. Matching uses the stable turn identity of
+ *  turnKey (uuid, else role+ts) plus two commit transitions that change a key:
+ *  a live assistant turn later committed with a uuid (matched by assistant ts)
+ *  and an optimistic user echo later committed with a ts (matched by content).
+ *  When the page no longer overlaps the loaded window (the outage outlasted a
+ *  whole page: page start is beyond the last-known total) the stale window is
+ *  dropped rather than bridging a silent hole — the cursor stays honest about
+ *  contiguity, so "Load earlier" never skips server turns. Pure, like reduce. */
+fun ConvoState.truthUp(page: List<Turn>, total: Int, start: Int): ConvoState {
+    val pageSize = cursor?.pageSize ?: page.size.coerceAtLeast(1)
+    if (page.isEmpty()) return copy(openAssistant = false, cursor = Cursor(total, start, pageSize))
+    val old = cursor
+    if (old != null && start > old.total) {
+        return copy(turns = page, openAssistant = false, cursor = Cursor(total, start, pageSize))
+    }
+    val pageKeys = page.map { turnKey(it) }.toSet()
+    val committedAssistantTs = page.mapNotNull { t -> t.ts.takeIf { t.role == "assistant" && it.isNotEmpty() } }.toSet()
+    fun covered(t: Turn): Boolean = when {
+        turnKey(t) in pageKeys -> true
+        t.role == "assistant" && t.uuid == null && t.ts.isNotEmpty() && t.ts in committedAssistantTs -> true
+        t.role == "user" && t.ts.isEmpty() && page.any { it.role == "user" && it.content == t.content } -> true
+        else -> false
+    }
+    val firstCovered = turns.indexOfFirst { covered(it) }
+    // Nothing covered: the whole local window predates (or exactly abuts) the
+    // page — keep it all as older history and append the page after it.
+    val prefix = if (firstCovered >= 0) turns.take(firstCovered) else turns
+    val clientTail = if (firstCovered < 0) emptyList()
+    else turns.drop(firstCovered).filter { !covered(it) && (it.role == "error" || (it.role == "user" && it.ts.isEmpty())) }
+    return copy(
+        turns = prefix + page + clientTail,
+        openAssistant = false,
+        // The loaded region still reaches back to the older of the two starts
+        // (kept prepended history), so Load earlier neither skips nor re-fetches.
+        cursor = Cursor(total, minOf(old?.start ?: start, start), pageSize),
+    )
+}
+
+/** ConvoOwner pins an async conversation request to the immutable {node, session}
+ *  it was issued for. Session ids are NOT unique across nodes (mirrored/cloned
+ *  data dirs), so the node is part of the identity. */
+data class ConvoOwner(val node: String, val session: String)
+
+/** applyEarlierPage folds a fetched earlier transcript page into [state] only
+ *  when the request's [owner] still equals the currently-selected [current]
+ *  owner — a "Load earlier" response that outlived its conversation (the user
+ *  switched session or node while it was in flight) is discarded, never
+ *  prepended into the now-open one. Returns null when discarded. Pure. */
+fun applyEarlierPage(state: ConvoState, owner: ConvoOwner, current: ConvoOwner?, page: TranscriptPage): ConvoState? =
+    if (owner != current) null else state.prepend(page.turns, page.total, page.start)
 
 /** turnKey is a stable LazyColumn key. Assistant turns prefer uuid (assigned at
  *  exit); before that they key on role+ts ONLY — never parts.size, which grows on

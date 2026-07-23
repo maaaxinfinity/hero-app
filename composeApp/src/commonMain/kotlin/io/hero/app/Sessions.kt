@@ -74,6 +74,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -96,6 +97,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.random.Random
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
@@ -109,6 +111,53 @@ import kotlinx.coroutines.withTimeoutOrNull
 // TRANSCRIPT_PAGE is the turns-per-page the app requests (newest page on open;
 // "Load earlier" prepends further pages).
 private const val TRANSCRIPT_PAGE = 40
+
+/** streamBackoffMillis is the delay before live-stream reconnect [attempt]
+ *  (0-based, reset on every successful subscribe): capped full-jitter exponential
+ *  backoff — a uniform draw from [0, min(1s·2^attempt, 30s)]. Replaces the fixed
+ *  1.5s bare loop, which hammered dead endpoints and thundering-herded every
+ *  viewer at a control-plane restart. Pure given [random]; unit-tested. */
+internal fun streamBackoffMillis(attempt: Int, random: Random = Random.Default): Long {
+    val exp = attempt.coerceIn(0, 5) // 1s·2^5 is already past the cap
+    val ceiling = (1_000L shl exp).coerceAtMost(30_000L)
+    return random.nextLong(ceiling + 1)
+}
+
+/** sessionLive decides whether an opened session still needs the live tail from
+ *  its SERVER-reported list status. Only an explicitly finished state skips the
+ *  subscription; "running", anything unknown, and a session missing from the
+ *  list (null status) all subscribe — the /parts feed is node-wide, so an extra
+ *  idle subscription is free, while the old inference ("drilled-in ⇒ transcript
+ *  complete") froze still-running subagents at their open snapshot. Pure. */
+internal fun sessionLive(status: String?): Boolean = when (status?.trim()?.lowercase()) {
+    "completed", "complete", "finished", "done", "exited", "exit", "stopped", "errored", "error", "failed" -> false
+    else -> true
+}
+
+/** anchorAfterPrepend computes the LazyColumn (item index, scroll offset) that
+ *  keeps the pre-prepend first visible turn stationary after an earlier page
+ *  lands above it. [anchorKey] is that turn's stable display key recorded before
+ *  the load; [keysAfter] the merged window's keys; [hasHeaderAfter] whether the
+ *  "Load earlier" item still occupies index 0 — on the LAST page it disappears,
+ *  which the old `oldIndex + added` arithmetic ignored, landing one row down. A
+ *  vanished key falls back to the top of the window. Pure; unit-tested. */
+internal fun anchorAfterPrepend(
+    anchorKey: Any?,
+    keysAfter: List<Any>,
+    hasHeaderAfter: Boolean,
+    offset: Int,
+): Pair<Int, Int> {
+    val turnIdx = if (anchorKey == null) -1 else keysAfter.indexOf(anchorKey)
+    if (turnIdx < 0) return 0 to 0
+    return (turnIdx + if (hasHeaderAfter) 1 else 0) to offset
+}
+
+/** EarlierPage reports one applied "Load earlier" fetch back to the pane: how
+ *  many turns landed, the merged window's display keys (to re-anchor scroll by
+ *  stable key), and whether the header item still renders. null = nothing
+ *  applied (no more pages, fetch failed, or the response outlived its
+ *  conversation and was discarded by the owner CAS). */
+data class EarlierPage(val added: Int, val keys: List<Any>, val hasMore: Boolean)
 
 /**
  * SessionSel is the hoisted selection state: which node, which root session,
@@ -135,6 +184,10 @@ data class SessionSel(
 @Composable
 internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel: (SessionSel) -> Unit) {
     val scope = rememberCoroutineScope()
+    // The CURRENT selection for async completions. Handlers launched from a
+    // previous composition captured a stale `sel`; any late response must CAS
+    // against this before touching shared conversation state.
+    val currentSel = rememberUpdatedState(sel)
     // Sidebar collapse survives restarts (a workspace-layout choice, not UI froth).
     var collapsed by remember { mutableStateOf(settings.getString(Keys.SidebarCollapsed) == "1") }
     // Nodes render straight from the fleet cache (fed here and by the badge
@@ -229,7 +282,13 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     }
     // Seed the newest transcript page, then subscribe the grouped live tail and
     // reconcile it. Keyed on (node, active session) so it cancels + restarts on
-    // switch; the live loop reconnects with backoff (SSE drops are routine).
+    // switch. Every successful (re)subscribe TRUTH-UPS: it re-reads the newest
+    // page and merges by stable turn identity, so frames committed in the
+    // snapshot→subscribe gap or during an outage are recovered instead of lost
+    // until reopen. Transient stream failures (EOF, resets, 5xx) reconnect with
+    // capped full-jitter backoff; permanent ones (401/403 auth, a non-SSE
+    // endpoint) stop the loop and surface an error row — the app's existing 401
+    // posture (explicit error, no silent retry), matching orThrow/me().
     LaunchedEffect(sel.node, active) {
         val n = sel.node; val s = active
         if (n == null || s == null) { convo = ConvoState(); return@LaunchedEffect }
@@ -237,13 +296,27 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         runCatchingCancellable { api.transcript(n, s, TRANSCRIPT_PAGE) }.getOrNull()?.let { page ->
             convo = ConvoState(turns = page.turns, cursor = Cursor(page.total, page.start, TRANSCRIPT_PAGE))
         }
-        if (readonly) return@LaunchedEffect // subagent transcripts are complete + read-only
+        // Whether a drilled-in subagent still needs the live tail is the
+        // SERVER's call (its status in the sessions list) — "readonly" only
+        // shapes the UI and is not evidence the transcript ended; a child that
+        // is still running must keep receiving part/exit frames.
+        if (readonly && !sessionLive(sessions.firstOrNull { it.id == s }?.status)) return@LaunchedEffect
+        var attempt = 0
         while (isActive) {
-            runCatchingCancellable {
-                api.liveFrames(n, s).collect { frame -> convo = convo.reduce(frame) }
-            }
+            val err = runCatchingCancellable {
+                api.liveFrames(n, s, onSubscribed = {
+                    val page = api.transcript(n, s, TRANSCRIPT_PAGE)
+                    convo = convo.truthUp(page.turns, page.total, page.start)
+                    attempt = 0
+                }).collect { frame -> convo = convo.reduce(frame) }
+            }.exceptionOrNull()
             if (!isActive) break
-            delay(1500)
+            if (err != null && isPermanentStreamError(err)) {
+                convo = convo.reduce(LiveFrame.ErrorFrame("live updates stopped: ${err.message ?: "stream error"}"))
+                break
+            }
+            delay(streamBackoffMillis(attempt))
+            attempt += 1
         }
     }
     // Poll pending permission requests for the WHOLE node while a session is
@@ -311,18 +384,27 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     val convoPane: @Composable (Boolean, Modifier) -> Unit = { showBack, m ->
         ConversationPane(
             convo = convo, pend = pend, backend = backend, title = title,
-            readonly = readonly, showBack = showBack, sessionKey = sel.active.orEmpty(),
+            readonly = readonly, showBack = showBack,
+            node = sel.node.orEmpty(), sessionId = sel.active.orEmpty(),
             onToggleInspector = { inspector = !inspector },
             onLoadEarlier = {
-                // Fetch the page before the window and prepend it; returns the
-                // number of turns added so the pane can re-anchor its scroll.
+                // Fetch the page before the window and prepend it. The request's
+                // owner is the immutable {node, session} captured HERE; the
+                // response applies only if that owner still matches the current
+                // selection (CAS via applyEarlierPage) — a page that returns
+                // after switching to another session/node is discarded, never
+                // prepended into the now-open conversation.
                 val n = sel.node; val s = sel.active; val cur = convo.cursor
-                if (n == null || s == null || cur == null || !cur.hasMore) 0
+                if (n == null || s == null || cur == null || !cur.hasMore) null
                 else runCatchingCancellable { api.transcript(n, s, cur.pageSize, offset = cur.earlierOffset()) }
                     .getOrNull()?.let { page ->
-                        convo = convo.prepend(page.turns, page.total, page.start)
-                        page.turns.size
-                    } ?: 0
+                        val now = currentSel.value
+                        val nowOwner = now.node?.let { nn -> now.active?.let { ss -> ConvoOwner(nn, ss) } }
+                        applyEarlierPage(convo, ConvoOwner(n, s), nowOwner, page)?.let { merged ->
+                            convo = merged
+                            EarlierPage(page.turns.size, displayKeys(merged.turns), merged.cursor?.hasMore == true)
+                        }
+                    }
             },
             input = input, onInput = { input = it },
             switchModels = catModels, effortLevels = catEffortLevels,
@@ -335,16 +417,29 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                     convo = convo.optimisticUser(t)
                     val m = switchModel; val e = if (catEffortLevels.isNotEmpty()) switchEffort else ""
                     scope.launch {
-                        // The optimistic echo must not mask a failed send.
+                        // The optimistic echo must not mask a failed send — but a
+                        // failure that returns after switching conversations must
+                        // not inject its error row into the new one either.
                         runCatchingCancellable { api.send(n, s, t, m, e) }
-                            .onFailure { convo = convo.reduce(LiveFrame.ErrorFrame("send failed: ${it.message ?: "error"}")) }
+                            .onFailure {
+                                val now = currentSel.value
+                                if (now.node == n && now.active == s) {
+                                    convo = convo.reduce(LiveFrame.ErrorFrame("send failed: ${it.message ?: "error"}"))
+                                }
+                            }
                     }
                 }
             },
             onRespond = { p, behavior ->
-                scope.launch {
-                    runCatchingCancellable { api.respond(sel.node!!, p.id, behavior) }
-                        .onFailure { convo = convo.reduce(LiveFrame.ErrorFrame("respond failed: ${it.message ?: "error"}")) }
+                val n = sel.node; val s = sel.active
+                if (n != null) scope.launch {
+                    runCatchingCancellable { api.respond(n, p.id, behavior) }
+                        .onFailure {
+                            val now = currentSel.value
+                            if (now.node == n && now.active == s) {
+                                convo = convo.reduce(LiveFrame.ErrorFrame("respond failed: ${it.message ?: "error"}"))
+                            }
+                        }
                 }
             },
             onOpenChild = { childId -> onSel(sel.copy(drill = sel.drill + childId)) },
@@ -365,9 +460,15 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                     session = rootSession, sessionId = sel.session.orEmpty(),
                     model = convo.runtimeModel, pend = pend, turns = convo.turns,
                     onRespond = { p, behavior ->
-                        scope.launch {
-                            runCatchingCancellable { api.respond(sel.node!!, p.id, behavior) }
-                                .onFailure { convo = convo.reduce(LiveFrame.ErrorFrame("respond failed: ${it.message ?: "error"}")) }
+                        val n = sel.node; val s = sel.active
+                        if (n != null) scope.launch {
+                            runCatchingCancellable { api.respond(n, p.id, behavior) }
+                                .onFailure {
+                                    val now = currentSel.value
+                                    if (now.node == n && now.active == s) {
+                                        convo = convo.reduce(LiveFrame.ErrorFrame("respond failed: ${it.message ?: "error"}"))
+                                    }
+                                }
                         }
                     },
                     onOpenChild = { childId -> onSel(sel.copy(drill = sel.drill + childId)) },
@@ -674,9 +775,9 @@ private suspend fun LazyListState.followToBottom(target: Int, animate: Boolean) 
 @Composable
 private fun ConversationPane(
     convo: ConvoState, pend: List<Pending>, backend: String, title: String,
-    readonly: Boolean, showBack: Boolean, sessionKey: String,
+    readonly: Boolean, showBack: Boolean, node: String, sessionId: String,
     onToggleInspector: () -> Unit,
-    onLoadEarlier: suspend () -> Int,
+    onLoadEarlier: suspend () -> EarlierPage?,
     input: String, onInput: (String) -> Unit, onSend: () -> Unit,
     switchModels: List<HarnessModel> = emptyList(), effortLevels: List<String> = emptyList(),
     model: String = "", onModel: (String) -> Unit = {},
@@ -686,17 +787,22 @@ private fun ConversationPane(
     modifier: Modifier = Modifier,
 ) {
     val scope = rememberCoroutineScope()
+    // Local-state namespace: the FULL conversation identity {node, session}.
+    // Session ids are not unique across nodes (mirrored/cloned data dirs), and
+    // the Quick Switcher swaps both at once — keying on the session alone would
+    // carry node A's scroll/loading/row state onto node B's same-id session.
+    val paneKey = "$node\u0000$sessionId"
     Column(modifier) {
         ConversationHeader(title, convo.runtimeModel, backend, showBack, onBack, onToggleInspector)
         if (readonly) SubagentBar(onBack)
-        // Scroll state is per session (keyed), not shared across switches.
-        val listState = remember(sessionKey) { LazyListState() }
-        var didInitialScroll by remember(sessionKey) { mutableStateOf(false) }
-        var loadingEarlier by remember(sessionKey) { mutableStateOf(false) }
+        // Scroll state is per conversation (keyed), not shared across switches.
+        val listState = remember(paneKey) { LazyListState() }
+        var didInitialScroll by remember(paneKey) { mutableStateOf(false) }
+        var loadingEarlier by remember(paneKey) { mutableStateOf(false) }
         // Stick to the bottom only when already there — don't yank a user who
         // scrolled up to read history. Keyed on the LAST turn (not list size) so
         // prepending an earlier page never triggers a re-stick.
-        val atBottom by remember(sessionKey) {
+        val atBottom by remember(paneKey) {
             derivedStateOf {
                 val info = listState.layoutInfo
                 val last = info.visibleItemsInfo.lastOrNull()
@@ -710,7 +816,7 @@ private fun ConversationPane(
             }
         }
         val lastKey = convo.turns.lastOrNull()?.let { turnKey(it) }
-        LaunchedEffect(sessionKey, lastKey, convo.turns.lastOrNull()?.parts?.size) {
+        LaunchedEffect(paneKey, lastKey, convo.turns.lastOrNull()?.parts?.size) {
             if (convo.turns.isEmpty()) return@LaunchedEffect
             // Last turn's list index, offset by the "load earlier" header when shown.
             val target = convo.turns.lastIndex + if (convo.cursor?.hasMore == true) 1 else 0
@@ -744,22 +850,28 @@ private fun ConversationPane(
                             TextButton(onClick = {
                                 scope.launch {
                                     loadingEarlier = true
-                                    // Anchor the first visible turn so the list doesn't jump
-                                    // when the page lands above it.
+                                    // Anchor the first visible TURN by its stable display key,
+                                    // not by raw item index: when the fetched page is the LAST
+                                    // one, hasMore flips false and this very header item
+                                    // disappears — index math (`old + added`) would land one
+                                    // row down. The key survives the prepend unchanged.
                                     val first = listState.firstVisibleItemIndex
-                                    val offset = listState.firstVisibleItemScrollOffset
+                                    val offset = if (first >= 1) listState.firstVisibleItemScrollOffset else 0
+                                    val anchorKey = keys.getOrNull(maxOf(first, 1) - 1)
                                     val before = listState.layoutInfo.totalItemsCount
-                                    val added = onLoadEarlier()
-                                    if (added > 0) {
+                                    val res = onLoadEarlier()
+                                    if (res != null && res.added > 0) {
                                         // Scroll only after the new page reaches layout —
                                         // earlier, scrollToItem clamps to the OLD item count
-                                        // and the view lands at the bottom instead.
+                                        // and the view lands at the bottom instead. The expected
+                                        // count accounts for this header leaving on the last page.
+                                        val expected = before + res.added - (if (res.hasMore) 0 else 1)
                                         withTimeoutOrNull(1000) {
                                             snapshotFlow { listState.layoutInfo.totalItemsCount }
-                                                .first { it >= before + added }
+                                                .first { it >= expected }
                                         }
-                                        val anchor = maxOf(first, 1)
-                                        listState.scrollToItem(anchor + added, if (first >= 1) offset else 0)
+                                        val (idx, off) = anchorAfterPrepend(anchorKey, res.keys, res.hasMore, offset)
+                                        listState.scrollToItem(idx, off)
                                     }
                                     loadingEarlier = false
                                 }
@@ -768,7 +880,11 @@ private fun ConversationPane(
                     }
                 }
             }
-            itemsIndexed(convo.turns, key = { i, _ -> keys[i] }) { _, turn ->
+            // Row keys carry the pane namespace: two nodes can hold the same
+            // session id with identical turn uuids (mirrored data dirs), and
+            // un-namespaced keys would hand node A's row state (tool-card
+            // expansion) to node B's rows on a Quick Switcher jump.
+            itemsIndexed(convo.turns, key = { i, _ -> "$paneKey|${keys[i]}" }) { _, turn ->
                 TurnView(turn, backend, onOpenChild = onOpenChild)
             }
         }
@@ -776,7 +892,7 @@ private fun ConversationPane(
         if (!readonly) {
             // The composer bar surfaces only THIS session's requests; the
             // inspector's permission center handles the rest of the node.
-            pend.filter { it.session_id == sessionKey }.forEach { p ->
+            pend.filter { it.session_id == sessionId }.forEach { p ->
                 PendingBar(p) { behavior -> onRespond(p, behavior) }
             }
             InputBar(input, onInput, onSend, switchModels, effortLevels, model, onModel, effort, onEffort, backend)

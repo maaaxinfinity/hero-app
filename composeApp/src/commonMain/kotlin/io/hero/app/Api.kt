@@ -24,7 +24,8 @@ import io.ktor.http.encodeURLPathPart
 import io.ktor.http.isSuccess
 import io.ktor.http.parameters
 import io.ktor.serialization.kotlinx.json.json
-import io.ktor.utils.io.readUTF8Line
+import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.readAvailable
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.filter
@@ -165,9 +166,12 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     }
 
     /** liveFrames is the grouped, typed live tail for one session: the /parts SSE
-     *  (structured frames only — no raw jsonl), filtered to this session and decoded. */
-    fun liveFrames(node: String, session: String): Flow<LiveFrame> =
-        sseFrames("$baseUrl/api/nodes/${node.enc()}/parts")
+     *  (structured frames only — no raw jsonl), filtered to this session and decoded.
+     *  [onSubscribed] runs once the SSE handshake is validated, before any frame is
+     *  consumed — the caller's truth-up hook (re-read the newest transcript page and
+     *  merge), so the snapshot→subscribe gap and outage windows are recovered. */
+    fun liveFrames(node: String, session: String, onSubscribed: suspend () -> Unit = {}): Flow<LiveFrame> =
+        sseFrames("$baseUrl/api/nodes/${node.enc()}/parts", onSubscribed)
             .filter { it.session_id.isEmpty() || it.session_id == session }
             .mapNotNull { decodeLiveFrame(it, json) }
 
@@ -289,8 +293,14 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
     /** events streams the node's raw+grouped SSE feed (all sessions). */
     fun events(node: String): Flow<Event> = sseFrames("$baseUrl/api/nodes/${node.enc()}/events")
 
-    /** sseFrames reads an SSE endpoint, parsing each `data:` frame into an Event. */
-    private fun sseFrames(url: String): Flow<Event> = flow {
+    /** sseFrames reads an SSE endpoint, parsing each `data:` frame into an Event.
+     *  The handshake is validated before any line is consumed: 401/403 throw the
+     *  permanent [StreamAuthException], any other non-2xx a transient error, and a
+     *  2xx that is not actually an SSE stream (204 no-body, or a proxy's 200
+     *  HTML/JSON page) the permanent [StreamProtocolException] — previously such a
+     *  body was ignored line by line and bare-reconnected forever. [onSubscribed]
+     *  fires after validation, before the first read (the caller's truth-up hook). */
+    private fun sseFrames(url: String, onSubscribed: suspend () -> Unit = {}): Flow<Event> = flow {
         client.prepareGet(url) {
             // A quiet stream is not a stuck request — the client's unary 30s
             // bound must not apply here (reconnect loops live in the callers).
@@ -300,15 +310,22 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
             // not an empty stream: surface it so the caller's reconnect/error path
             // runs instead of treating a short error body as a cleanly-ended stream.
             if (!resp.status.isSuccess()) {
+                if (resp.status.value == 401 || resp.status.value == 403) {
+                    throw StreamAuthException(resp.status.value)
+                }
                 throw IllegalStateException("stream ${resp.status.value}")
             }
-            val ch = resp.bodyAsChannel()
+            // isSuccess() also admits bodyless 204s and any 2xx a proxy fabricates;
+            // require the SSE content type before treating the body as a stream.
+            if (resp.status.value == 204) throw StreamProtocolException("empty stream (204 No Content)")
+            val ct = resp.contentType()
+            if (ct == null || !ct.match(ContentType.Text.EventStream)) {
+                throw StreamProtocolException("not an event stream: ${ct ?: "no content type"}")
+            }
+            onSubscribed()
+            val lines = SseLineReader(resp.bodyAsChannel(), MAX_SSE_LINE)
             while (true) {
-                // Hard per-line ceiling: readUTF8Line() with no max accumulates a
-                // response that never sends a newline up to ~2^31 chars. Bound it
-                // to the node RPC wire ceiling; an over-limit line throws and ends
-                // the stream rather than exhausting memory.
-                val line = ch.readUTF8Line(MAX_SSE_LINE) ?: break
+                val line = lines.readLine() ?: break
                 if (line.startsWith("data:")) {
                     val data = line.removePrefix("data:").trim()
                     if (data.isNotEmpty()) {
@@ -323,6 +340,95 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
 // MAX_SSE_LINE bounds one SSE line to the node RPC message ceiling (16 MiB); a
 // grouped frame is already capped there upstream, so a longer line is malformed.
 private const val MAX_SSE_LINE = 16 * 1024 * 1024
+
+/** StreamAuthException: the live stream was refused with 401/403 — the session
+ *  cookie is gone or insufficient. Permanent: reconnecting cannot fix it, the
+ *  caller must stop its retry loop and surface the failure (the app's existing
+ *  401 posture — an explicit error, like Api.me()/orThrow — not a silent loop). */
+class StreamAuthException(val status: Int) : IllegalStateException(
+    if (status == 401) "authentication expired (401) — sign in again" else "access denied (403)",
+)
+
+/** StreamProtocolException: the endpoint answered success but not with an SSE
+ *  stream — a 204 without a body, or a proxy/captive portal's 200 HTML/JSON.
+ *  Permanent for this URL: retrying re-fetches the same wrong document. */
+class StreamProtocolException(message: String) : IllegalStateException(message)
+
+/** isPermanentStreamError classifies a live-stream failure for the reconnect
+ *  loop: permanent errors (auth, wrong protocol) stop it and surface; everything
+ *  else — EOF, resets, 5xx, over-limit lines — retries with capped backoff. */
+internal fun isPermanentStreamError(t: Throwable): Boolean =
+    t is StreamAuthException || t is StreamProtocolException
+
+/** SseLineReader reads newline-delimited SSE lines with a STRICT encoded-byte
+ *  ceiling, counted BEFORE any String is materialized. Ktor's readUTF8Line(max)
+ *  is only a soft bound: it checks the running total while the delimiter hasn't
+ *  been seen yet, so a line whose newline and over-limit tail arrive in the same
+ *  buffer is accepted past the declared max (measured +47 bytes on the OkHttp
+ *  path). This reader owns the bytes: it scans for '\n' in its own buffer and
+ *  throws once more than [maxBytes] line bytes accumulate without a delimiter —
+ *  a legal line (≤ maxBytes + the newline) always fits the capped buffer, so the
+ *  budget is exact and nothing over it is ever decoded. */
+internal class SseLineReader(private val ch: ByteReadChannel, private val maxBytes: Int) {
+    private var buf = ByteArray(minOf(8 * 1024, maxBytes + 1))
+    private var start = 0
+    private var end = 0
+    private var eof = false
+
+    /** readLine returns the next line without its terminator (\r\n or \n), the
+     *  final unterminated tail at EOF, or null once drained. */
+    suspend fun readLine(): String? {
+        var scanFrom = start
+        while (true) {
+            var nl = -1
+            var i = scanFrom
+            while (i < end) {
+                if (buf[i] == NL) { nl = i; break }
+                i++
+            }
+            if (nl >= 0) {
+                var lineEnd = nl
+                if (lineEnd > start && buf[lineEnd - 1] == CR) lineEnd--
+                if (lineEnd - start > maxBytes) throw IllegalStateException(overLimit()) // defensive; capacity forbids it
+                val line = buf.decodeToString(start, lineEnd)
+                start = nl + 1
+                return line
+            }
+            scanFrom = end
+            if (eof) {
+                if (start == end) return null
+                if (end - start > maxBytes) throw IllegalStateException(overLimit())
+                val line = buf.decodeToString(start, end)
+                start = end
+                return line
+            }
+            // The whole buffered run is one unterminated line: enforce the budget
+            // on the byte count, before any decode.
+            if (end - start > maxBytes) throw IllegalStateException(overLimit())
+            if (end == buf.size) {
+                if (start > 0) {
+                    // Compact the pending line to the front to make room.
+                    buf.copyInto(buf, 0, start, end)
+                    end -= start
+                    scanFrom -= start
+                    start = 0
+                } else {
+                    // Grow toward the hard cap: maxBytes line bytes + 1 delimiter.
+                    buf = buf.copyOf(minOf(buf.size.toLong() * 2, maxBytes.toLong() + 1).toInt())
+                }
+            }
+            val n = ch.readAvailable(buf, end, buf.size - end)
+            if (n == -1) eof = true else end += n
+        }
+    }
+
+    private fun overLimit() = "SSE line exceeds $maxBytes bytes"
+
+    private companion object {
+        const val NL = '\n'.code.toByte()
+        const val CR = '\r'.code.toByte()
+    }
+}
 
 /** TranscriptPage fuses a transcript page body with its X-Transcript-* cursor. */
 data class TranscriptPage(
