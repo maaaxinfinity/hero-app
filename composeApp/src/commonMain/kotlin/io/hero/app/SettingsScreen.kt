@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -198,5 +199,9 @@ private fun UpdateControls() {
         }
     }
     Spacer(Modifier.height(6.dp))
-    Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    // Selectable so the desktop "verified → <path>, run: java -jar …" instruction
+    // can actually be copied; the running app is never auto-replaced there.
+    SelectionContainer {
+        Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
 }

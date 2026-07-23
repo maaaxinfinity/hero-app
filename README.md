@@ -97,10 +97,18 @@ GitHub Actions and publishes a release with:
 - `hero-app-linux.jar` / `hero-app-macos.jar` / `hero-app-windows.jar` — desktop
 
 Settings has an **Updates** section: tap **Check for updates**, then
-**Install**. The release is public, so no token is involved. Android downloads
-the APK and fires the system installer via a `FileProvider`; desktop downloads
-the matching per-OS jar to the temp dir and tells you how to launch it.
-`AppVersion` in `Update.kt` gates "is this newer".
+**Install**. The release is public, so no token is involved. Every download is
+bounded and validated — the response must be `2xx`, any declared `Content-Length`
+must agree with what actually arrived, and a byte ceiling guards a runaway or
+mis-served body. The bytes stream into a same-directory temp file and are only
+renamed onto the install path after a complete, verified transfer, so a
+cancel/timeout/error never leaves a partial file there. Android then fires the
+system installer via a `FileProvider` on the committed APK. Desktop is a portable
+jar with no installer to hand off to and no launcher path it can safely overwrite,
+so it does **not** auto-relaunch: it downloads and verifies the new per-OS jar,
+publishes it to a stable path (under your home directory), and shows you the exact
+path plus the `java -jar …` command to run it / swap it in. `AppVersion` in
+`Update.kt` gates "is this newer".
 
 ## Status
 

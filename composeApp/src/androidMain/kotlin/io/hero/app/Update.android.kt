@@ -7,7 +7,6 @@ import io.ktor.client.request.header
 import io.ktor.client.request.prepareGet
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.contentLength
-import io.ktor.utils.io.readAvailable
 import java.io.File
 
 // appContext is set by MainActivity so the updater can reach the package
@@ -21,27 +20,30 @@ actual suspend fun installUpdate(info: UpdateInfo, onProgress: (Long, Long?) -> 
     // No HttpTimeout: the download is progress-streamed and may take minutes.
     val client = heroHttpClient()
     try {
-        val out = File(ctx.cacheDir, "hero-update.apk")
-        client.prepareGet(info.downloadUrl) {
-            header("Accept", "application/octet-stream")
-        }.execute { resp ->
-            val total = resp.contentLength()
-            val ch = resp.bodyAsChannel()
-            out.outputStream().use { fo ->
-                val buf = ByteArray(64 * 1024)
-                var received = 0L
-                while (true) {
-                    val n = ch.readAvailable(buf, 0, buf.size)
-                    if (n == -1) break
-                    if (n > 0) {
-                        fo.write(buf, 0, n)
-                        received += n
-                        onProgress(received, total)
-                    }
+        // Download into a same-directory temp first; the installer only ever sees
+        // the final path after a complete, verified commit.
+        val finalFile = File(ctx.cacheDir, "hero-update.apk")
+        val tmp = File.createTempFile("hero-update-", ".apk.part", ctx.cacheDir)
+        try {
+            client.prepareGet(info.downloadUrl) {
+                header("Accept", "application/octet-stream")
+            }.execute { resp ->
+                val expected = validateDownloadStatus(resp.status.value, resp.contentLength())
+                val received = tmp.outputStream().use { fo ->
+                    val r = streamDownload(resp.bodyAsChannel(), expected, onProgress) { b, n -> fo.write(b, 0, n) }
+                    fo.flush() // push bytes to the OS before we size-check and rename
+                    r
                 }
+                validateDownloadSize(received, expected)
             }
+            // Complete + verified: publish onto the path the installer reads.
+            publishAtomically(tmp, finalFile)
+        } finally {
+            // No-op after a successful move; deletes the partial on any
+            // failure/cancel so a broken APK is never handed to the installer.
+            tmp.delete()
         }
-        val uri = FileProvider.getUriForFile(ctx, "io.hero.app.fileprovider", out)
+        val uri = FileProvider.getUriForFile(ctx, "io.hero.app.fileprovider", finalFile)
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -53,4 +55,15 @@ actual suspend fun installUpdate(info: UpdateInfo, onProgress: (Long, Long?) -> 
     } finally {
         client.close()
     }
+}
+
+// publishAtomically renames the completed temp onto the target in a single move.
+// On Android/Linux File.renameTo is rename(2): atomic within one filesystem
+// (tmp and dest share cacheDir) and it replaces an existing dest. java.nio.file
+// is avoided deliberately — it is API 26+, but this app's minSdk is 24. If the
+// rename fails, retry once after removing a stale dest before giving up.
+private fun publishAtomically(tmp: File, dest: File) {
+    if (tmp.renameTo(dest)) return
+    dest.delete()
+    if (!tmp.renameTo(dest)) throw UpdateDownloadException("could not publish the downloaded update")
 }
