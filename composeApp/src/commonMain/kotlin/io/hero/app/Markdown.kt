@@ -35,6 +35,26 @@ import androidx.compose.ui.unit.dp
 /** Annotation tag carrying a link's target URL through the AnnotatedString. */
 internal const val URL_TAG = "URL"
 
+/** RENDER_CHAR_CAP bounds the characters any single Text / markdown body renders.
+ *  The node RPC caps a part at ~64 KiB and a turn at ~512 KiB, but one legit 64 KiB
+ *  part of short lines still expands into tens of thousands of blocks/spans and a
+ *  single enormous Text. This is a defensive *view* cap: content past it stays in
+ *  the transcript (reachable there) — normal chat messages are a few KiB, far below
+ *  it, so they render unchanged. Deliberately generous. */
+internal const val RENDER_CHAR_CAP = 16 * 1024
+
+/** Shown after a body that [capForRender] truncated, so the cut is visible. */
+internal const val RENDER_TRUNCATION_NOTICE = "… (truncated in view; full text in transcript)"
+
+/** capForRender returns [s] unchanged when within [RENDER_CHAR_CAP], else its first
+ *  RENDER_CHAR_CAP chars. Pure — the caller adds the visible affordance when
+ *  [isRenderCapped] is true. */
+internal fun capForRender(s: String): String =
+    if (s.length <= RENDER_CHAR_CAP) s else s.substring(0, RENDER_CHAR_CAP)
+
+/** isRenderCapped reports whether [capForRender] would drop content. */
+internal fun isRenderCapped(s: String): Boolean = s.length > RENDER_CHAR_CAP
+
 internal sealed interface MdBlock {
     data class Code(val text: String) : MdBlock
     data class Heading(val level: Int, val text: String) : MdBlock
@@ -45,7 +65,12 @@ internal sealed interface MdBlock {
 
 @Composable
 fun MarkdownText(md: String, modifier: Modifier = Modifier) {
-    val blocks = remember(md) { parseBlocks(md) }
+    // Defensive per-part view cap: parse/annotate only a bounded head so a huge
+    // part can't expand into an unbounded block/span tree (the full text stays in
+    // the transcript). Normal messages sit far below the cap and are unaffected.
+    val capped = remember(md) { capForRender(md) }
+    val truncated = md.length > RENDER_CHAR_CAP
+    val blocks = remember(capped) { parseBlocks(capped) }
     val link = MaterialTheme.colorScheme.primary
     val codeBg = MaterialTheme.colorScheme.surfaceVariant
     val body = MaterialTheme.typography.bodyMedium
@@ -75,6 +100,13 @@ fun MarkdownText(md: String, modifier: Modifier = Modifier) {
                         style = body.copy(color = MaterialTheme.colorScheme.onSurface),
                     )
                 }
+            }
+            if (truncated) {
+                Text(
+                    RENDER_TRUNCATION_NOTICE,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -151,16 +183,53 @@ private fun orderedMarker(s: String): String? {
     ) "$digits." else null
 }
 
-// parseInline is a single left-to-right scanner over buildAnnotatedString. On any
-// unbalanced marker it emits the literal char and moves on — so malformed markdown
-// degrades to plain text rather than dropping content.
+// INLINE_SCAN_FACTOR/FLOOR size parseInline's forward-scan budget relative to the
+// input length: total closer-search work is capped at FACTOR*length + FLOOR, which
+// keeps the parser linear. The factor is generous — well-formed text does ~length
+// total scan work — so real markup is never starved of budget.
+private const val INLINE_SCAN_FACTOR = 8L
+private const val INLINE_SCAN_FLOOR = 4096L
+
+// parseInline is a single left-to-right, LINEAR-time tokenizer over
+// buildAnnotatedString. Advancing one position at a time, it emits the literal char
+// on any unbalanced marker — so malformed markdown degrades to plain text rather
+// than dropping content. Every forward search for a marker's closer debits a shared
+// budget proportional to the input length (see INLINE_SCAN_FACTOR); once spent, the
+// remainder is emitted verbatim. This bounds total work to O(length): the previous
+// version re-scanned forward with indexOf(']') for every '[', so a large text with
+// many unclosed '[' (or a shared trailing ']') degraded to O(length^2) on the UI
+// thread before a single node was created. Normal text closes its markers within a
+// few chars, so the budget is never near exhausted and the output is identical.
 internal fun parseInline(s: String, link: Color, codeBg: Color): AnnotatedString = buildAnnotatedString {
     var i = 0
+    var scanBudget = s.length.toLong() * INLINE_SCAN_FACTOR + INLINE_SCAN_FLOOR
+    // find advances from `from` to the next `needle`, debiting one unit per char
+    // examined; returns -1 if not found before end-of-string or budget exhaustion.
+    fun find(needle: Char, from: Int): Int {
+        var j = from
+        while (j < s.length) {
+            if (scanBudget-- <= 0L) return -1
+            if (s[j] == needle) return j
+            j++
+        }
+        return -1
+    }
+    // findDouble finds the next run of two identical `ch` (the ** / __ token),
+    // debiting the same budget.
+    fun findDouble(ch: Char, from: Int): Int {
+        var j = from
+        while (j + 1 < s.length) {
+            if (scanBudget-- <= 0L) return -1
+            if (s[j] == ch && s[j + 1] == ch) return j
+            j++
+        }
+        return -1
+    }
     while (i < s.length) {
         val c = s[i]
         when {
             c == '`' -> {
-                val end = s.indexOf('`', i + 1)
+                val end = find('`', i + 1)
                 if (end > i) {
                     withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = codeBg)) {
                         append(s.substring(i + 1, end))
@@ -169,24 +238,25 @@ internal fun parseInline(s: String, link: Color, codeBg: Color): AnnotatedString
                 } else { append(c); i++ }
             }
             s.startsWith("**", i) || s.startsWith("__", i) -> {
-                val token = s.substring(i, i + 2)
-                val end = s.indexOf(token, i + 2)
+                val end = findDouble(c, i + 2)
                 if (end > i) {
                     withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(s.substring(i + 2, end)) }
                     i = end + 2
                 } else { append(c); i++ }
             }
             c == '*' || c == '_' -> {
-                val end = s.indexOf(c, i + 1)
+                val end = find(c, i + 1)
                 if (end > i) {
                     withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { append(s.substring(i + 1, end)) }
                     i = end + 1
                 } else { append(c); i++ }
             }
             c == '[' -> {
-                val close = s.indexOf(']', i + 1)
+                // On '[' try to match ](...); on any failure treat '[' as literal
+                // and continue from the NEXT char — never re-scan from the start.
+                val close = find(']', i + 1)
                 if (close > i && close + 1 < s.length && s[close + 1] == '(') {
-                    val paren = s.indexOf(')', close + 2)
+                    val paren = find(')', close + 2)
                     if (paren > close) {
                         // The URL rides along as an annotation so the label is
                         // tappable (LinkableText) — the url itself is not shown.

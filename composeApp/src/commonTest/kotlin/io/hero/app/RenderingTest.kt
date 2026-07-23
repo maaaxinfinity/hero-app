@@ -1,11 +1,19 @@
 package io.hero.app
 
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
 import kotlinx.serialization.json.Json
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 
 class RenderingTest {
     private val json = Json { ignoreUnknownKeys = true }
@@ -99,5 +107,82 @@ class RenderingTest {
         val broken = parseInline("a [label(no-close", androidx.compose.ui.graphics.Color.Black, androidx.compose.ui.graphics.Color.White)
         assertEquals("a [label(no-close", broken.text)
         assertTrue(broken.getStringAnnotations(URL_TAG, 0, broken.length).isEmpty())
+    }
+
+    // Well-formed bold / italic / code / link still produce the exact same visible
+    // text, span styles and URL annotation after the rewrite to the linear parser.
+    @Test
+    fun parseInlinePreservesNormalMarkup() {
+        val out = parseInline("a **bold** b *italic* c `code` d [x](https://h)", Color.Black, Color.White)
+        assertEquals("a bold b italic c code d x", out.text)
+        assertTrue(
+            out.spanStyles.any { it.item.fontWeight == FontWeight.Bold && out.text.substring(it.start, it.end) == "bold" },
+            "bold span missing",
+        )
+        assertTrue(
+            out.spanStyles.any { it.item.fontStyle == FontStyle.Italic && out.text.substring(it.start, it.end) == "italic" },
+            "italic span missing",
+        )
+        assertTrue(
+            out.spanStyles.any { it.item.fontFamily == FontFamily.Monospace && out.text.substring(it.start, it.end) == "code" },
+            "code span missing",
+        )
+        val ann = out.getStringAnnotations(URL_TAG, 0, out.length).single()
+        assertEquals("https://h", ann.item)
+        assertEquals("x", out.text.substring(ann.start, ann.end))
+    }
+
+    // Regression for the O(L^2) inline scan: a text of only unclosed '[' used to make
+    // every '[' re-scan forward with indexOf(']'). The linear parser bounds total
+    // scan work to O(L), so 8/16/32/64 KiB stay ~linear (~x8), not ~quadratic (~x64).
+    private fun timeUnclosedBrackets(sizeKib: Int): kotlin.time.Duration {
+        val s = "[".repeat(sizeKib * 1024)
+        val mark = TimeSource.Monotonic.markNow()
+        val out = parseInline(s, Color.Black, Color.White)
+        val elapsed = mark.elapsedNow()
+        // Every '[' degrades to a literal — nothing is dropped and it terminates.
+        assertEquals(s.length, out.text.length)
+        assertTrue(out.getStringAnnotations(URL_TAG, 0, out.length).isEmpty())
+        return elapsed
+    }
+
+    @Test
+    fun parseInlineLinearOnUnclosedBrackets() {
+        parseUnclosedWarmup()
+        val t8 = timeUnclosedBrackets(8)
+        val t16 = timeUnclosedBrackets(16)
+        val t32 = timeUnclosedBrackets(32)
+        val t64 = timeUnclosedBrackets(64)
+        // Absolute guard: a linear parser handles 64 KiB of pathological '[' in well
+        // under a second; the old O(L^2) scan is billions of char-ops (many seconds).
+        assertTrue(t64 < 2.seconds, "64 KiB unclosed '[' took $t64 — expected linear (sub-second)")
+        // Scaling guard: 8->64 KiB (x8 input) must not blow up ~x64. Generous slack
+        // absorbs JIT/GC noise on sub-millisecond absolute times.
+        assertTrue(
+            t64 <= t8 * 32 + 500.milliseconds,
+            "inline scan looked super-linear: t8=$t8 t16=$t16 t32=$t32 t64=$t64",
+        )
+    }
+
+    private fun parseUnclosedWarmup() {
+        // Prime the JIT so the first measured size isn't unfairly penalised.
+        parseInline("[".repeat(4096), Color.Black, Color.White)
+    }
+
+    // The per-part view cap keeps a huge body from rendering wholesale: a multi-MiB
+    // string is bounded to RENDER_CHAR_CAP chars, and short-line markdown parses a
+    // bounded number of blocks instead of one block per line for the whole part.
+    @Test
+    fun renderCapBoundsHugeContent() {
+        val small = "hello **world**"
+        assertEquals(small, capForRender(small))
+        assertFalse(isRenderCapped(small))
+
+        val huge = "a".repeat(4 * 1024 * 1024) // multi-MiB
+        assertTrue(isRenderCapped(huge))
+        assertEquals(RENDER_CHAR_CAP, capForRender(huge).length)
+
+        val manyLines = "x\n".repeat(1_000_000)
+        assertTrue(parseBlocks(capForRender(manyLines)).size <= RENDER_CHAR_CAP)
     }
 }

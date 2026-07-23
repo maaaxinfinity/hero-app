@@ -96,8 +96,8 @@ android {
         applicationId = "io.hero.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 24
-        versionName = "0.5.18"
+        versionCode = 25
+        versionName = "0.5.19"
     }
     signingConfigs {
         create("release") {

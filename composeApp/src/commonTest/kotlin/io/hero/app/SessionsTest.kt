@@ -108,4 +108,15 @@ class SessionsTest {
         assertEquals("u1", keys[0])
         assertEquals(keys[1], displayKeys(listOf(done, live1, live2, live1.copy(ts = "later")))[1])
     }
+
+    // "Really at bottom" uses the last item's END offset vs the viewport end, not
+    // just its index: a last turn taller than the viewport parked at its top is the
+    // last visible item but must NOT count as bottom (else live appends yank the
+    // reader and only re-align the turn's start).
+    @Test
+    fun isReallyAtBottomChecksEndOffsetNotIndex() {
+        assertTrue(isReallyAtBottom(lastItemEndOffset = 500, viewportEndOffset = 1000)) // ends above fold
+        assertTrue(isReallyAtBottom(lastItemEndOffset = 1000, viewportEndOffset = 1000)) // exactly aligned
+        assertFalse(isReallyAtBottom(lastItemEndOffset = 5000, viewportEndOffset = 1000)) // tall turn, at its top
+    }
 }

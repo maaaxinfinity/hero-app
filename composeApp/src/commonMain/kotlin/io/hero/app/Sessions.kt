@@ -643,6 +643,32 @@ private fun RailTile(label: String, selected: Boolean, onClick: () -> Unit, cont
     }
 }
 
+/** isReallyAtBottom reports whether the transcript is scrolled to its true end: the
+ *  final item's bottom edge ([lastItemEndOffset]) is at or above the viewport end
+ *  ([viewportEndOffset]). Unlike a last-visible-index check it stays false when the
+ *  last turn is taller than the viewport and the user is parked at its TOP, so live
+ *  appends don't yank a reader. Pure & unit-tested; the composable derives the
+ *  offsets from LazyListLayoutInfo (equivalent to !canScrollForward at the end). */
+internal fun isReallyAtBottom(lastItemEndOffset: Int, viewportEndOffset: Int): Boolean =
+    lastItemEndOffset <= viewportEndOffset
+
+/** followToBottom scrolls to [target] (the last turn) and then, when that turn is
+ *  taller than the viewport, pushes the remaining overflow so its END — the newest
+ *  content — is what shows, instead of only aligning its start. Used for both the
+ *  initial open and live follow. */
+private suspend fun LazyListState.followToBottom(target: Int, animate: Boolean) {
+    if (animate) animateScrollToItem(target) else scrollToItem(target)
+    val info = layoutInfo
+    val last = info.visibleItemsInfo.lastOrNull() ?: return
+    if (last.index >= info.totalItemsCount - 1) {
+        val viewport = info.viewportEndOffset - info.viewportStartOffset
+        val overflow = last.size - viewport
+        if (overflow > 0) {
+            if (animate) animateScrollToItem(last.index, overflow) else scrollToItem(last.index, overflow)
+        }
+    }
+}
+
 // ConversationPane renders one open session: header, transcript, pending
 // permission bars and the composer. Stateless apart from its scroll position.
 @Composable
@@ -674,19 +700,30 @@ private fun ConversationPane(
             derivedStateOf {
                 val info = listState.layoutInfo
                 val last = info.visibleItemsInfo.lastOrNull()
-                last == null || last.index >= info.totalItemsCount - 1
+                // Really at bottom only when the LAST item is visible AND its bottom
+                // edge is within the viewport. A last turn taller than the viewport
+                // parked at its TOP is the last visible item but is NOT at bottom —
+                // the old index-only check wrongly returned true, and auto-scroll then
+                // only re-aligned that turn's start (see isReallyAtBottom).
+                last == null || (last.index >= info.totalItemsCount - 1 &&
+                    isReallyAtBottom(last.offset + last.size, info.viewportEndOffset))
             }
         }
         val lastKey = convo.turns.lastOrNull()?.let { turnKey(it) }
         LaunchedEffect(sessionKey, lastKey, convo.turns.lastOrNull()?.parts?.size) {
             if (convo.turns.isEmpty()) return@LaunchedEffect
+            // Last turn's list index, offset by the "load earlier" header when shown.
+            val target = convo.turns.lastIndex + if (convo.cursor?.hasMore == true) 1 else 0
             if (!didInitialScroll) {
-                // The seeded page must land at its newest turn unconditionally —
+                // The seeded page must land at its newest CONTENT unconditionally —
                 // deciding via atBottom races the first non-empty layout pass.
-                listState.scrollToItem(convo.turns.lastIndex + 1) // +1: load-earlier item may sit at index 0
+                listState.followToBottom(target, animate = false)
                 didInitialScroll = true
             } else if (atBottom) {
-                listState.animateScrollToItem(convo.turns.lastIndex + 1)
+                // Live follow: keep the true end in view only while the user is
+                // actually parked there; once they scroll up, atBottom is false and
+                // we stop pulling them back.
+                listState.followToBottom(target, animate = true)
             }
         }
         val hasEarlier = convo.cursor?.hasMore == true

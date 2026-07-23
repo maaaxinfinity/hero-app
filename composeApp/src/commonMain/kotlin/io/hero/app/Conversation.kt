@@ -352,21 +352,43 @@ private fun ToolCard(part: TurnPart, onOpenChild: ((String) -> Unit)?) {
 }
 
 /** MonoBlock renders code / tool output / unknown-kind content as a scrollable
- *  monospace block. Shared by ToolCard, the PartView fallback, and Markdown code. */
+ *  monospace block. Shared by ToolCard, the PartView fallback, and Markdown code.
+ *  A very long block (e.g. a 64 KiB tool output) is bounded to a head + transcript
+ *  affordance so one giant Text is never measured/laid out; normal-sized content
+ *  keeps the exact original single-Text layout. */
 @Composable
 fun MonoBlock(text: String) {
+    val truncated = text.length > RENDER_CHAR_CAP
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant,
         shape = RoundedCornerShape(6.dp),
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
     ) {
-        Text(
-            text,
-            fontFamily = FontFamily.Monospace,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp),
-        )
+        if (!truncated) {
+            Text(
+                text,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp),
+            )
+        } else {
+            Column {
+                Text(
+                    capForRender(text),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp),
+                )
+                Text(
+                    RENDER_TRUNCATION_NOTICE,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 8.dp).padding(bottom = 8.dp),
+                )
+            }
+        }
     }
 }
 
