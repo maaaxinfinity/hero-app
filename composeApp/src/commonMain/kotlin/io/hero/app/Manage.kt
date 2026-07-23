@@ -66,6 +66,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -74,6 +75,105 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+
+// ============================================================================
+// Management mutation owner — the Remove/Delete pattern (cc6a930: immutable
+// captured target + single-flight busy + stale-completion CAS at the parent)
+// generalized so EVERY management mutation runs under the same contract:
+// Access transfer/share/unshare, user password/admin/create/delete, join,
+// harness save+apply/install, control-plane update/auto-toggle.
+// ============================================================================
+
+/** MutationOwner serializes the mutations of ONE management surface and fences
+ *  their completions:
+ *
+ *   - single-flight: begin() admits one operation at a time — while busy every
+ *     other begin() (a double click, a sibling button on the same surface)
+ *     returns null and must do nothing;
+ *   - captured operation: an admitted Op is the immutable {operation id,
+ *     fingerprint of the logical mutation, owner generation} its completion is
+ *     judged against — never re-read from current state;
+ *   - idempotency key: an explicit retry of the SAME logical mutation (same
+ *     fingerprint, after a failure) REUSES the failed operation's id — sent as
+ *     X-Hero-Op, the key a server-side dedupe converges a response-lost
+ *     resubmission on. A different logical mutation mints a fresh id; a
+ *     success retires the reuse;
+ *   - late-completion CAS: settle() reports whether the op still owns the
+ *     surface. After retarget() (the surface moved to a new target while this
+ *     owner instance survived) a stale completion must not write status, close
+ *     panels, clear inputs, or trigger reloads. Inspectors keyed by entity id
+ *     (key(nodeId)/key(user)) retarget implicitly by RECREATING the owner and
+ *     cancelling its scope.
+ *
+ *  What this owner deliberately does NOT claim: an operation whose response
+ *  was lost may still have been ACCEPTED server-side, and a same-id entity
+ *  recreated after a delete is indistinguishable from the old one client-side.
+ *  Converging those needs the control plane to dedupe on the operation id and
+ *  expose an accepted/committed/unknown query — until then the owner only
+ *  guarantees the client never invents a result. busy is Compose snapshot
+ *  state so buttons gate on it; the rest is plain state, unit-tested without
+ *  a composition. */
+internal class MutationOwner {
+    data class Op(val id: String, val fingerprint: String, val generation: Long)
+
+    var busy by mutableStateOf(false)
+        private set
+    private var generation = 0L
+    private var retryable: Op? = null
+
+    /** begin admits the mutation described by [fingerprint] (target id + the
+     *  payload identity that makes it THIS logical operation), or returns null
+     *  while another operation is in flight. */
+    fun begin(fingerprint: String): Op? {
+        if (busy) return null
+        busy = true
+        val id = retryable?.takeIf { it.fingerprint == fingerprint }?.id ?: newOperationId()
+        return Op(id, fingerprint, generation)
+    }
+
+    /** retarget invalidates every outstanding operation: a completion minted
+     *  before it loses ownership (settle returns false). */
+    fun retarget() {
+        generation += 1
+    }
+
+    /** settle finishes [op] and reports whether it still owns the surface;
+     *  a failed op is recorded for same-fingerprint id reuse, a success
+     *  retires the record. */
+    fun settle(op: Op, failed: Boolean): Boolean {
+        busy = false
+        retryable = when {
+            failed -> op
+            retryable?.id == op.id -> null
+            else -> retryable
+        }
+        return op.generation == generation
+    }
+}
+
+/** launchManaged runs one management mutation under [owner]'s contract: refuse
+ *  while one is in flight; run [action] with the captured Op (pass op.id as
+ *  the Api call's operationId); let cancellation propagate untouched (a keyed
+ *  inspector leaving composition tears the wait down mid-suspend — no state
+ *  writes); and apply [onFailure]/[onSuccess] ONLY while the completion still
+ *  owns the surface. Side effects that must be success-only — clearing the
+ *  input, reloading lists, closing the panel — belong in [onSuccess]; a
+ *  failure keeps the user's input for an explicit retry. */
+internal fun <T> CoroutineScope.launchManaged(
+    owner: MutationOwner,
+    fingerprint: String,
+    action: suspend (MutationOwner.Op) -> T,
+    onFailure: (Throwable) -> Unit = {},
+    onSuccess: (T) -> Unit = {},
+) {
+    val op = owner.begin(fingerprint) ?: return
+    launch {
+        val result = runCatchingCancellable { action(op) }
+        val current = owner.settle(op, failed = result.isFailure)
+        if (!current) return@launch // lost ownership: no writes, no reloads
+        result.onSuccess { onSuccess(it) }.onFailure { onFailure(it) }
+    }
+}
 
 // ============================================================================
 // Nodes — top toolbar (collection actions) + right inspector (selected node).
@@ -376,10 +476,10 @@ private fun NodeInspector(
 ) {
     val scope = rememberCoroutineScope()
     var status by remember(n.node_id) { mutableStateOf<String?>(null) }
-    // Single-flight the destructive Remove: disabled while a delete is in flight
-    // so a rapid re-arm can't launch a second call. Keyed to n.node_id so it
-    // resets when the inspector switches targets.
-    var removing by remember(n.node_id) { mutableStateOf(false) }
+    // This inspector's mutation owner (the generalized Remove pattern):
+    // single-flight busy, captured {op id, target, generation}, and a
+    // late-completion CAS. Keyed to n.node_id so a target switch recreates it.
+    val owner = remember(n.node_id) { MutationOwner() }
     // Harness install state is loaded once here so the section can show each
     // backend's version/status line; the config page re-fetches on entry.
     var harness by remember(n.node_id) { mutableStateOf<HarnessState?>(null) }
@@ -435,18 +535,17 @@ private fun NodeInspector(
                 }
             }
             PanelSection("Danger") {
-                ConfirmButton("Remove node", targetKey = n.node_id, enabled = !removing) {
+                ConfirmButton("Remove node", targetKey = n.node_id, enabled = !owner.busy) {
                     // Capture the target at launch; the parent applies onRemoved
                     // only if this node is still the selected one, so a late
                     // completion can't close/refresh a different node's inspector.
                     val target = n.node_id
-                    removing = true
-                    scope.launch {
-                        runCatchingCancellable { api.removeNode(target) }
-                            .onSuccess { onRemoved(target) }
-                            .onFailure { status = it.message ?: "remove failed" }
-                        removing = false
-                    }
+                    scope.launchManaged(
+                        owner, "remove:$target",
+                        action = { op -> api.removeNode(target, operationId = op.id) },
+                        onFailure = { status = it.message ?: "remove failed" },
+                        onSuccess = { onRemoved(target) },
+                    )
                 }
             }
         }
@@ -533,7 +632,12 @@ private fun HarnessConfigPanel(api: Api, nodeId: String, backend: String, onBack
     }
 }
 
-// AccessEditor: owner display + transfer (setOwner), share add/remove.
+// AccessEditor: owner display + transfer (setOwner), share add/remove. All
+// three mutations run under ONE MutationOwner: mutually single-flighted,
+// success-only input clear + reload (a failure keeps the typed user id and an
+// explicit retry reuses the same operation id), and a stale completion cannot
+// clear/reload the surface. Transfer and unshare failures surface through
+// onError (unshare used to fail silently and reload anyway).
 @Composable
 private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onError: (String) -> Unit) {
     val scope = rememberCoroutineScope()
@@ -541,6 +645,7 @@ private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onErro
     var shareUser by remember(nodeId) { mutableStateOf("") }
     var ownerUser by remember(nodeId) { mutableStateOf("") }
     var reload by remember(nodeId) { mutableStateOf(0) }
+    val owner = remember(nodeId) { MutationOwner() }
     LaunchedEffect(nodeId, reload) {
         runCatchingCancellable { acc = api.nodeAccess(nodeId) }.onFailure { onError(it.message ?: "access load failed") }
     }
@@ -553,12 +658,14 @@ private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onErro
             ownerUser, { ownerUser = it }, Modifier.weight(1f),
             label = { Text("Transfer to user") }, singleLine = true,
         )
-        TextButton(onClick = {
+        TextButton(enabled = !owner.busy, onClick = {
             val u = ownerUser.trim()
-            if (u.isNotEmpty()) scope.launch {
-                runCatchingCancellable { api.setOwner(nodeId, u) }.onFailure { onError(it.message ?: "transfer failed") }
-                ownerUser = ""; reload++; onChanged()
-            }
+            if (u.isNotEmpty()) scope.launchManaged(
+                owner, "owner:$nodeId:$u",
+                action = { op -> api.setOwner(nodeId, u, operationId = op.id) },
+                onFailure = { onError(it.message ?: "transfer failed") },
+                onSuccess = { ownerUser = ""; reload++; onChanged() },
+            )
         }) { Text("Set") }
     }
     Spacer(Modifier.height(8.dp))
@@ -567,8 +674,13 @@ private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onErro
     a.shared_with.forEach { u ->
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(u, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = {
-                scope.launch { runCatchingCancellable { api.removeShare(nodeId, u) }; reload++; onChanged() }
+            TextButton(enabled = !owner.busy, onClick = {
+                scope.launchManaged(
+                    owner, "unshare:$nodeId:$u",
+                    action = { op -> api.removeShare(nodeId, u, operationId = op.id) },
+                    onFailure = { onError(it.message ?: "unshare failed") },
+                    onSuccess = { reload++; onChanged() },
+                )
             }) { Text("remove") }
         }
     }
@@ -577,12 +689,14 @@ private fun AccessEditor(api: Api, nodeId: String, onChanged: () -> Unit, onErro
             shareUser, { shareUser = it }, Modifier.weight(1f),
             label = { Text("User id") }, singleLine = true,
         )
-        TextButton(onClick = {
+        TextButton(enabled = !owner.busy, onClick = {
             val u = shareUser.trim()
-            if (u.isNotEmpty()) scope.launch {
-                runCatchingCancellable { api.addShare(nodeId, u) }.onFailure { onError(it.message ?: "share failed") }
-                shareUser = ""; reload++; onChanged()
-            }
+            if (u.isNotEmpty()) scope.launchManaged(
+                owner, "share:$nodeId:$u",
+                action = { op -> api.addShare(nodeId, u, operationId = op.id) },
+                onFailure = { onError(it.message ?: "share failed") },
+                onSuccess = { shareUser = ""; reload++; onChanged() },
+            )
         }) { Text("Share") }
     }
 }
@@ -596,6 +710,9 @@ private fun JoinPanel(api: Api) {
     var nodeId by remember { mutableStateOf("") }
     var result by remember { mutableStateOf<JoinResult?>(null) }
     var status by remember { mutableStateOf<String?>(null) }
+    // Single-flight the mint: each successful Generate is a real one-time
+    // token server-side, so a double click must not mint two.
+    val owner = remember { MutationOwner() }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -608,12 +725,14 @@ private fun JoinPanel(api: Api) {
             nodeId, { nodeId = it }, Modifier.fillMaxWidth(),
             label = { Text("Node id (optional)") }, singleLine = true,
         )
-        OutlinedButton(onClick = {
-            scope.launch {
-                status = null
-                runCatchingCancellable { api.mintJoin(JoinReq(node_id = nodeId.trim())) }
-                    .onSuccess { result = it }.onFailure { status = it.message }
-            }
+        OutlinedButton(enabled = !owner.busy, onClick = {
+            val id = nodeId.trim()
+            scope.launchManaged(
+                owner, "join:$id",
+                action = { op -> api.mintJoin(JoinReq(node_id = id), operationId = op.id) },
+                onFailure = { status = it.message ?: "mint failed" },
+                onSuccess = { result = it; status = null },
+            )
         }) { Text("Generate") }
         status?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         result?.let { r ->
@@ -657,6 +776,11 @@ private fun HarnessBackendCard(
     var effort by remember(b.backend) { mutableStateOf(existing?.defaultEffort ?: "") }
     var autoUpd by remember(b.backend) { mutableStateOf(existing?.autoUpdate ?: false) }
     var modelMenu by remember { mutableStateOf(false) }
+    // Owner per {node, backend} card: Save+apply and Install are mutually
+    // single-flighted (each apply/install is real work on the node), and a
+    // backend switch recreates the owner so an old card's completion can't
+    // gate or write into the new one.
+    val owner = remember(nodeId, b.backend) { MutationOwner() }
 
     OutlinedCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp)) {
@@ -715,26 +839,37 @@ private fun HarnessBackendCard(
             }
             Spacer(Modifier.height(8.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(enabled = !pullManaged, onClick = {
-                    scope.launch {
-                        // Rebuild the whole harness.json with this backend's slice merged in.
-                        val next = buildMergedConfig(api, nodeId, b.backend, model, if (cat.supports_effort) effort else "", autoUpd)
-                        runCatchingCancellable {
-                            api.setHarnessConfig(nodeId, next)
+                OutlinedButton(enabled = !pullManaged && !owner.busy, onClick = {
+                    // Capture the edited slice at launch; one operation id spans
+                    // the save and the apply that commits it.
+                    val cfgModel = model
+                    val cfgEffort = if (cat.supports_effort) effort else ""
+                    val cfgAuto = autoUpd
+                    scope.launchManaged(
+                        owner, "apply:$nodeId:${b.backend}:$cfgModel:$cfgEffort:$cfgAuto",
+                        action = { op ->
+                            // Rebuild the whole harness.json with this backend's slice merged in.
+                            val next = buildMergedConfig(api, nodeId, b.backend, cfgModel, cfgEffort, cfgAuto)
+                            api.setHarnessConfig(nodeId, next, operationId = op.id)
                             // The cached snapshot is now stale — drop it so the
                             // composer/new-session pickers re-read the node.
                             FleetCache.invalidateHarness(nodeId)
-                            onResult(api.harnessApply(nodeId, b.backend))
-                        }.onFailure { onResult(it.message ?: "error") }
-                    }
+                            api.harnessApply(nodeId, b.backend, operationId = op.id)
+                        },
+                        onFailure = { onResult(it.message ?: "error") },
+                        onSuccess = { onResult(it) },
+                    )
                 }) { Text("Save + apply") }
-                OutlinedButton(onClick = {
-                    scope.launch {
-                        runCatchingCancellable {
+                OutlinedButton(enabled = !owner.busy, onClick = {
+                    scope.launchManaged(
+                        owner, "install:$nodeId:${b.backend}",
+                        action = { op ->
                             FleetCache.invalidateHarness(nodeId)
-                            onResult(api.harnessInstall(nodeId, b.backend))
-                        }.onFailure { onResult(it.message ?: "error") }
-                    }
+                            api.harnessInstall(nodeId, b.backend, operationId = op.id)
+                        },
+                        onFailure = { onResult(it.message ?: "error") },
+                        onSuccess = { onResult(it) },
+                    )
                 }) { Text(if (b.version_status == "missing") "Install" else "Reinstall") }
             }
         }
@@ -897,8 +1032,10 @@ private fun UserInspector(
     val scope = rememberCoroutineScope()
     var status by remember(u.user) { mutableStateOf<String?>(null) }
     var pass by remember(u.user) { mutableStateOf("") }
-    // Single-flight the destructive Delete (see NodeInspector.removing).
-    var deleting by remember(u.user) { mutableStateOf(false) }
+    // This inspector's mutation owner: set-password/set-admin/delete are
+    // mutually single-flighted under the same captured-target + CAS contract
+    // as Remove/Delete. Keyed to u.user so a target switch recreates it.
+    val owner = remember(u.user) { MutationOwner() }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -935,35 +1072,45 @@ private fun UserInspector(
             PasswordField(pass, { pass = it }, label = "New password (≥ 8)", modifier = Modifier.fillMaxWidth())
             Spacer(Modifier.height(6.dp))
             OutlinedButton(
-                enabled = pass.length >= 8,
+                enabled = pass.length >= 8 && !owner.busy,
                 onClick = {
-                    scope.launch {
-                        runCatchingCancellable { api.setPassword(u.user, pass) }
-                            .onSuccess { pass = ""; status = null }
-                            .onFailure { status = it.message ?: "password change failed" }
-                    }
+                    // Capture target + payload at launch; the fingerprint hashes
+                    // the secret (never stores it) so a retry of the SAME new
+                    // password reuses the op id while an edited one is a new op.
+                    val target = u.user
+                    val secret = pass
+                    scope.launchManaged(
+                        owner, "password:$target:${secret.hashCode()}",
+                        action = { op -> api.setPassword(target, secret, operationId = op.id) },
+                        onFailure = { status = it.message ?: "password change failed" },
+                        onSuccess = { pass = ""; status = null },
+                    )
                 },
             ) { Text("Set password") }
             Spacer(Modifier.height(6.dp))
-            OutlinedButton(onClick = {
-                scope.launch {
-                    runCatchingCancellable { api.setAdmin(u.user, !u.admin) }
-                        .onFailure { status = it.message ?: "admin change failed" }
-                    onChanged()
-                }
+            OutlinedButton(enabled = !owner.busy, onClick = {
+                val target = u.user
+                val want = !u.admin
+                scope.launchManaged(
+                    owner, "admin:$target:$want",
+                    action = { op -> api.setAdmin(target, want, operationId = op.id) },
+                    onFailure = { status = it.message ?: "admin change failed" },
+                    // Success-only: a failed toggle used to trigger the global
+                    // reload anyway, masking that nothing changed.
+                    onSuccess = { onChanged() },
+                )
             }) { Text(if (u.admin) "Revoke admin" else "Make admin") }
         }
         if (u.user != me.user) {
             PanelSection("Danger") {
-                ConfirmButton("Delete user", targetKey = u.user, enabled = !deleting) {
+                ConfirmButton("Delete user", targetKey = u.user, enabled = !owner.busy) {
                     val target = u.user
-                    deleting = true
-                    scope.launch {
-                        runCatchingCancellable { api.deleteUser(target) }
-                            .onSuccess { onDeleted(target) }
-                            .onFailure { status = it.message ?: "delete failed" }
-                        deleting = false
-                    }
+                    scope.launchManaged(
+                        owner, "delete:$target",
+                        action = { op -> api.deleteUser(target, operationId = op.id) },
+                        onFailure = { status = it.message ?: "delete failed" },
+                        onSuccess = { onDeleted(target) },
+                    )
                 }
             }
         }
@@ -981,6 +1128,9 @@ private fun CreateUserPanel(api: Api, onDone: () -> Unit) {
     var pass by remember { mutableStateOf("") }
     var admin by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
+    // Single-flight the create; a double click must not POST two users, and a
+    // failed create keeps the form (retry reuses the same operation id).
+    val owner = remember { MutationOwner() }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -993,12 +1143,17 @@ private fun CreateUserPanel(api: Api, onDone: () -> Unit) {
         }
         status?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         OutlinedButton(
-            enabled = user.isNotBlank() && pass.length >= 8,
+            enabled = user.isNotBlank() && pass.length >= 8 && !owner.busy,
             onClick = {
-                scope.launch {
-                    runCatchingCancellable { api.createUser(CreateUserReq(user.trim(), pass, admin)) }
-                        .onSuccess { onDone() }.onFailure { status = it.message }
-                }
+                val id = user.trim()
+                val secret = pass
+                val isAdmin = admin
+                scope.launchManaged(
+                    owner, "create:$id:${secret.hashCode()}:$isAdmin",
+                    action = { op -> api.createUser(CreateUserReq(id, secret, isAdmin), operationId = op.id) },
+                    onFailure = { status = it.message ?: "create failed" },
+                    onSuccess = { onDone() },
+                )
             },
         ) { Text("Create") }
     }
@@ -1146,7 +1301,10 @@ internal fun ControlScreen(api: Api) {
     var loading by remember { mutableStateOf(true) }
     var reload by remember { mutableStateOf(0) }
     var status by remember { mutableStateOf<String?>(null) }
-    var busy by remember { mutableStateOf(false) }
+    // One owner for the control-plane surface: Update and the auto-update
+    // toggle are single-flighted together (each is a real control-plane
+    // mutation), refetching only after a SUCCESSFUL mutation.
+    val owner = remember { MutationOwner() }
 
     LaunchedEffect(reload) {
         loading = true
@@ -1187,25 +1345,30 @@ internal fun ControlScreen(api: Api) {
                         )
                         Spacer(Modifier.height(12.dp))
                         OutlinedButton(
-                            enabled = f.defined && !upToDate && !busy,
+                            enabled = f.defined && !upToDate && !owner.busy,
                             onClick = {
-                                scope.launch {
-                                    busy = true
-                                    runCatchingCancellable { api.controlSelfUpdate() }.onSuccess { status = it }.onFailure { status = it.message }
-                                    busy = false
-                                    reload++ // it drains + restarts; refetch shows the new running version
-                                }
+                                scope.launchManaged(
+                                    owner, "self-update:${f.version}",
+                                    action = { op -> api.controlSelfUpdate(operationId = op.id) },
+                                    onFailure = { status = it.message ?: "update failed" },
+                                    // it drains + restarts; the success-only
+                                    // refetch shows the new running version.
+                                    onSuccess = { status = it; reload++ },
+                                )
                             },
-                        ) { Text(if (busy) "Updating…" else "Update control plane") }
+                        ) { Text(if (owner.busy) "Updating…" else "Update control plane") }
                         Spacer(Modifier.height(12.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Checkbox(
                                 checked = f.auto_update,
-                                enabled = f.defined,
+                                enabled = f.defined && !owner.busy,
                                 onCheckedChange = { want ->
-                                    scope.launch {
-                                        runCatchingCancellable { api.setFleetHeroAuto(want) }.onSuccess { reload++ }.onFailure { status = it.message }
-                                    }
+                                    scope.launchManaged(
+                                        owner, "auto-update:$want",
+                                        action = { op -> api.setFleetHeroAuto(want, operationId = op.id) },
+                                        onFailure = { status = it.message ?: "auto-update change failed" },
+                                        onSuccess = { reload++ },
+                                    )
                                 },
                             )
                             Text("Auto-update the control plane when a new version is published", style = MaterialTheme.typography.bodyMedium)
