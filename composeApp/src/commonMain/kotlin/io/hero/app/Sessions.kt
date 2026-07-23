@@ -155,6 +155,49 @@ internal fun anchorAfterPrepend(
     return (turnIdx + if (hasHeaderAfter) 1 else 0) to offset
 }
 
+// Bounds for DraftStore: how many conversations keep a parked draft and how
+// large one parked draft may be. The store is a navigation convenience (bring
+// back what you were typing), not a document store — a pathological draft is
+// dropped rather than retained forever, and old conversations' drafts are
+// evicted put-recency-first.
+internal const val MAX_DRAFT_ENTRIES = 32
+internal const val MAX_DRAFT_CHARS = 16 * 1024
+
+/** DraftStore owns the composer draft PER {node, session}. The composer used to
+ *  share one identity-less string across every conversation: text typed for A
+ *  appeared verbatim in B's composer after a switch and could be sent to B.
+ *  Now a switch parks A's draft under A's identity and restores B's own (or
+ *  empty). Bounded (MAX_DRAFT_ENTRIES / MAX_DRAFT_CHARS); pure; unit-tested. */
+internal class DraftStore {
+    private val drafts = LinkedHashMap<String, String>()
+
+    // A NUL separator cannot appear in a node/session id, so the pair key is
+    // unambiguous ("a"+"b c" never collides with "a b"+"c").
+    private fun key(node: String, session: String) = node + "\u0000" + session
+
+    fun get(node: String?, session: String?): String {
+        if (node == null || session == null) return ""
+        return drafts[key(node, session)].orEmpty()
+    }
+
+    fun put(node: String?, session: String?, text: String) {
+        if (node == null || session == null) return
+        val k = key(node, session)
+        drafts.remove(k) // re-insert so put order approximates recency
+        if (text.isEmpty() || text.length > MAX_DRAFT_CHARS) return
+        drafts[k] = text
+        while (drafts.size > MAX_DRAFT_ENTRIES) drafts.remove(drafts.keys.first())
+    }
+
+    fun clear(node: String?, session: String?) {
+        if (node == null || session == null) return
+        drafts.remove(key(node, session))
+    }
+
+    /** size is exposed for the bound regressions only. */
+    val size: Int get() = drafts.size
+}
+
 /** EarlierPage reports one applied "Load earlier" fetch back to the pane: how
  *  many turns landed and the merged window (whose stable UI ids the pane
  *  flattens into row keys to re-anchor scroll, and whose cursor says whether
@@ -204,7 +247,13 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     var sessions by remember { mutableStateOf<List<Session>>(emptyList()) }
     var convo by remember { mutableStateOf(ConvoState()) }
     var pend by remember { mutableStateOf<List<Pending>>(emptyList()) }
-    var input by remember { mutableStateOf("") }
+    // The composer draft is OWNED per {node, root session} (the composer always
+    // sends to the ROOT session; drill-ins are read-only): switching
+    // conversations parks this one's text in the bounded DraftStore and
+    // restores the target's own draft — text typed for A can no longer appear
+    // in (or be sent to) B. Keyed remember drops the state on switch.
+    val drafts = remember { DraftStore() }
+    var input by remember(sel.node, sel.session) { mutableStateOf(drafts.get(sel.node, sel.session)) }
     var sessionsLoading by remember { mutableStateOf(false) }
     var nodesError by remember { mutableStateOf<String?>(null) }
     var sessionsError by remember { mutableStateOf<String?>(null) }
@@ -412,7 +461,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                         }
                     }
             },
-            input = input, onInput = { input = it },
+            input = input, onInput = { input = it; drafts.put(sel.node, sel.session, it) },
             switchModels = catModels, effortLevels = catEffortLevels,
             model = switchModel, onModel = { switchModel = it },
             effort = switchEffort, onEffort = { switchEffort = it },
@@ -420,6 +469,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                 val n = sel.node; val s = sel.session; val t = input.trim()
                 if (n != null && s != null && t.isNotEmpty()) {
                     input = ""
+                    drafts.clear(n, s)
                     convo = convo.optimisticUser(t)
                     val m = switchModel; val e = if (catEffortLevels.isNotEmpty()) switchEffort else ""
                     scope.launch {

@@ -1251,10 +1251,28 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
     var cwdMenu by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
     var defaultsByBackend by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
-    LaunchedEffect(node) {
+    // Start waits for the catalog: submitting before it loads (or after it
+    // failed) used to fall back to an EMPTY backend — a create the user never
+    // chose. catalogLoaded gates the button; a failed load shows a retry.
+    var catalogLoaded by remember { mutableStateOf(false) }
+    var catalogError by remember { mutableStateOf<String?>(null) }
+    var catalogReload by remember { mutableStateOf(0) }
+    // busy single-flights the create: one operation, one backend session per
+    // dialog confirm — a double/triple click can no longer start several
+    // parallel POSTs whose extra accepted creates the user never navigates to.
+    var busy by remember { mutableStateOf(false) }
+    // The client operation id for THE current logical create: stable across an
+    // explicit retry after a failure (the idempotency key a server-side dedupe
+    // converges on), replaced only once a create succeeds.
+    var opId by remember { mutableStateOf(newOperationId()) }
+    LaunchedEffect(node, catalogReload) {
+        catalogLoaded = false
+        catalogError = null
         val gen = FleetCache.generation
         val hs = FleetCache.harnessOf(node)
-            ?: runCatchingCancellable { api.harness(node) }.getOrNull()?.also { FleetCache.putHarness(node, gen, it) }
+            ?: runCatchingCancellable { api.harness(node) }
+                .onFailure { catalogError = it.message ?: "couldn't load the harness catalog" }
+                .getOrNull()?.also { FleetCache.putHarness(node, gen, it) }
         // Only enabled harnesses are offerable — a disabled backend in the DTO is
         // management surface (install/enable it in Nodes), not a launch target.
         val bs = hs?.backends.orEmpty().filter { it.enabled }
@@ -1262,6 +1280,7 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
         modelsByBackend = bs.associate { it.backend to it.catalog.models.filter { m -> !m.hidden } }
         defaultsByBackend = bs.associate { it.backend to it.catalog.default }
         if (backend.isEmpty() || backend !in backends) backend = backends.firstOrNull().orEmpty()
+        catalogLoaded = hs != null
         // Recent working directories from this node's existing sessions — a derived
         // pick-list, not a filesystem browse (HERO never browses the machine). Free
         // text still works for a brand-new path. A cold fetch is written back to
@@ -1340,21 +1359,50 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
                 // A session IS its first turn — the node needs both a cwd and a
                 // first message to spawn the CLI, so both are required (not optional).
                 OutlinedTextField(msg, { msg = it }, Modifier.fillMaxWidth(), label = { Text("First message") })
+                catalogError?.let { err ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            err, color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { catalogReload++ }) { Text("Retry") }
+                    }
+                }
+                if (catalogLoaded && backends.isEmpty()) {
+                    Text(
+                        "No enabled harness on this node — install/enable one in Nodes first.",
+                        color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 status?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
         },
         confirmButton = {
             TextButton(
-                enabled = cwd.isNotBlank() && msg.isNotBlank(),
+                // Gated on the loaded catalog AND a real backend choice AND no
+                // create already in flight — never an empty-backend fallback,
+                // never a second parallel create.
+                enabled = catalogLoaded && backend.isNotEmpty() && cwd.isNotBlank() && msg.isNotBlank() && !busy,
                 onClick = {
+                    busy = true
+                    status = null
+                    val op = opId
                     scope.launch {
-                        status = null
-                        runCatchingCancellable { api.startSession(node, StartSessionReq(cwd.trim(), msg, model, backend)) }
-                            .onSuccess { if (it.isNotEmpty()) onStarted(it) else status = "create failed" }
-                            .onFailure { status = it.message }
+                        // Navigate ONLY on this operation's own non-empty id: a
+                        // success mints a fresh op id for the next logical
+                        // create, a failure keeps this one so an explicit retry
+                        // re-submits the SAME operation (dedupe key), and a
+                        // dialog dismiss cancels the wait without inventing a
+                        // result for an operation the server may have accepted.
+                        runCatchingCancellable { api.startSession(node, StartSessionReq(cwd.trim(), msg, model, backend), operationId = op) }
+                            .onSuccess { id ->
+                                busy = false
+                                if (id.isNotEmpty()) { opId = newOperationId(); onStarted(id) } else status = "create failed"
+                            }
+                            .onFailure { busy = false; status = it.message }
                     }
                 },
-            ) { Text("Start") }
+            ) { Text(if (busy) "Starting…" else "Start") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )

@@ -12,13 +12,21 @@ import org.unifiedpush.android.connector.data.PushMessage
 // so message.content is the same JSON the browser service worker receives.
 class HeroPushService : PushService() {
     override fun onNewEndpoint(endpoint: PushEndpoint, instance: String) {
+        // One-shot client owner: this background callback lives outside the app
+        // session's Api owner, so it must close its temporary client itself —
+        // in finally, on success and on failure alike (it used to never close,
+        // leaking one OkHttp pool per endpoint rotation).
         val api = apiFromSettings() ?: return
-        val keys = endpoint.pubKeySet
-        val sub = PushSub(
-            endpoint = endpoint.url,
-            keys = PushKeys(p256dh = keys?.pubKey.orEmpty(), auth = keys?.auth.orEmpty()),
-        )
-        runCatching { runBlocking { api.subscribePush(sub) } }
+        try {
+            val keys = endpoint.pubKeySet
+            val sub = PushSub(
+                endpoint = endpoint.url,
+                keys = PushKeys(p256dh = keys?.pubKey.orEmpty(), auth = keys?.auth.orEmpty()),
+            )
+            runCatching { runBlocking { api.subscribePush(sub) } }
+        } finally {
+            api.close()
+        }
     }
 
     override fun onMessage(message: PushMessage, instance: String) {

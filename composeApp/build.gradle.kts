@@ -60,6 +60,12 @@ kotlin {
         val commonTest by getting {
             dependencies {
                 implementation(kotlin("test"))
+                // The Api read/mutation contract regressions run against a
+                // CONTROLLED HTTP engine (status-first decoding, bounded error
+                // bodies, explicit read retry, operation ids, real suspended
+                // cancellation) instead of only pure-helper calls.
+                implementation(libs.ktor.client.mock)
+                implementation(libs.kotlinx.coroutines.test)
             }
         }
         val androidMain by getting {

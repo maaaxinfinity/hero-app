@@ -11,8 +11,14 @@ import kotlinx.coroutines.runBlocking
 // time; otherwise the app uses UnifiedPush and this service is never invoked.
 class HeroFirebaseService : FirebaseMessagingService() {
     override fun onNewToken(token: String) {
+        // One-shot client owner (see HeroPushService.onNewEndpoint): close the
+        // temporary client in finally on every path.
         val api = apiFromSettings() ?: return
-        runCatching { runBlocking { api.subscribePush(PushSub(fcm_token = token)) } }
+        try {
+            runCatching { runBlocking { api.subscribePush(PushSub(fcm_token = token)) } }
+        } finally {
+            api.close()
+        }
     }
 
     override fun onMessageReceived(message: RemoteMessage) {

@@ -1,14 +1,18 @@
 package io.hero.app
 
+import io.ktor.client.HttpClient
+import io.ktor.client.HttpClientConfig
 import io.ktor.client.call.body
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.HttpTimeoutConfig
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.defaultRequest
 import io.ktor.client.plugins.timeout
+import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.forms.submitForm
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.prepareGet
@@ -16,21 +20,25 @@ import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsChannel
-import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.contentType
 import io.ktor.http.encodeURLPathPart
 import io.ktor.http.isSuccess
 import io.ktor.http.parameters
+import io.ktor.serialization.ContentConvertException
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.random.Random
+import kotlin.time.TimeSource
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -39,14 +47,20 @@ import kotlinx.serialization.json.JsonObject
 // managed explicitly (not via the HttpCookies plugin) so it can be persisted for
 // "remember me" and restored on the next launch. Pass initialCookie to resume a
 // saved session. followRedirects is off so login can read Set-Cookie off the 303.
-class Api(private val baseUrl: String, initialCookie: String? = null) {
+// clientBuilder exists so the contract tests can run every call against a
+// controlled engine (MockEngine); production always uses heroHttpClient.
+class Api(
+    private val baseUrl: String,
+    initialCookie: String? = null,
+    clientBuilder: (HttpClientConfig<*>.() -> Unit) -> HttpClient = ::heroHttpClient,
+) {
     private val json = Json { ignoreUnknownKeys = true }
 
     /** The current hero_cp_session cookie value; null until login succeeds. */
     var sessionCookie: String? = initialCookie
         private set
 
-    private val client = heroHttpClient {
+    private val client = clientBuilder {
         install(ContentNegotiation) { json(json) }
         // Bounds unary calls (the engine's socket read timeout is 0 so SSE can
         // idle); sseFrames raises its own request timeout to infinite.
@@ -59,13 +73,45 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
 
     // orThrow surfaces non-2xx responses on calls whose body is otherwise
     // ignored or decodes error JSON into an all-defaults DTO (which would read
-    // as success — dialogs closing, lists refreshing, nothing changed).
-    private suspend fun HttpResponse.orThrow(): HttpResponse {
+    // as success — dialogs closing, lists refreshing, nothing changed, or a
+    // GET like harness()/fleetHero() presenting an error object as authoritative
+    // empty truth). The status is checked FIRST; the error body is read through
+    // a hard pre-decode byte ceiling (bodyAsText() had none — an arbitrarily
+    // large error body was fully materialized before the display take());
+    // the result is a typed ApiHttpException carrying {status, operation,
+    // operation id} so callers and logs can correlate a failure with the
+    // mutation that caused it.
+    private suspend fun HttpResponse.orThrow(operation: String, operationId: String? = null): HttpResponse {
         if (!status.isSuccess()) {
-            val msg = runCatchingCancellable { bodyAsText() }.getOrNull()?.trim()?.take(300)?.ifBlank { null }
-            throw IllegalStateException(msg ?: "HTTP ${status.value}")
+            val detail = runCatchingCancellable { boundedBodyText(bodyAsChannel(), MAX_ERROR_BODY_BYTES) }.getOrNull()
+            throw ApiHttpException(status.value, operation, operationId, detail)
         }
         return this
+    }
+
+    // read wraps one GET in the explicit read-retry contract: mutations are
+    // NEVER replayed by the app or the transport (retryOnConnectionFailure is
+    // off), while reads — which are safe to re-issue — get a small number of
+    // attempts with jittered, budgeted delays for TRANSIENT failures only
+    // (connection resets, 5xx/408/429). Deterministic client errors, decode
+    // failures, and cancellation re-throw immediately. This replaces "the
+    // caller may re-issue reads" folklore with one bounded policy.
+    private suspend fun <T> read(operation: String, block: suspend () -> T): T {
+        val start = TimeSource.Monotonic.markNow()
+        var attempt = 0
+        while (true) {
+            try {
+                return block()
+            } catch (c: CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                if (!isTransientReadError(t)) throw t
+                val pause = readRetryDelayMs(READ_RETRY, attempt, start.elapsedNow().inWholeMilliseconds)
+                    ?: throw t
+                delay(pause)
+                attempt += 1
+            }
+        }
     }
 
     /** close releases the underlying HttpClient: its connection pool, the OkHttp
@@ -104,60 +150,80 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
         return sessionCookie!!.isNotEmpty()
     }
 
-    suspend fun nodes(): List<NodeView> =
-        client.get("$baseUrl/api/nodes").body()
-
-    suspend fun sessions(node: String): List<Session> =
-        client.get("$baseUrl/api/nodes/${node.enc()}/sessions").body()
-
-    suspend fun send(node: String, id: String, text: String, model: String = "", effort: String = "") {
-        client.post("$baseUrl/api/nodes/${node.enc()}/sessions/${id.enc()}/send") {
-            contentType(ContentType.Application.Json)
-            setBody(SendReq(text, model, effort))
-        }.orThrow()
+    suspend fun nodes(): List<NodeView> = read("nodes") {
+        client.get("$baseUrl/api/nodes").orThrow("nodes").body()
     }
 
-    suspend fun me(): Me {
+    suspend fun sessions(node: String): List<Session> = read("sessions") {
+        client.get("$baseUrl/api/nodes/${node.enc()}/sessions").orThrow("sessions").body()
+    }
+
+    suspend fun send(
+        node: String, id: String, text: String,
+        model: String = "", effort: String = "",
+        operationId: String = newOperationId(),
+    ) {
+        client.post("$baseUrl/api/nodes/${node.enc()}/sessions/${id.enc()}/send") {
+            operation(operationId)
+            contentType(ContentType.Application.Json)
+            setBody(SendReq(text, model, effort))
+        }.orThrow("send", operationId)
+    }
+
+    /** me is the authoritative identity read. It THROWS on any non-200 or a
+     *  malformed body: both login paths must treat "couldn't confirm who I am"
+     *  as a failed bootstrap, never substitute a locally guessed Me. */
+    suspend fun me(): Me = read("me") {
         val r = client.get("$baseUrl/api/me")
-        if (r.status.value != 200) throw IllegalStateException("not authenticated (${r.status.value})")
-        return r.body()
+        if (r.status.value != 200) {
+            val detail = if (r.status.value == 401 || r.status.value == 403) "not authenticated (${r.status.value})"
+            else runCatchingCancellable { boundedBodyText(r.bodyAsChannel(), MAX_ERROR_BODY_BYTES) }.getOrNull()
+            throw ApiHttpException(r.status.value, "me", null, detail)
+        }
+        r.body()
     }
 
     // ---- sessions ----
-    suspend fun startSession(node: String, req: StartSessionReq): String {
+    suspend fun startSession(node: String, req: StartSessionReq, operationId: String = newOperationId()): String {
         val resp = client.post("$baseUrl/api/nodes/${node.enc()}/sessions") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(req)
         }
         // Surface the node's validation error (e.g. "cwd is required",
         // "initial_message: text is required") instead of silently returning "".
+        // The error body is byte-bounded BEFORE decode and display-capped after:
+        // an arbitrarily large error body must become neither a heap spike nor
+        // a megabyte exception message in the dialog.
         if (!resp.status.isSuccess()) {
-            val msg = runCatchingCancellable { resp.bodyAsText() }.getOrNull()?.trim()?.ifBlank { null }
-            throw IllegalStateException(msg ?: "create failed (${resp.status.value})")
+            val detail = runCatchingCancellable { boundedBodyText(resp.bodyAsChannel(), MAX_ERROR_BODY_BYTES) }.getOrNull()
+            throw ApiHttpException(resp.status.value, "create session", operationId, detail)
         }
         return runCatchingCancellable { resp.body<Map<String, String>>()["id"] ?: "" }.getOrDefault("")
     }
 
-    suspend fun pending(node: String): List<Pending> =
-        client.get("$baseUrl/api/nodes/${node.enc()}/pending").body()
+    suspend fun pending(node: String): List<Pending> = read("pending") {
+        client.get("$baseUrl/api/nodes/${node.enc()}/pending").orThrow("pending").body()
+    }
 
     /** attention is the cross-fleet inbox: one aggregate of everything wanting the
      *  user's attention across every accessible connected node (permission/question
      *  + recent finished/errored), each item stamped with its node. */
-    suspend fun attention(): List<AttentionItem> =
-        client.get("$baseUrl/api/attention").body()
+    suspend fun attention(): List<AttentionItem> = read("attention") {
+        client.get("$baseUrl/api/attention").orThrow("attention").body()
+    }
 
     // ---- conversation: structured window (history + grouped live tail) ----
 
     /** transcript fetches one grouped display page. offset=null → newest page; the
      *  X-Transcript-* headers carry the cursor for prepending older pages. */
-    suspend fun transcript(node: String, id: String, limit: Int, offset: Int? = null): TranscriptPage {
+    suspend fun transcript(node: String, id: String, limit: Int, offset: Int? = null): TranscriptPage = read("transcript") {
         val resp = client.get("$baseUrl/api/nodes/${node.enc()}/sessions/${id.enc()}/transcript") {
             parameter("limit", limit)
             if (offset != null) parameter("offset", offset)
-        }
+        }.orThrow("transcript")
         val turns: List<Turn> = resp.body()
         val h = resp.headers
-        return TranscriptPage(
+        TranscriptPage(
             turns = turns,
             total = h["X-Transcript-Total"]?.toIntOrNull() ?: turns.size,
             start = h["X-Transcript-Start"]?.toIntOrNull() ?: 0,
@@ -175,120 +241,152 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
             .filter { it.session_id.isEmpty() || it.session_id == session }
             .mapNotNull { decodeLiveFrame(it, json) }
 
-    suspend fun respond(node: String, id: String, behavior: String) =
-        respond(node, id, RespondReq(behavior))
+    suspend fun respond(node: String, id: String, behavior: String, operationId: String = newOperationId()) =
+        respond(node, id, RespondReq(behavior), operationId)
 
     /** respond resolves a pending interaction with a full request (scope for
      *  "allow always", answers for AskUserQuestion). */
-    suspend fun respond(node: String, id: String, req: RespondReq) {
+    suspend fun respond(node: String, id: String, req: RespondReq, operationId: String = newOperationId()) {
         client.post("$baseUrl/api/nodes/${node.enc()}/pending/${id.enc()}/respond") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(req)
-        }.orThrow()
+        }.orThrow("respond", operationId)
     }
 
     // ---- node management ----
-    suspend fun nodeAccess(node: String): NodeAccess =
-        client.get("$baseUrl/api/nodes/${node.enc()}/access").body()
+    suspend fun nodeAccess(node: String): NodeAccess = read("access") {
+        client.get("$baseUrl/api/nodes/${node.enc()}/access").orThrow("access").body()
+    }
 
-    suspend fun addShare(node: String, user: String) {
+    suspend fun addShare(node: String, user: String, operationId: String = newOperationId()) {
         client.post("$baseUrl/api/nodes/${node.enc()}/shares") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(ShareReq(user))
-        }.orThrow()
+        }.orThrow("share", operationId)
     }
 
-    suspend fun removeShare(node: String, user: String) {
-        client.delete("$baseUrl/api/nodes/${node.enc()}/shares/${user.enc()}").orThrow()
+    suspend fun removeShare(node: String, user: String, operationId: String = newOperationId()) {
+        client.delete("$baseUrl/api/nodes/${node.enc()}/shares/${user.enc()}") {
+            operation(operationId)
+        }.orThrow("remove share", operationId)
     }
 
-    suspend fun setOwner(node: String, user: String) {
+    suspend fun setOwner(node: String, user: String, operationId: String = newOperationId()) {
         client.put("$baseUrl/api/nodes/${node.enc()}/owner") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(ShareReq(user))
-        }.orThrow()
+        }.orThrow("transfer owner", operationId)
     }
 
-    suspend fun removeNode(node: String) {
-        client.delete("$baseUrl/api/nodes/${node.enc()}").orThrow()
+    suspend fun removeNode(node: String, operationId: String = newOperationId()) {
+        client.delete("$baseUrl/api/nodes/${node.enc()}") { operation(operationId) }
+            .orThrow("remove node", operationId)
     }
 
-    suspend fun mintJoin(req: JoinReq): JoinResult =
-        client.post("$baseUrl/api/join") { contentType(ContentType.Application.Json); setBody(req) }.orThrow().body()
+    suspend fun mintJoin(req: JoinReq, operationId: String = newOperationId()): JoinResult =
+        client.post("$baseUrl/api/join") {
+            operation(operationId)
+            contentType(ContentType.Application.Json); setBody(req)
+        }.orThrow("mint join", operationId).body()
 
     // ---- harness management ----
-    suspend fun harness(node: String): HarnessState =
-        client.get("$baseUrl/api/nodes/${node.enc()}/harness").body()
-
-    suspend fun setHarnessConfig(node: String, config: JsonElement) {
-        client.put("$baseUrl/api/nodes/${node.enc()}/harness/config") {
-            contentType(ContentType.Application.Json); setBody(config)
-        }.orThrow()
+    suspend fun harness(node: String): HarnessState = read("harness") {
+        client.get("$baseUrl/api/nodes/${node.enc()}/harness").orThrow("harness").body()
     }
 
-    suspend fun harnessApply(node: String, backend: String): String =
-        client.post("$baseUrl/api/nodes/${node.enc()}/harness/apply") {
-            contentType(ContentType.Application.Json); setBody(BackendReq(backend))
-        }.orThrow().body<MessageResult>().message
+    suspend fun setHarnessConfig(node: String, config: JsonElement, operationId: String = newOperationId()) {
+        client.put("$baseUrl/api/nodes/${node.enc()}/harness/config") {
+            operation(operationId)
+            contentType(ContentType.Application.Json); setBody(config)
+        }.orThrow("save harness config", operationId)
+    }
 
-    suspend fun harnessInstall(node: String, backend: String): String =
-        client.post("$baseUrl/api/nodes/${node.enc()}/harness/install") {
+    suspend fun harnessApply(node: String, backend: String, operationId: String = newOperationId()): String =
+        client.post("$baseUrl/api/nodes/${node.enc()}/harness/apply") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(BackendReq(backend))
-        }.orThrow().body<MessageResult>().message
+        }.orThrow("apply harness", operationId).body<MessageResult>().message
+
+    suspend fun harnessInstall(node: String, backend: String, operationId: String = newOperationId()): String =
+        client.post("$baseUrl/api/nodes/${node.enc()}/harness/install") {
+            operation(operationId)
+            contentType(ContentType.Application.Json); setBody(BackendReq(backend))
+        }.orThrow("install harness", operationId).body<MessageResult>().message
 
     // ---- users (admin) ----
-    suspend fun users(): List<UserInfo> = client.get("$baseUrl/api/users").body()
-
-    suspend fun createUser(req: CreateUserReq) {
-        client.post("$baseUrl/api/users") { contentType(ContentType.Application.Json); setBody(req) }.orThrow()
+    suspend fun users(): List<UserInfo> = read("users") {
+        client.get("$baseUrl/api/users").orThrow("users").body()
     }
 
-    suspend fun deleteUser(user: String) { client.delete("$baseUrl/api/users/${user.enc()}").orThrow() }
+    suspend fun createUser(req: CreateUserReq, operationId: String = newOperationId()) {
+        client.post("$baseUrl/api/users") {
+            operation(operationId)
+            contentType(ContentType.Application.Json); setBody(req)
+        }.orThrow("create user", operationId)
+    }
 
-    suspend fun setPassword(user: String, password: String) {
+    suspend fun deleteUser(user: String, operationId: String = newOperationId()) {
+        client.delete("$baseUrl/api/users/${user.enc()}") { operation(operationId) }
+            .orThrow("delete user", operationId)
+    }
+
+    suspend fun setPassword(user: String, password: String, operationId: String = newOperationId()) {
         client.put("$baseUrl/api/users/${user.enc()}/password") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(PasswordReq(password))
-        }.orThrow()
+        }.orThrow("set password", operationId)
     }
 
-    suspend fun setAdmin(user: String, admin: Boolean) {
+    suspend fun setAdmin(user: String, admin: Boolean, operationId: String = newOperationId()) {
         client.put("$baseUrl/api/users/${user.enc()}/admin") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(AdminReq(admin))
-        }.orThrow()
+        }.orThrow("set admin", operationId)
     }
 
-    suspend fun audit(limit: Int = 200): List<AuditRecord> =
-        client.get("$baseUrl/api/audit?limit=$limit").body()
+    suspend fun audit(limit: Int = 200): List<AuditRecord> = read("audit") {
+        client.get("$baseUrl/api/audit?limit=$limit").orThrow("audit").body()
+    }
 
     // ---- native push registration (control-plane fleet web push / FCM) ----
-    suspend fun subscribePush(sub: PushSub) {
+    suspend fun subscribePush(sub: PushSub, operationId: String = newOperationId()) {
         client.post("$baseUrl/api/push/subscribe") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(sub)
-        }.orThrow()
+        }.orThrow("subscribe push", operationId)
     }
 
-    suspend fun unsubscribePush(endpoint: String) {
+    suspend fun unsubscribePush(endpoint: String, operationId: String = newOperationId()) {
         client.post("$baseUrl/api/push/unsubscribe") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(mapOf("endpoint" to endpoint))
-        }.orThrow()
+        }.orThrow("unsubscribe push", operationId)
     }
 
     /** vapidKey fetches the server's VAPID applicationServerKey (base64url) for a
      *  UnifiedPush/Web Push subscription; null when push is unavailable. */
     suspend fun vapidKey(): String? = runCatchingCancellable {
-        client.get("$baseUrl/api/push/vapid-key").body<Map<String, String>>()["key"]
+        read("vapid key") {
+            client.get("$baseUrl/api/push/vapid-key").orThrow("vapid key").body<Map<String, String>>()["key"]
+        }
     }.getOrNull()
 
     // ---- control-plane self-update (the CP binary; nodes/harnesses are separate) ----
-    suspend fun fleetHero(): HeroFleet =
-        client.get("$baseUrl/api/fleet/hero").body()
+    suspend fun fleetHero(): HeroFleet = read("fleet hero") {
+        client.get("$baseUrl/api/fleet/hero").orThrow("fleet hero").body()
+    }
 
     /** setFleetHeroAuto toggles fleet-wide auto-update (re-signs the manifest); returns the new state. */
-    suspend fun setFleetHeroAuto(auto: Boolean): Boolean =
+    suspend fun setFleetHeroAuto(auto: Boolean, operationId: String = newOperationId()): Boolean =
         client.put("$baseUrl/api/fleet/hero") {
+            operation(operationId)
             contentType(ContentType.Application.Json); setBody(AutoUpdateReq(auto))
-        }.orThrow().body<AutoUpdateResp>().auto_update
+        }.orThrow("set auto-update", operationId).body<AutoUpdateResp>().auto_update
 
     /** controlSelfUpdate updates the control plane to the published target; it drains + restarts. */
-    suspend fun controlSelfUpdate(): String =
-        client.post("$baseUrl/api/control/self-update").orThrow().body<MessageResult>().message
+    suspend fun controlSelfUpdate(operationId: String = newOperationId()): String =
+        client.post("$baseUrl/api/control/self-update") { operation(operationId) }
+            .orThrow("control self-update", operationId).body<MessageResult>().message
 
     /** events streams the node's raw+grouped SSE feed (all sessions). */
     fun events(node: String): Flow<Event> = sseFrames("$baseUrl/api/nodes/${node.enc()}/events")
@@ -340,6 +438,121 @@ class Api(private val baseUrl: String, initialCookie: String? = null) {
 // MAX_SSE_LINE bounds one SSE line to the node RPC message ceiling (16 MiB); a
 // grouped frame is already capped there upstream, so a longer line is malformed.
 private const val MAX_SSE_LINE = 16 * 1024 * 1024
+
+/** HERO_OP_HEADER carries the client operation id of one logical mutation. The
+ *  transport never replays mutations (retryOnConnectionFailure is off), but a
+ *  user-driven retry after a lost response is still at-least-once from the
+ *  server's point of view; a persistent id per logical operation is what lets
+ *  the control plane/node dedupe re-submissions before side effects and lets a
+ *  typed error be correlated with the exact operation that failed. Reusing the
+ *  SAME id for an explicit retry of the SAME logical operation (StartSessionDialog,
+ *  the management mutation runner) is the client half of that contract. */
+internal const val HERO_OP_HEADER = "X-Hero-Op"
+
+/** MAX_ERROR_BODY_BYTES is the hard pre-decode ceiling on how much of a FAILED
+ *  response's body is ever read off the wire. bodyAsText() had no bound — the
+ *  display take(300) capped what was shown, not what was fetched/allocated. */
+internal const val MAX_ERROR_BODY_BYTES = 8 * 1024
+
+/** ERROR_DISPLAY_CHARS caps how much error-body text ends up in an exception
+ *  message (and so in a status line/dialog). */
+internal const val ERROR_DISPLAY_CHARS = 300
+
+private fun HttpRequestBuilder.operation(id: String) {
+    header(HERO_OP_HEADER, id)
+}
+
+/** newOperationId mints the client operation id for one logical mutation:
+ *  128 random bits, hex. Unique per logical operation, stable across explicit
+ *  retries of that same operation. */
+internal fun newOperationId(): String {
+    val b = Random.nextBytes(16)
+    val sb = StringBuilder(32)
+    for (x in b) {
+        val v = x.toInt() and 0xff
+        sb.append(HEX[v ushr 4]).append(HEX[v and 0xf])
+    }
+    return sb.toString()
+}
+
+private val HEX = "0123456789abcdef".toCharArray()
+
+/** ApiHttpException is the typed non-2xx result of one call: the HTTP status,
+ *  the logical operation name, the client operation id (mutations), and a
+ *  bounded, display-capped detail from the error body. Everything a caller
+ *  needs to decide retryability and show a message — without ever having read
+ *  more than MAX_ERROR_BODY_BYTES of the failure. */
+class ApiHttpException(
+    val status: Int,
+    val operation: String,
+    val operationId: String? = null,
+    detail: String? = null,
+) : IllegalStateException(httpErrorMessage(status, operation, detail))
+
+/** httpErrorMessage renders a typed HTTP failure for humans: the (already
+ *  byte-bounded) body detail display-capped to ERROR_DISPLAY_CHARS, or a
+ *  "<operation> failed (HTTP <status>)" fallback. Pure; unit-tested. */
+internal fun httpErrorMessage(status: Int, operation: String, detail: String?): String {
+    val d = detail?.trim()?.take(ERROR_DISPLAY_CHARS)?.ifBlank { null }
+    return d ?: "$operation failed (HTTP $status)"
+}
+
+/** boundedBodyText reads AT MOST [cap] bytes from [ch] and decodes them —
+ *  the pre-decode budget for error bodies. The rest of the body is cancelled,
+ *  never buffered; a multi-byte sequence cut at the cap decodes to a
+ *  replacement character instead of throwing. */
+internal suspend fun boundedBodyText(ch: ByteReadChannel, cap: Int): String {
+    val buf = ByteArray(cap)
+    var filled = 0
+    while (filled < cap) {
+        val n = ch.readAvailable(buf, filled, cap - filled)
+        if (n == -1) break
+        filled += n
+    }
+    ch.cancel(null) // drop the remainder of an arbitrarily large error body
+    return buf.decodeToString(0, filled)
+}
+
+/** ReadRetryPolicy bounds the explicit GET retry: a small attempt count, a
+ *  full-jitter exponential delay, and a total elapsed budget (deadline) that
+ *  stops retrying even when attempts remain. Mutations never use this. */
+internal data class ReadRetryPolicy(
+    val attempts: Int = 3,
+    val baseDelayMs: Long = 200,
+    val maxDelayMs: Long = 2_000,
+    val budgetMs: Long = 8_000,
+)
+
+private val READ_RETRY = ReadRetryPolicy()
+
+/** readRetryDelayMs decides whether failed read attempt [attempt] (0-based) may
+ *  retry under [policy]: null = give up (attempts exhausted or the deadline
+ *  budget is spent); otherwise the jittered delay to sleep first — a uniform
+ *  draw from [0, min(base·2^attempt, max)]. Pure given [random]; unit-tested. */
+internal fun readRetryDelayMs(
+    policy: ReadRetryPolicy,
+    attempt: Int,
+    elapsedMs: Long,
+    random: Random = Random.Default,
+): Long? {
+    if (attempt >= policy.attempts - 1) return null
+    if (elapsedMs >= policy.budgetMs) return null
+    val exp = attempt.coerceIn(0, 20) // 2^20 · base is far past any sane max
+    val ceiling = (policy.baseDelayMs shl exp).coerceIn(policy.baseDelayMs, policy.maxDelayMs)
+    val d = random.nextLong(ceiling + 1)
+    return if (elapsedMs + d > policy.budgetMs) null else d
+}
+
+/** isTransientReadError classifies one read failure for the retry loop: only
+ *  connection-level trouble and 5xx/408/429 are worth re-asking; deterministic
+ *  4xx, malformed-body decode failures, and cancellation are not. Pure. */
+internal fun isTransientReadError(t: Throwable): Boolean = when (t) {
+    is CancellationException -> false
+    is ApiHttpException -> t.status >= 500 || t.status == 408 || t.status == 429
+    is ContentConvertException -> false
+    is SerializationException -> false
+    else -> true
+}
 
 /** StreamAuthException: the live stream was refused with 401/403 — the session
  *  cookie is gone or insufficient. Permanent: reconnecting cannot fix it, the

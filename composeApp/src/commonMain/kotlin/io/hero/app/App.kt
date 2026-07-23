@@ -98,6 +98,19 @@ fun App() {
     }
 }
 
+// Screen models a top-level destination TOGETHER WITH the resources it renders
+// from. Crossfade keeps the EXITING content composing until its fade finishes,
+// so that content must render from its own immutable state value — Main carries
+// its Api+Me — and may never re-read a nullable var that sign-out already
+// cleared (the old string-keyed content did exactly that: its lambda captured
+// `api!!`, a deterministic null dereference during the sign-out animation).
+private sealed interface Screen {
+    data object Boot : Screen
+    data object Settings : Screen
+    data object Login : Screen
+    data class Main(val api: Api, val me: Me) : Screen
+}
+
 @Composable
 private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (ThemeMode) -> Unit) {
     // Edge-to-edge: the Surface paints under the system bars; this keeps content
@@ -108,14 +121,15 @@ private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (T
         // Persisting a settings change is an atomic off-UI batch; it is launched
         // here (never awaited on a click) so the store I/O never blocks a frame.
         val scope = rememberCoroutineScope()
-        var api by remember { mutableStateOf<Api?>(null) }
-        var me by remember { mutableStateOf(Me()) }
+        var main by remember { mutableStateOf<Screen.Main?>(null) }
         var showSettings by remember { mutableStateOf(false) }
         var booting by remember { mutableStateOf(true) }
 
         // Silent re-login: if "remember me" saved a session cookie, try it. The
         // probe Api is closed unless it is promoted to the app session, so a
         // failed (or cancelled) silent login never leaks its connection pool.
+        // The login is committed only when the AUTHORITATIVE /api/me succeeds —
+        // same truth contract as the manual sign-in path.
         LaunchedEffect(Unit) {
             val url = settings.getString(Keys.ServerUrl)
             val cookie = settings.getString(Keys.Cookie)
@@ -124,7 +138,7 @@ private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (T
                 var kept = false
                 try {
                     val m = runCatchingCancellable { a.me() }.getOrNull()
-                    if (m != null) { api = a; me = m; kept = true }
+                    if (m != null) { main = Screen.Main(a, m); kept = true }
                 } finally {
                     if (!kept) a.close()
                 }
@@ -132,27 +146,24 @@ private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (T
             booting = false
         }
 
-        // The app session owns the current Api: whenever it is replaced (silent
-        // login, sign-in, sign-out) or AppContent leaves composition, close the
-        // PREVIOUS client so its OkHttp pool + engine coroutines don't accumulate
-        // until GC. `current` captures this generation's Api so onDispose closes
-        // the one being replaced, never the incoming one that is still in use.
-        DisposableEffect(api) {
-            val current = api
-            onDispose { current?.close() }
+        // Last-resort owner: if AppContent itself leaves composition while a
+        // session is live (window teardown), close the current client. The
+        // per-screen owner inside the Crossfade below skips this case (the
+        // session is still current there), so the close runs exactly once.
+        DisposableEffect(Unit) {
+            onDispose { main?.api?.close() }
         }
 
-        val screen = when {
-            booting -> "boot"
-            showSettings -> "settings"
-            api == null -> "login"
-            else -> "main"
+        val screen: Screen = when {
+            booting -> Screen.Boot
+            showSettings -> Screen.Settings
+            else -> main ?: Screen.Login
         }
         // Gentle crossfade between top-level screens — subtle, ink-quiet.
         Crossfade(targetState = screen, animationSpec = tween(260), label = "screen") { s ->
             when (s) {
-                "boot" -> BootSplash()
-                "settings" -> SettingsScreen(
+                Screen.Boot -> BootSplash()
+                Screen.Settings -> SettingsScreen(
                     settings = settings,
                     themeMode = themeMode,
                     onThemeMode = { mode -> onThemeMode(mode); scope.launch { settings.update { it[Keys.ThemeMode] = mode.id } } },
@@ -163,28 +174,43 @@ private fun AppContent(settings: Settings, themeMode: ThemeMode, onThemeMode: (T
                     },
                     onClose = { showSettings = false },
                 )
-                "login" -> LoginScreen(
+                Screen.Login -> LoginScreen(
                     settings = settings,
-                    onLogin = { a, m -> api = a; me = m },
+                    onLogin = { a, m -> main = Screen.Main(a, m) },
                     onOpenSettings = { showSettings = true },
                 )
-                else -> MainScreen(
-                    api!!, me, settings,
-                    themeMode = themeMode,
-                    onThemeMode = { mode -> onThemeMode(mode); scope.launch { settings.update { it[Keys.ThemeMode] = mode.id } } },
-                    onForget = {
-                        // One batch clears the whole saved login, so the section
-                        // recomposes to "Nothing saved" the instant it commits.
-                        scope.launch { settings.update { it.remove(Keys.ServerUrl); it.remove(Keys.Username); it.remove(Keys.Remember); it.remove(Keys.Cookie) } }
-                    },
-                    onSignOut = {
-                        api = null; me = Me()
-                        FleetCache.clear()
-                        // Sign out keeps server+user (convenience for quick re-login);
-                        // only the durable "remember me" cookie pair is dropped.
-                        scope.launch { settings.update { it.remove(Keys.Cookie); it.remove(Keys.Remember) } }
-                    },
-                )
+                is Screen.Main -> {
+                    // The app-session owner, placed INSIDE the crossfaded content
+                    // and FIRST in it: sign-out replaces `main`, but this content
+                    // (and its SSE/poll children) stays composed until the exit
+                    // fade completes. Only when the old content is truly removed
+                    // does disposal run — children first (effects dispose in
+                    // reverse order of composition), this owner last — so the
+                    // client is closed strictly AFTER every child effect was
+                    // cancelled, and a cancelled child cannot issue a new call
+                    // (its next suspension throws). Navigating away with the
+                    // session still current (teardown) defers to the outer owner.
+                    DisposableEffect(s.api) {
+                        onDispose { if (main?.api !== s.api) s.api.close() }
+                    }
+                    MainScreen(
+                        s.api, s.me, settings,
+                        themeMode = themeMode,
+                        onThemeMode = { mode -> onThemeMode(mode); scope.launch { settings.update { it[Keys.ThemeMode] = mode.id } } },
+                        onForget = {
+                            // One batch clears the whole saved login, so the section
+                            // recomposes to "Nothing saved" the instant it commits.
+                            scope.launch { settings.update { it.remove(Keys.ServerUrl); it.remove(Keys.Username); it.remove(Keys.Remember); it.remove(Keys.Cookie) } }
+                        },
+                        onSignOut = {
+                            main = null
+                            FleetCache.clear()
+                            // Sign out keeps server+user (convenience for quick re-login);
+                            // only the durable "remember me" cookie pair is dropped.
+                            scope.launch { settings.update { it.remove(Keys.Cookie); it.remove(Keys.Remember) } }
+                        },
+                    )
+                }
             }
         }
     }
@@ -254,17 +280,27 @@ private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSe
                                 onClick = {
                                     busy = true; error = null
                                     scope.launch {
+                                        // Explicit temp-Api owner: ownership transfers to
+                                        // checkedApi only on a successful adopt; EVERY other
+                                        // exit — failed probe, thrown error, or this coroutine
+                                        // being cancelled mid-probe (Settings opened, screen
+                                        // left) — closes the local client in finally. The
+                                        // cancelled path used to leak one engine per probe.
                                         val a = Api(url.trim().trimEnd('/'))
-                                        if (a.probe()) {
-                                            // Re-check / Change server: close the previous
-                                            // probe client before adopting the new one.
-                                            checkedApi?.close()
-                                            checkedApi = a; step = 1
-                                        } else {
-                                            a.close() // failed probe: don't leak the client
-                                            error = "Not reachable, or not a HERO control plane."
+                                        var adopted = false
+                                        try {
+                                            if (a.probe()) {
+                                                // Re-check / Change server: close the previous
+                                                // probe client before adopting the new one.
+                                                checkedApi?.close()
+                                                checkedApi = a; adopted = true; step = 1
+                                            } else {
+                                                error = "Not reachable, or not a HERO control plane."
+                                            }
+                                            busy = false
+                                        } finally {
+                                            if (!adopted) a.close()
                                         }
-                                        busy = false
                                     }
                                 },
                                 enabled = !busy && url.isNotBlank(),
@@ -287,9 +323,21 @@ private fun LoginScreen(settings: Settings, onLogin: (Api, Me) -> Unit, onOpenSe
                                     busy = true; error = null
                                     scope.launch {
                                         try {
-                                            val a = checkedApi ?: Api(url.trim().trimEnd('/'))
+                                            // A fallback client (probe skipped) is adopted into
+                                            // checkedApi immediately, so the screen's owner
+                                            // closes it on any non-handoff exit — it used to
+                                            // float unowned and leak on a failed sign-in.
+                                            val a = checkedApi ?: Api(url.trim().trimEnd('/')).also { checkedApi = it }
                                             if (a.login(user, pass)) {
-                                                val m = runCatchingCancellable { a.me() }.getOrDefault(Me(user = user))
+                                                // The login commits ONLY once the authoritative
+                                                // /api/me confirms it. Guessing Me(user=...) on a
+                                                // 500/timeout/bad JSON committed an unconfirmed
+                                                // identity: admin surfaces hidden, settings
+                                                // persisted, and the failure deferred into the
+                                                // main screen. Any me() failure lands in the
+                                                // catch below — stay on the login page, persist
+                                                // nothing. (Cookie alone is not a login.)
+                                                val m = a.me()
                                                 val server = url.trim().trimEnd('/')
                                                 // One atomic batch: server+user (+remember+cookie) or
                                                 // the cleared pair — never a half-written combination.

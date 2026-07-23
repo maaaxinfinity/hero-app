@@ -20,12 +20,23 @@ class PushActionReceiver : BroadcastReceiver() {
         val api = apiFromSettings() ?: return
         val pending = goAsync()
         Thread {
-            runCatching {
-                runBlocking { api.respond(node, id, RespondReq(behavior, scope = scope, reason = "via HERO app")) }
+            try {
+                runCatching {
+                    runBlocking { api.respond(node, id, RespondReq(behavior, scope = scope, reason = "via HERO app")) }
+                }
+                runCatching {
+                    val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+                    nm.cancel(notifId)
+                }
+            } finally {
+                // The receiver's two owner obligations hold on EVERY exit —
+                // success, HTTP failure, or a Throwable anywhere on this thread:
+                // the one-shot client is closed (it used to leak per tap) and the
+                // broadcast is finished (an unfinished goAsync() pins the process
+                // and eventually ANRs the receiver).
+                api.close()
+                pending.finish()
             }
-            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-            nm.cancel(notifId)
-            pending.finish()
         }.start()
     }
 }

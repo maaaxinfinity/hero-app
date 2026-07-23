@@ -149,4 +149,57 @@ class SessionsTest {
         assertTrue(isReallyAtBottom(lastItemEndOffset = 1000, viewportEndOffset = 1000)) // exactly aligned
         assertFalse(isReallyAtBottom(lastItemEndOffset = 5000, viewportEndOffset = 1000)) // tall turn, at its top
     }
+
+    // The composer draft is owned per {node, session}: text typed for A never
+    // appears in (or gets sent to) B, a parked draft comes back on return, and
+    // sending clears the entry.
+    @Test
+    fun draftStoreScopesTextToItsConversation() {
+        val d = DraftStore()
+        d.put("n1", "a", "hello A")
+        assertEquals("", d.get("n1", "b"))
+        assertEquals("", d.get("n2", "a"))
+        assertEquals("hello A", d.get("n1", "a"))
+        d.clear("n1", "a") // send
+        assertEquals("", d.get("n1", "a"))
+        assertEquals(0, d.size)
+        // No identity, no draft (nothing open yet).
+        d.put(null, "a", "x")
+        d.put("n1", null, "x")
+        assertEquals(0, d.size)
+        // Emptying the composer drops the entry instead of parking "".
+        d.put("n1", "a", "text")
+        d.put("n1", "a", "")
+        assertEquals(0, d.size)
+    }
+
+    // "a" + "b c" must never collide with "a b" + "c" — the pair key uses a
+    // separator that cannot appear in either id.
+    @Test
+    fun draftStoreKeyIsUnambiguous() {
+        val d = DraftStore()
+        d.put("a", "b c", "one")
+        d.put("a b", "c", "two")
+        assertEquals("one", d.get("a", "b c"))
+        assertEquals("two", d.get("a b", "c"))
+    }
+
+    // Bounded state: entry count is capped (oldest-put evicted first) and a
+    // pathological draft is dropped rather than retained forever.
+    @Test
+    fun draftStoreIsBounded() {
+        val d = DraftStore()
+        repeat(MAX_DRAFT_ENTRIES + 8) { i -> d.put("n", "s$i", "draft $i") }
+        assertEquals(MAX_DRAFT_ENTRIES, d.size)
+        assertEquals("", d.get("n", "s0")) // oldest evicted
+        assertEquals("draft ${MAX_DRAFT_ENTRIES + 7}", d.get("n", "s${MAX_DRAFT_ENTRIES + 7}")) // newest kept
+        // An over-cap draft is dropped — and clears the previously parked value.
+        d.put("n", "big", "ok")
+        d.put("n", "big", "x".repeat(MAX_DRAFT_CHARS + 1))
+        assertEquals("", d.get("n", "big"))
+        // Exactly at the cap still fits.
+        val edge = "y".repeat(MAX_DRAFT_CHARS)
+        d.put("n", "edge", edge)
+        assertEquals(edge, d.get("n", "edge"))
+    }
 }
