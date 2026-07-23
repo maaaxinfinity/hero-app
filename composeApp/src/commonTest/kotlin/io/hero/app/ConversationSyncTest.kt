@@ -31,7 +31,9 @@ class ConversationSyncTest {
 
         val merged = s.truthUp(listOf(t1, t2, t3, t4), total = 4, start = 0)
         assertEquals(listOf(t1, t2, t3, t4), merged.turns)
-        assertEquals(4, displayKeys(merged.turns).toSet().size)
+        // Mechanical adaptation: displayKeys(turns) was replaced by ConvoState's
+        // incrementally maintained UI id index; the uniqueness assertion is the same.
+        assertEquals(4, merged.uiKeys.toSet().size)
         assertEquals(0, merged.cursor?.start)
         assertFalse(merged.openAssistant)
     }

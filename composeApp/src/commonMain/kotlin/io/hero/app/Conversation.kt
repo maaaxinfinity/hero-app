@@ -59,82 +59,242 @@ data class Cursor(val total: Int, val start: Int, val pageSize: Int) {
     fun earlierOffset() = (start - pageSize).coerceAtLeast(0)
 }
 
+/**
+ * ConvoState is the conversation window split in two so a live part append is
+ * near O(1) instead of a whole-list rebuild:
+ *
+ *  - [history] holds every SETTLED turn. Its list reference is untouched while
+ *    parts stream into the open turn, so `remember(history)`-keyed derivations
+ *    and LazyColumn rows stay valid across part frames.
+ *  - [open] is the single live, unfinalized assistant turn — the only row a
+ *    part frame may grow. Exit/idle settles it: one append onto history.
+ *
+ * Every turn gets a stable UI id when it FIRST enters the state — the server
+ * uuid when it arrives committed, else a local monotonic id ("~n", from
+ * [nextLocalId]) — carried in [historyKeys]/[openKey], parallel to the turns.
+ * That id never changes for the life of the row: the exit frame stamping the
+ * canonical uuid, a truth-up swapping in the committed version, and a prepend
+ * landing a same-identity record all keep the original id. Rows are therefore
+ * never deleted+reinserted on commit (tool-card expansion and scroll anchors
+ * survive), and keys never shift the way the old displayKeys occurrence
+ * recompute shifted them on prepend.
+ *
+ * [children] is the incrementally maintained subagent index — always equal to
+ * collectChildSessions(turns) — with [childIds] as its dedup set; live part
+ * frames fold in only the new part instead of rescanning the history.
+ *
+ * Construct via the ConvoState(turns, …) factory below; the primary
+ * constructor is the internal split representation.
+ */
 data class ConvoState(
-    val turns: List<Turn> = emptyList(),
-    val openAssistant: Boolean = false, // last turn is a live, unfinalized assistant turn
-    val cursor: Cursor? = null,
-    val status: String? = null,         // transient "thinking"/"stalled"
-    val runtimeModel: String? = null,
-)
+    val history: List<Turn>,
+    val historyKeys: List<Any>,
+    val open: Turn?,
+    val openKey: Any?,
+    val cursor: Cursor?,
+    val status: String?,         // transient "thinking"/"stalled"
+    val runtimeModel: String?,
+    val children: List<Pair<String, String>>,
+    val childIds: Set<String>,
+    val nextLocalId: Long,
+) {
+    /** True while the last turn is a live, unfinalized assistant turn. */
+    val openAssistant: Boolean get() = open != null
+    /** The full window, oldest→newest. Materializes a copy — for page-scale
+     *  callers and tests; per-frame code reads [history]/[open] directly. */
+    val turns: List<Turn> get() = if (open == null) history else history + open
+    /** Stable UI ids parallel to [turns]; same materialization caveat. */
+    val uiKeys: List<Any> get() = openKey?.let { historyKeys + it } ?: historyKeys
+    val turnCount: Int get() = history.size + (if (open == null) 0 else 1)
+    val lastTurn: Turn? get() = open ?: history.lastOrNull()
+    val lastUiKey: Any? get() = openKey ?: historyKeys.lastOrNull()
+    /** UI id of the [i]-th turn without materializing [uiKeys]. */
+    fun uiKeyAt(i: Int): Any? = when {
+        i in historyKeys.indices -> historyKeys[i]
+        i == historyKeys.size -> openKey
+        else -> null
+    }
+}
+
+/** ConvoState factory: folds a plain turn list (a transcript page seed, a test
+ *  fixture) into the split representation, assigning each turn its UI id —
+ *  uuid when it arrived committed, else a fresh local id. [openAssistant]
+ *  marks a trailing assistant turn as live (it moves into the open slot). */
+fun ConvoState(
+    turns: List<Turn> = emptyList(),
+    openAssistant: Boolean = false,
+    cursor: Cursor? = null,
+    status: String? = null,
+    runtimeModel: String? = null,
+): ConvoState {
+    val (keys, next) = assignUiKeys(turns, HashSet(), 0L)
+    val opensLast = openAssistant && turns.lastOrNull()?.role == "assistant"
+    val (kids, kidIds) = childIndex(turns)
+    return ConvoState(
+        history = if (opensLast) turns.dropLast(1) else turns,
+        historyKeys = if (opensLast) keys.dropLast(1) else keys,
+        open = if (opensLast) turns.last() else null,
+        openKey = if (opensLast) keys.last() else null,
+        cursor = cursor, status = status, runtimeModel = runtimeModel,
+        children = kids, childIds = kidIds,
+        nextLocalId = next,
+    )
+}
+
+/** localUiKey formats local monotonic UI id [n]. The "~" prefix keeps it out
+ *  of the uuid namespace (harness uuids never start with "~"). */
+private fun localUiKey(n: Long): Any = "~$n"
+
+/** assignUiKeys allocates one UI id per incoming page turn: its uuid when
+ *  present and not already [used] (a colliding record — server dup or page
+ *  overlap — falls back to a local id instead of stealing or shifting an
+ *  existing row's key), else the next local id. Adds every issued key to
+ *  [used]; returns the keys and the advanced local-id counter. */
+private fun assignUiKeys(page: List<Turn>, used: MutableSet<Any>, firstLocalId: Long): Pair<List<Any>, Long> {
+    var next = firstLocalId
+    val keys: List<Any> = page.map { t ->
+        val key: Any = if (t.uuid != null && t.uuid !in used) t.uuid else {
+            while (localUiKey(next) in used) next++
+            localUiKey(next++)
+        }
+        used += key
+        key
+    }
+    return keys to next
+}
+
+/** childIndex is the full-scan (re)build of the subagent index — used by the
+ *  page-scale paths (seed, prepend, truth-up, mid-window resume) where
+ *  first-appearance order can change; live appends use [withChild]. */
+private fun childIndex(turns: List<Turn>): Pair<List<Pair<String, String>>, Set<String>> {
+    val kids = collectChildSessions(turns)
+    return kids to kids.mapTo(HashSet()) { it.second }
+}
+
+/** settle folds the open turn (if any) into history — ONE append, keeping its
+ *  UI id and optionally stamping the canonical [uuid] the exit frame carried.
+ *  live→terminal is thus an in-place commit, never a delete+insert. */
+private fun ConvoState.settle(uuid: String? = null): ConvoState =
+    if (open == null) this
+    else copy(
+        history = history + (if (uuid == null) open else open.copy(uuid = uuid)),
+        historyKeys = historyKeys + checkNotNull(openKey) { "open turn without a UI id" },
+        open = null, openKey = null,
+    )
+
+/** appendSettled adds one settled row (user turn, error line) under a fresh
+ *  local UI id. */
+private fun ConvoState.appendSettled(t: Turn): ConvoState =
+    copy(
+        history = history + t,
+        historyKeys = historyKeys + localUiKey(nextLocalId),
+        nextLocalId = nextLocalId + 1,
+    )
+
+/** withChild folds ONE streamed part into the subagent index — the O(1) live
+ *  replacement for rescanning every loaded turn on each part frame. */
+private fun ConvoState.withChild(p: TurnPart): ConvoState {
+    val id = p.childSessionId ?: return this
+    if (id in childIds) return this
+    val label = p.toolTarget?.takeIf { it.isNotEmpty() } ?: (p.toolName ?: "subagent")
+    return copy(children = children + (label to id), childIds = childIds + id)
+}
 
 /** reduce folds one live frame into the conversation. Immutable copies so Compose
  *  sees new references; `Unknown`/`Delta` are no-ops (v1 renders committed parts).
  *  UserTurn/Part tolerate RE-DELIVERY: after a truth-up (or a snapshot taken
  *  mid-turn) the stream replays work the merged page already contains — those
- *  frames must fold away instead of duplicating turns or parts. */
+ *  frames must fold away instead of duplicating turns or parts. A part for the
+ *  open turn touches ONLY the open slot ([history] keeps its reference), so the
+ *  hot streaming path does no per-frame window rebuild. */
 fun ConvoState.reduce(f: LiveFrame): ConvoState = when (f) {
     is LiveFrame.UserTurn -> {
         // Duplicate if it's the optimistic echo (last turn, same content) or a
         // commit the loaded window already holds (same non-empty ts + content —
         // an SSE re-delivery across a truth-up, never a genuinely repeated
         // message, which gets its own ts).
-        val echoDup = turns.lastOrNull()?.let { it.role == "user" && it.content == f.content } == true
-        val committedDup = !f.ts.isNullOrEmpty() && turns.any { it.role == "user" && it.ts == f.ts && it.content == f.content }
-        if (echoDup || committedDup) copy(openAssistant = false, status = null)
-        else copy(turns = turns + Turn(role = "user", content = f.content, ts = f.ts ?: ""),
-            openAssistant = false, status = null)
+        val echoDup = lastTurn?.let { it.role == "user" && it.content == f.content } == true
+        val committedDup = !f.ts.isNullOrEmpty() && history.any { it.role == "user" && it.ts == f.ts && it.content == f.content }
+        if (echoDup || committedDup) settle().copy(status = null)
+        else settle().appendSettled(Turn(role = "user", content = f.content, ts = f.ts ?: "")).copy(status = null)
     }
     is LiveFrame.Part -> {
-        val resumeIdx = if (openAssistant || f.ts.isNullOrEmpty()) -1
-        else turns.indexOfLast { it.role == "assistant" && it.ts == f.ts }
+        val resumeIdx = if (open != null || f.ts.isNullOrEmpty()) -1
+        else history.indexOfLast { it.role == "assistant" && it.ts == f.ts }
         when {
-            openAssistant && turns.lastOrNull()?.role == "assistant" -> {
-                val last = turns.last()
-                copy(turns = turns.dropLast(1) + last.copy(parts = last.parts + f.part))
-            }
+            // Hot path: grow the open turn in place. History (and its keys)
+            // keep their references — no O(turns) copy per streamed part.
+            open != null -> withChild(f.part).copy(open = open.copy(parts = open.parts + f.part))
             // Not open, but the frame's ts names a turn the seed/truth-up page
             // already holds: a part the page committed is a re-delivery (no-op);
             // a new one RESUMES that turn in place instead of opening a split
             // duplicate turn for the same ts.
-            resumeIdx >= 0 && f.part in turns[resumeIdx].parts -> this
-            resumeIdx >= 0 -> {
-                val t = turns[resumeIdx]
-                val updated = turns.toMutableList().also { it[resumeIdx] = t.copy(parts = t.parts + f.part) }
-                copy(turns = updated, openAssistant = resumeIdx == turns.lastIndex, status = null)
+            resumeIdx >= 0 && f.part in history[resumeIdx].parts -> this
+            resumeIdx >= 0 && resumeIdx == history.lastIndex -> {
+                // Reopen the tail turn: it and its UI id MOVE into the open slot,
+                // so the row's key survives the settle→live→settle round trip.
+                val t = history[resumeIdx]
+                withChild(f.part).copy(
+                    history = history.dropLast(1),
+                    historyKeys = historyKeys.dropLast(1),
+                    open = t.copy(parts = t.parts + f.part),
+                    openKey = historyKeys[resumeIdx],
+                    status = null,
+                )
             }
-            else -> copy(
-                turns = turns + Turn(role = "assistant", parts = listOf(f.part), ts = f.ts ?: "", model = f.model),
-                openAssistant = true, status = null,
+            resumeIdx >= 0 -> {
+                // Mid-window resume (rare: replay races a truth-up): in-place
+                // append; positions and keys unchanged, child order re-derived.
+                val t = history[resumeIdx]
+                val updated = history.toMutableList().also { it[resumeIdx] = t.copy(parts = t.parts + f.part) }
+                val (kids, kidIds) = childIndex(updated)
+                copy(history = updated, children = kids, childIds = kidIds, status = null)
+            }
+            else -> withChild(f.part).copy(
+                open = Turn(role = "assistant", parts = listOf(f.part), ts = f.ts ?: "", model = f.model),
+                openKey = localUiKey(nextLocalId),
+                nextLocalId = nextLocalId + 1,
+                status = null,
             )
         }
     }
     is LiveFrame.Delta -> this // v1: rely on committed `part` frames
     is LiveFrame.Status -> copy(status = f.status)
-    is LiveFrame.Exit -> {
-        val closed = if (openAssistant && f.assistantUuid != null && turns.lastOrNull()?.role == "assistant")
-            turns.dropLast(1) + turns.last().copy(uuid = f.assistantUuid) else turns
-        copy(turns = closed, openAssistant = false, status = null)
-    }
+    // Exit only stamps the canonical uuid and settles — the UI id is untouched,
+    // so the row is not rebuilt when a live turn goes terminal.
+    is LiveFrame.Exit -> settle(uuid = f.assistantUuid).copy(status = null)
     is LiveFrame.Runtime -> copy(runtimeModel = f.model ?: runtimeModel)
-    is LiveFrame.ErrorFrame -> copy(turns = turns + Turn(role = "error", content = f.message),
-        openAssistant = false, status = null)
+    is LiveFrame.ErrorFrame -> settle().appendSettled(Turn(role = "error", content = f.message)).copy(status = null)
     LiveFrame.TurnActive -> copy(status = status ?: "thinking")
-    LiveFrame.TurnIdle -> copy(openAssistant = false, status = null)
+    LiveFrame.TurnIdle -> settle().copy(status = null)
     is LiveFrame.Unknown -> this
 }
 
 /** optimisticUser appends the user's message locally on send; the canonical
  *  turn.user that follows is deduped by reduce. */
 fun ConvoState.optimisticUser(text: String): ConvoState =
-    copy(turns = turns + Turn(role = "user", content = text), openAssistant = false)
+    settle().appendSettled(Turn(role = "user", content = text))
 
 /** prepend inserts an earlier transcript page before the current window and
- *  advances the cursor. Pure, like reduce. */
-fun ConvoState.prepend(page: List<Turn>, total: Int, start: Int): ConvoState =
-    copy(
-        turns = page + turns,
+ *  advances the cursor. Page turns get their own UI ids (uuid or fresh local);
+ *  EXISTING rows keep theirs — a same-identity record landing above no longer
+ *  shifts a loaded turn's key the way the old occurrence suffix did. The
+ *  subagent index merges page-first (first-appearance order). Pure, like
+ *  reduce. */
+fun ConvoState.prepend(page: List<Turn>, total: Int, start: Int): ConvoState {
+    val used = HashSet<Any>(historyKeys)
+    openKey?.let { used += it }
+    val (pageKeys, next) = assignUiKeys(page, used, nextLocalId)
+    val (pageKids, pageKidIds) = childIndex(page)
+    return copy(
+        history = page + history,
+        historyKeys = pageKeys + historyKeys,
         cursor = Cursor(total, start, cursor?.pageSize ?: page.size.coerceAtLeast(1)),
+        children = pageKids + children.filter { it.second !in pageKidIds },
+        childIds = childIds + pageKidIds,
+        nextLocalId = next,
     )
+}
 
 /** truthUp reconciles a freshly re-read NEWEST transcript page into the loaded
  *  window after every SSE (re)subscribe: turns committed in the snapshot→subscribe
@@ -148,34 +308,90 @@ fun ConvoState.prepend(page: List<Turn>, total: Int, start: Int): ConvoState =
  *  When the page no longer overlaps the loaded window (the outage outlasted a
  *  whole page: page start is beyond the last-known total) the stale window is
  *  dropped rather than bridging a silent hole — the cursor stays honest about
- *  contiguity, so "Load earlier" never skips server turns. Pure, like reduce. */
+ *  contiguity, so "Load earlier" never skips server turns. Replaced turns
+ *  donate their UI ids to their authoritative versions, so the merge re-keys
+ *  no surviving row. Pure, like reduce. */
 fun ConvoState.truthUp(page: List<Turn>, total: Int, start: Int): ConvoState {
     val pageSize = cursor?.pageSize ?: page.size.coerceAtLeast(1)
-    if (page.isEmpty()) return copy(openAssistant = false, cursor = Cursor(total, start, pageSize))
+    if (page.isEmpty()) return settle().copy(cursor = Cursor(total, start, pageSize))
     val old = cursor
     if (old != null && start > old.total) {
-        return copy(turns = page, openAssistant = false, cursor = Cursor(total, start, pageSize))
+        val (pageUiKeys, next) = assignUiKeys(page, HashSet(), nextLocalId)
+        val (kids, kidIds) = childIndex(page)
+        return copy(
+            history = page, historyKeys = pageUiKeys, open = null, openKey = null,
+            cursor = Cursor(total, start, pageSize),
+            children = kids, childIds = kidIds, nextLocalId = next,
+        )
     }
-    val pageKeys = page.map { turnKey(it) }.toSet()
+    val loaded = turns          // history + open, materialized once (page-scale op)
+    val loadedKeys = uiKeys
+    val pageCanon = page.mapTo(HashSet()) { turnKey(it) }
     val committedAssistantTs = page.mapNotNull { t -> t.ts.takeIf { t.role == "assistant" && it.isNotEmpty() } }.toSet()
     fun covered(t: Turn): Boolean = when {
-        turnKey(t) in pageKeys -> true
+        turnKey(t) in pageCanon -> true
         t.role == "assistant" && t.uuid == null && t.ts.isNotEmpty() && t.ts in committedAssistantTs -> true
         t.role == "user" && t.ts.isEmpty() && page.any { it.role == "user" && it.content == t.content } -> true
         else -> false
     }
-    val firstCovered = turns.indexOfFirst { covered(it) }
+    val firstCovered = loaded.indexOfFirst { covered(it) }
     // Nothing covered: the whole local window predates (or exactly abuts) the
     // page — keep it all as older history and append the page after it.
-    val prefix = if (firstCovered >= 0) turns.take(firstCovered) else turns
-    val clientTail = if (firstCovered < 0) emptyList()
-    else turns.drop(firstCovered).filter { !covered(it) && (it.role == "error" || (it.role == "user" && it.ts.isEmpty())) }
+    val prefixEnd = if (firstCovered >= 0) firstCovered else loaded.size
+    val prefix = loaded.take(prefixEnd)
+    val prefixKeys = loadedKeys.take(prefixEnd)
+    // Covered rows are replaced by the page's authoritative versions but DONATE
+    // their UI ids to them (matched by canonical identity plus the two commit
+    // transitions: live assistant by ts, optimistic user echo by content), so a
+    // truth-up re-keys nothing. Uncovered client-only rows keep theirs at the
+    // tail; anything else in the covered region drops with its id.
+    val donorByCanon = HashMap<Any, Any>()
+    val donorLiveAssistant = HashMap<String, Any>()
+    val donorEcho = HashMap<String?, Any>()
+    val tailTurns = ArrayList<Turn>()
+    val tailKeys = ArrayList<Any>()
+    for (i in prefixEnd until loaded.size) {
+        val t = loaded[i]
+        val k = loadedKeys[i]
+        when {
+            covered(t) -> {
+                donorByCanon.putIfAbsent(turnKey(t), k)
+                if (t.role == "assistant" && t.uuid == null && t.ts.isNotEmpty()) donorLiveAssistant.putIfAbsent(t.ts, k)
+                if (t.role == "user" && t.ts.isEmpty()) donorEcho.putIfAbsent(t.content, k)
+            }
+            t.role == "error" || (t.role == "user" && t.ts.isEmpty()) -> {
+                tailTurns += t
+                tailKeys += k
+            }
+        }
+    }
+    val used = HashSet<Any>(prefixKeys).apply { addAll(tailKeys) }
+    var next = nextLocalId
+    val pageUiKeys: List<Any> = page.map { p ->
+        val donated = donorByCanon.remove(turnKey(p))
+            ?: (if (p.role == "assistant" && p.ts.isNotEmpty()) donorLiveAssistant.remove(p.ts) else null)
+            ?: (if (p.role == "user") donorEcho.remove(p.content) else null)
+        val key: Any = when {
+            donated != null && donated !in used -> donated
+            p.uuid != null && p.uuid !in used -> p.uuid
+            else -> {
+                while (localUiKey(next) in used) next++
+                localUiKey(next++)
+            }
+        }
+        used += key
+        key
+    }
+    val merged = prefix + page + tailTurns
+    val (kids, kidIds) = childIndex(merged)
     return copy(
-        turns = prefix + page + clientTail,
-        openAssistant = false,
+        history = merged,
+        historyKeys = prefixKeys + pageUiKeys + tailKeys,
+        open = null, openKey = null,
         // The loaded region still reaches back to the older of the two starts
         // (kept prepended history), so Load earlier neither skips nor re-fetches.
         cursor = Cursor(total, minOf(old?.start ?: start, start), pageSize),
+        children = kids, childIds = kidIds, nextLocalId = next,
     )
 }
 
@@ -192,11 +408,12 @@ data class ConvoOwner(val node: String, val session: String)
 fun applyEarlierPage(state: ConvoState, owner: ConvoOwner, current: ConvoOwner?, page: TranscriptPage): ConvoState? =
     if (owner != current) null else state.prepend(page.turns, page.total, page.start)
 
-/** turnKey is a stable LazyColumn key. Assistant turns prefer uuid (assigned at
- *  exit); before that they key on role+ts ONLY — never parts.size, which grows on
- *  every streamed part and would rebuild the live row (losing tool-card expand
- *  state and scroll) on each append. Non-assistant turns have settled content, so
- *  a length tiebreaker is stable. displayKeys disambiguates same-ts collisions. */
+/** turnKey is a turn's CANONICAL identity (uuid, else role+ts[+length]) — what
+ *  truth-up merges by. It is NOT the LazyColumn key anymore: rows render under
+ *  the UI ids ConvoState assigns on first entry, which survive the uuid landing
+ *  at exit (this key flips uuid-ward then; the UI id doesn't). Assistant turns
+ *  key on role+ts ONLY before their uuid — never parts.size, which grows on
+ *  every streamed part. */
 fun turnKey(t: Turn): Any {
     t.uuid?.let { return it }
     return if (t.role == "assistant") "assistant:${t.ts}"
@@ -205,7 +422,9 @@ fun turnKey(t: Turn): Any {
 
 /** collectChildSessions lists the subagent transcripts spawned in this
  *  conversation (display label → child session id), in order of first
- *  appearance, deduped by child id. Pure — feeds the session inspector. */
+ *  appearance, deduped by child id. Pure — the full-scan reference behind
+ *  ConvoState.children, run only on page-scale merges (live part frames fold
+ *  in incrementally via the reducer). */
 fun collectChildSessions(turns: List<Turn>): List<Pair<String, String>> {
     val out = LinkedHashMap<String, String>()
     turns.forEach { t ->
@@ -217,20 +436,6 @@ fun collectChildSessions(turns: List<Turn>): List<Pair<String, String>> {
         }
     }
     return out.map { (id, label) -> label to id }
-}
-
-/** displayKeys makes turnKey collision-proof for LazyColumn: live turns without
- *  a uuid can legitimately repeat (same role/ts/size), which crashes the list.
- *  Duplicates get an occurrence suffix; uuid'd history stays untouched, so keys
- *  are stable across prepends and appends. */
-fun displayKeys(turns: List<Turn>): List<Any> {
-    val seen = HashMap<Any, Int>()
-    return turns.map { t ->
-        val base = turnKey(t)
-        val n = seen[base] ?: 0
-        seen[base] = n + 1
-        if (n == 0) base else "$base#$n"
-    }
 }
 
 // ---- rendering ----

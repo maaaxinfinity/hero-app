@@ -4,6 +4,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class SessionsTest {
@@ -94,19 +95,48 @@ class SessionsTest {
         assertEquals(emptyList(), filterAudit(recs, "nothing"))
     }
 
-    // Two live assistant turns without uuids can produce identical turnKeys
-    // (same ts + part count); displayKeys must disambiguate them and stay
-    // stable when the list grows.
+    // Two assistant turns without uuids can share a canonical identity (same
+    // role + ts); the ConvoState UI id index must keep their keys unique and
+    // untouched as the window grows. (Mechanical adaptation of the old
+    // displayKeys occurrence-suffix test: ids are now allocated once on entry
+    // by ConvoState instead of recomputed from the whole list — the uniqueness
+    // and stability assertions are the same.)
     @Test
-    fun displayKeysDisambiguateCollisions() {
+    fun sameTimestampTurnsGetUniqueStableKeys() {
         val live1 = Turn(role = "assistant", parts = listOf(TurnPart(content = "a")), ts = "now")
         val live2 = Turn(role = "assistant", parts = listOf(TurnPart(content = "b")), ts = "now")
         val done = Turn(role = "assistant", parts = emptyList(), ts = "t1", uuid = "u1")
 
-        val keys = displayKeys(listOf(done, live1, live2))
+        val s = ConvoState(turns = listOf(done, live1, live2))
+        val keys = s.uiKeys
         assertEquals(3, keys.toSet().size)
         assertEquals("u1", keys[0])
-        assertEquals(keys[1], displayKeys(listOf(done, live1, live2, live1.copy(ts = "later")))[1])
+        // Growing the window leaves every existing key untouched.
+        val grown = s.reduce(LiveFrame.UserTurn("hi", "t9"))
+        assertEquals(keys, grown.uiKeys.take(3))
+    }
+
+    // The inspector's actionable-first pending partition: current session's
+    // requests first (stable within groups), recomputed ONLY when {pend,
+    // sessionId} actually change — poll ticks that deliver an equal list reuse
+    // the cached ordering.
+    @Test
+    fun pendingPartitionRecomputesOnlyOnInputChange() {
+        val memo = PendingPartition()
+        val a = Pending(id = "p1", session_id = "other")
+        val b = Pending(id = "p2", session_id = "mine")
+        val c = Pending(id = "p3", session_id = "other2")
+
+        val first = memo.of(listOf(a, b, c), "mine")
+        assertEquals(listOf(b, a, c), first)
+        assertEquals(1, memo.computations)
+        // An equal (but not identical) list — what each poll tick delivers.
+        assertSame(first, memo.of(listOf(a, b, c), "mine"))
+        assertEquals(1, memo.computations)
+        assertEquals(listOf(a, c), memo.of(listOf(a, c), "mine")) // pend changed
+        assertEquals(2, memo.computations)
+        assertEquals(listOf(c, a), memo.of(listOf(a, c), "other2")) // session changed
+        assertEquals(3, memo.computations)
     }
 
     // "Really at bottom" uses the last item's END offset vs the viewport end, not

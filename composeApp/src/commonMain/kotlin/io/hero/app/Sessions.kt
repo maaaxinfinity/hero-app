@@ -71,6 +71,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -153,10 +154,10 @@ internal fun anchorAfterPrepend(
 }
 
 /** EarlierPage reports one applied "Load earlier" fetch back to the pane: how
- *  many turns landed, the merged window's display keys (to re-anchor scroll by
- *  stable key), and whether the header item still renders. null = nothing
- *  applied (no more pages, fetch failed, or the response outlived its
- *  conversation and was discarded by the owner CAS). */
+ *  many turns landed, the merged window's stable UI ids (to re-anchor scroll by
+ *  key), and whether the header item still renders. null = nothing applied (no
+ *  more pages, fetch failed, or the response outlived its conversation and was
+ *  discarded by the owner CAS). */
 data class EarlierPage(val added: Int, val keys: List<Any>, val hasMore: Boolean)
 
 /**
@@ -402,7 +403,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                         val nowOwner = now.node?.let { nn -> now.active?.let { ss -> ConvoOwner(nn, ss) } }
                         applyEarlierPage(convo, ConvoOwner(n, s), nowOwner, page)?.let { merged ->
                             convo = merged
-                            EarlierPage(page.turns.size, displayKeys(merged.turns), merged.cursor?.hasMore == true)
+                            EarlierPage(page.turns.size, merged.uiKeys, merged.cursor?.hasMore == true)
                         }
                     }
             },
@@ -458,7 +459,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
             panel = {
                 SessionInspector(
                     session = rootSession, sessionId = sel.session.orEmpty(),
-                    model = convo.runtimeModel, pend = pend, turns = convo.turns,
+                    model = convo.runtimeModel, pend = pend, children = convo.children,
                     onRespond = { p, behavior ->
                         val n = sel.node; val s = sel.active
                         if (n != null) scope.launch {
@@ -506,17 +507,42 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     }
 }
 
+/** PendingPartition memoizes the inspector's actionable-first ordering (the
+ *  open session's requests before the rest of the node's): it recomputes only
+ *  when {pend, sessionId} actually change, so live part frames and equal-list
+ *  poll ticks reuse the cached ordering. sortedByDescending is stable, so rows
+ *  within each group keep their server order. [computations] backs the unit
+ *  test's recompute counter. */
+internal class PendingPartition {
+    var computations = 0
+        private set
+    private var lastPend: List<Pending>? = null
+    private var lastSession: String? = null
+    private var cached: List<Pending> = emptyList()
+    fun of(pend: List<Pending>, sessionId: String): List<Pending> {
+        if (pend == lastPend && sessionId == lastSession) return cached
+        computations++
+        lastPend = pend
+        lastSession = sessionId
+        cached = pend.sortedByDescending { it.session_id == sessionId }
+        return cached
+    }
+}
+
 // SessionInspector: what you're talking to and the levers you have — all wired
 // to real endpoints (respond, startSession) or real transcript/list data.
+// `children` is ConvoState's incrementally maintained subagent index; nothing
+// here rescans the transcript on part frames.
 @Composable
 private fun SessionInspector(
     session: Session?, sessionId: String, model: String?,
-    pend: List<Pending>, turns: List<Turn>,
+    pend: List<Pending>, children: List<Pair<String, String>>,
     onRespond: (Pending, String) -> Unit,
     onOpenChild: (String) -> Unit,
     onNewSession: () -> Unit,
 ) {
     val clipboard = LocalClipboardManager.current
+    val partition = remember { PendingPartition() }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -544,25 +570,26 @@ private fun SessionInspector(
             if (pend.isEmpty()) HintText("None.")
             else {
                 // Current session's requests first; others still answerable here.
-                pend.sortedByDescending { it.session_id == sessionId }.forEachIndexed { i, p ->
-                    if (i > 0) HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                    Text(
-                        p.tool_name.ifEmpty { p.event.ifEmpty { "request" } },
-                        style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold,
-                    )
-                    if (p.session_id.isNotEmpty() && p.session_id != sessionId) {
-                        Text("session ${p.session_id}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Row {
-                        TextButton(onClick = { onRespond(p, "allow") }) { Text("Allow") }
-                        TextButton(onClick = { onRespond(p, "deny") }) { Text("Deny") }
+                // Memoized ordering + a stable per-request key, so answering or
+                // re-sorting one request never hands its row state to another.
+                partition.of(pend, sessionId).forEachIndexed { i, p ->
+                    key(p.id) {
+                        if (i > 0) HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                        Text(
+                            p.tool_name.ifEmpty { p.event.ifEmpty { "request" } },
+                            style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold,
+                        )
+                        if (p.session_id.isNotEmpty() && p.session_id != sessionId) {
+                            Text("session ${p.session_id}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Row {
+                            TextButton(onClick = { onRespond(p, "allow") }) { Text("Allow") }
+                            TextButton(onClick = { onRespond(p, "deny") }) { Text("Deny") }
+                        }
                     }
                 }
             }
         }
-        // Memoized: scans every loaded turn/part; the inspector recomposes on
-        // each live frame and every pending-poll tick.
-        val children = remember(turns) { collectChildSessions(turns) }
         if (children.isNotEmpty()) {
             PanelSection("Subagents") {
                 children.forEach { (label, id) -> LinkRow(label) { onOpenChild(id) } }
@@ -815,11 +842,11 @@ private fun ConversationPane(
                     isReallyAtBottom(last.offset + last.size, info.viewportEndOffset))
             }
         }
-        val lastKey = convo.turns.lastOrNull()?.let { turnKey(it) }
-        LaunchedEffect(paneKey, lastKey, convo.turns.lastOrNull()?.parts?.size) {
-            if (convo.turns.isEmpty()) return@LaunchedEffect
+        val lastKey = convo.lastUiKey
+        LaunchedEffect(paneKey, lastKey, convo.lastTurn?.parts?.size) {
+            if (convo.turnCount == 0) return@LaunchedEffect
             // Last turn's list index, offset by the "load earlier" header when shown.
-            val target = convo.turns.lastIndex + if (convo.cursor?.hasMore == true) 1 else 0
+            val target = convo.turnCount - 1 + if (convo.cursor?.hasMore == true) 1 else 0
             if (!didInitialScroll) {
                 // The seeded page must land at its newest CONTENT unconditionally —
                 // deciding via atBottom races the first non-empty layout pass.
@@ -833,9 +860,9 @@ private fun ConversationPane(
             }
         }
         val hasEarlier = convo.cursor?.hasMore == true
-        // Hoisted out of the LazyColumn builder + memoized: it scans every loaded
-        // turn, and the builder re-runs on each recomposition (every live frame).
-        val keys = remember(convo.turns) { displayKeys(convo.turns) }
+        // Row keys come straight from ConvoState's incremental UI id index —
+        // assigned once per turn, stable for the row's whole life (live→exit,
+        // prepends, truth-ups) — so nothing is rescanned per frame here.
         LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp), state = listState) {
             if (hasEarlier) {
                 item(key = "load-earlier") {
@@ -857,7 +884,7 @@ private fun ConversationPane(
                                     // row down. The key survives the prepend unchanged.
                                     val first = listState.firstVisibleItemIndex
                                     val offset = if (first >= 1) listState.firstVisibleItemScrollOffset else 0
-                                    val anchorKey = keys.getOrNull(maxOf(first, 1) - 1)
+                                    val anchorKey = convo.uiKeyAt(maxOf(first, 1) - 1)
                                     val before = listState.layoutInfo.totalItemsCount
                                     val res = onLoadEarlier()
                                     if (res != null && res.added > 0) {
@@ -883,9 +910,18 @@ private fun ConversationPane(
             // Row keys carry the pane namespace: two nodes can hold the same
             // session id with identical turn uuids (mirrored data dirs), and
             // un-namespaced keys would hand node A's row state (tool-card
-            // expansion) to node B's rows on a Quick Switcher jump.
-            itemsIndexed(convo.turns, key = { i, _ -> "$paneKey|${keys[i]}" }) { _, turn ->
+            // expansion) to node B's rows on a Quick Switcher jump. Settled
+            // turns and the open turn are separate item blocks over the SAME
+            // key space: when the open turn settles, its key simply moves from
+            // the trailing item into the history block, so the row (and its
+            // tool-card expand state) is reused, never deleted+reinserted.
+            itemsIndexed(convo.history, key = { i, _ -> "$paneKey|${convo.historyKeys[i]}" }) { _, turn ->
                 TurnView(turn, backend, onOpenChild = onOpenChild)
+            }
+            convo.open?.let { live ->
+                item(key = "$paneKey|${convo.openKey}") {
+                    TurnView(live, backend, onOpenChild = onOpenChild)
+                }
             }
         }
         convo.status?.takeIf { !readonly }?.let { ThinkingRow(it) }
