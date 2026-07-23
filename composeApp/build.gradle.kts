@@ -67,6 +67,28 @@ kotlin {
     }
 }
 
+// --- Android release signing --------------------------------------------------
+// Signing secrets never live in the repo. Locally, put them in a gitignored
+// keystore.properties at the project root (storeFile defaults to
+// composeApp/keystore.jks); in CI, release.yml materializes the keystore +
+// passwords from GitHub secrets into env. A RELEASE build MUST be signed with the
+// real release keystore: a debug-signed release has a different certificate that
+// Android refuses to upgrade over a real install, so it is never publishable.
+// When no keystore is configured the release build FAILS CLOSED (see the
+// taskGraph guard after the android block). The debug fallback is offered only
+// for a local build explicitly opted into with -PallowDebugSigningForRelease —
+// a flag CI never passes, so a missing/misconfigured secret can't silently ship
+// a debug-signed APK.
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun releaseSecret(propKey: String, envKey: String): String? =
+    keystoreProps.getProperty(propKey) ?: System.getenv(envKey)
+val releaseStoreFile = file(releaseSecret("storeFile", "KEYSTORE_FILE") ?: "keystore.jks")
+val hasReleaseKeystore = releaseStoreFile.exists()
+val allowDebugSigningForRelease = hasProperty("allowDebugSigningForRelease")
+
 android {
     namespace = "io.hero.app"
     compileSdk = 34
@@ -74,41 +96,33 @@ android {
         applicationId = "io.hero.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 17
-        versionName = "0.5.11"
+        versionCode = 18
+        versionName = "0.5.12"
     }
-    // Signing secrets never live in the repo. Locally, put them in a gitignored
-    // keystore.properties at the project root; in CI, provide them via env
-    // (release.yml materializes the keystore + passwords from GitHub secrets).
-    // When nothing is configured, release falls back to debug signing so an
-    // unconfigured checkout still builds.
-    val keystoreProps = Properties().apply {
-        val f = rootProject.file("keystore.properties")
-        if (f.exists()) f.inputStream().use { load(it) }
-    }
-    fun secret(propKey: String, envKey: String): String? =
-        keystoreProps.getProperty(propKey) ?: System.getenv(envKey)
-
     signingConfigs {
         create("release") {
-            val storePath = secret("storeFile", "KEYSTORE_FILE") ?: "keystore.jks"
-            val sf = file(storePath)
-            if (sf.exists()) {
-                storeFile = sf
-                storePassword = secret("storePassword", "KEYSTORE_PASSWORD")
-                keyAlias = secret("keyAlias", "KEY_ALIAS")
-                keyPassword = secret("keyPassword", "KEY_PASSWORD")
+            if (hasReleaseKeystore) {
+                storeFile = releaseStoreFile
+                storePassword = releaseSecret("storePassword", "KEYSTORE_PASSWORD")
+                keyAlias = releaseSecret("keyAlias", "KEY_ALIAS")
+                keyPassword = releaseSecret("keyPassword", "KEY_PASSWORD")
             }
         }
     }
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
-            val releaseSigning = signingConfigs.getByName("release")
-            signingConfig = if (releaseSigning.storeFile?.exists() == true) {
-                releaseSigning
+            // With a real keystore, sign for real. Without one, keep configuration
+            // valid (so assembleDebug and unit tests still evaluate on an
+            // unconfigured checkout) by pointing at the debug config — but the
+            // taskGraph guard below turns an *actual* release assembly into a hard
+            // failure unless -PallowDebugSigningForRelease was explicitly given.
+            signingConfig = if (hasReleaseKeystore) {
+                signingConfigs.getByName("release")
             } else {
-                logger.warn("no release keystore configured; signing the release build with the debug key")
+                if (allowDebugSigningForRelease) {
+                    logger.warn("allowDebugSigningForRelease is set — signing the RELEASE build with the DEBUG key; this artifact is NOT publishable")
+                }
                 signingConfigs.getByName("debug")
             }
         }
@@ -116,6 +130,29 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+// Fail closed: a release APK must never be debug-signed. Configuration above
+// stays valid on an unconfigured checkout (so assembleDebug and unit tests run),
+// but scheduling an actual release-packaging task without a real keystore aborts
+// the build here. A contributor who deliberately wants a local debug-signed
+// release opts in with -PallowDebugSigningForRelease; CI never passes that flag,
+// so a release job with a missing/misconfigured keystore fails instead of
+// publishing an unupgradable debug-signed APK.
+if (!hasReleaseKeystore && !allowDebugSigningForRelease) {
+    gradle.taskGraph.whenReady {
+        val releaseTask = gradle.taskGraph.allTasks.firstOrNull { t ->
+            t.project == project && (t.name == "assembleRelease" || t.name == "packageRelease")
+        }
+        if (releaseTask != null) {
+            throw GradleException(
+                "Refusing to build ${releaseTask.path}: no release keystore is configured, so the APK " +
+                    "would be signed with the debug key and could never upgrade a real release install. " +
+                    "Configure keystore.properties or the KEYSTORE_* env (see .github/workflows/release.yml), " +
+                    "or pass -PallowDebugSigningForRelease to build a local debug-signed APK on purpose.",
+            )
+        }
     }
 }
 

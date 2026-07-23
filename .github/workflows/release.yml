@@ -26,8 +26,10 @@ jobs:
       # Signing secrets come from repo secrets, never the tree. Set:
       #   KEYSTORE_BASE64  = base64 of the release keystore (.jks)
       #   KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
-      # Without them the build falls back to debug signing (unsuitable for a
-      # public release, but keeps the workflow from failing on a fork).
+      # Without them assembleRelease FAILS CLOSED (the Gradle config refuses to
+      # debug-sign a release), so a secret-less or misconfigured run can never
+      # publish an unupgradable debug-signed APK. A fork that just wants a local
+      # build should use assembleDebug (or -PallowDebugSigningForRelease).
       - name: Materialize keystore
         if: ${{ env.KEYSTORE_BASE64 != '' }}
         env:
@@ -42,6 +44,23 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :composeApp:assembleRelease --no-daemon
+      # Artifact-level gate (defense in depth on top of the Gradle fail-closed
+      # signing config): prove the built APK is release-signed, not debug-signed.
+      # A debug-signed APK carries the well-known Android debug certificate DN;
+      # its different certificate means users can't upgrade over a real install,
+      # so refuse to publish it.
+      - name: Verify the APK is release-signed (not debug)
+        run: |
+          apk=composeApp/build/outputs/apk/release/composeApp-release.apk
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          if [ -z "$apksigner" ]; then echo "::error::apksigner not found in Android SDK"; exit 1; fi
+          echo "using $apksigner"
+          certs=$("$apksigner" verify --print-certs "$apk")
+          echo "$certs"
+          if printf '%s' "$certs" | grep -q "CN=Android Debug"; then
+            echo "::error::release APK is debug-signed — refusing to publish"
+            exit 1
+          fi
       - name: Name the artifact
         run: cp composeApp/build/outputs/apk/release/composeApp-release.apk hero-app.apk
       - uses: actions/upload-artifact@v4
