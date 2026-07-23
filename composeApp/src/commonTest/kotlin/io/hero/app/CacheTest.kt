@@ -139,6 +139,55 @@ class CacheTest {
         assertEquals(1000, FleetCache.auditOf(1000)?.size)
     }
 
+    // Cold start / re-login: bindIdentity draws the generation boundary and
+    // returns the bound generation. Anything stamped with a pre-bind generation
+    // (an effect that raced the bind) is cleared at the boundary and refused
+    // afterwards; only writes carrying the bound generation land. Same-identity
+    // rebinding is generation-stable, so a warm remount keeps the set.
+    @Test
+    fun bindIdentityDrawsTheStartupGenerationBoundary() {
+        FleetCache.clear()
+        val preBind = FleetCache.generation
+        FleetCache.putSessions("n1", preBind, listOf(session("boot")))
+        val bound = FleetCache.bindIdentity("https://cp", "alice")
+        assertTrue(bound != preBind)
+        assertEquals(bound, FleetCache.generation)
+        assertNull(FleetCache.sessionsOf("n1")) // cleared at the boundary
+        FleetCache.putSessions("n1", preBind, listOf(session("late"))) // pre-bind straggler refused
+        assertNull(FleetCache.sessionsOf("n1"))
+        FleetCache.putSessions("n1", bound, listOf(session("ok")))
+        assertNotNull(FleetCache.sessionsOf("n1"))
+        assertEquals(bound, FleetCache.bindIdentity("https://cp", "alice"))
+        assertNotNull(FleetCache.sessionsOf("n1"))
+    }
+
+    // The byte budget is a HARD cap: a single entry beyond it is refused at the
+    // door (no "only one entry left" exemption) — and the node's previous,
+    // now-stale entry is dropped rather than left masquerading as current.
+    @Test
+    fun oversizeSessionEntryIsNeverRetained() {
+        FleetCache.clear()
+        val gen = FleetCache.generation
+        FleetCache.putSessions("n1", gen, listOf(session("small")))
+        assertNotNull(FleetCache.sessionsOf("n1"))
+        val over = "x".repeat(5 * 1024 * 1024) // one entry > the whole 4 MiB budget
+        FleetCache.putSessions("n1", gen, listOf(session("big", cwd = over)))
+        assertNull(FleetCache.sessionsOf("n1"))
+        // The cache keeps admitting normal entries afterwards.
+        FleetCache.putSessions("n2", gen, listOf(session("ok")))
+        assertNotNull(FleetCache.sessionsOf("n2"))
+    }
+
+    @Test
+    fun oversizeHarnessEntryIsNeverRetained() {
+        FleetCache.clear()
+        val gen = FleetCache.generation
+        FleetCache.putHarness("n1", gen, HarnessState(pull_url = "x".repeat(3 * 1024 * 1024))) // > 2 MiB cap
+        assertNull(FleetCache.harnessOf("n1"))
+        FleetCache.putHarness("n1", gen, harness())
+        assertNotNull(FleetCache.harnessOf("n1"))
+    }
+
     // Harness invalidation after a mutation (Save + apply / Install) drops just
     // that node's entry so the next picker open re-reads it.
     @Test

@@ -3,6 +3,11 @@ package io.hero.app
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 // FleetCache is the process-wide, identity-scoped store behind the cache-first
 // UX: management screens and the session list render their last-known data
@@ -25,7 +30,12 @@ import androidx.compose.runtime.mutableStateOf
 //    install/model state. The per-node session and harness caches are bounded by
 //    a small weighted LRU (entry count + estimated bytes), so retained heap
 //    tracks the current + recently-viewed working set, not every node ever
-//    visited.
+//    visited. The byte budget is a HARD cap: a single oversize entry is refused
+//    at the door instead of being exempted as "the freshest one".
+//  - Shared fetches. Cache-miss (and management-refresh) downloads go through a
+//    per-key single-flight owner, so concurrent callers share one in-flight
+//    request instead of racing duplicate downloads whose completions could
+//    apply out of order.
 //  - Freshness. Parameterised data (audit) is keyed by its request parameter, so
 //    a fetch at one limit is never shown as the result for another.
 //
@@ -78,14 +88,22 @@ object FleetCache {
      * bumps the generation and drops every entry, so identity replacement
      * invalidates the cache without a scattered clear(). Idempotent for the same
      * identity, so the warm cache-first set survives a same-identity remount.
+     *
+     * Returns the bound generation, and is called SYNCHRONOUSLY from MainScreen's
+     * composition (not from an effect): the cold-start / re-login generation
+     * boundary must exist before any child composes or any launched effect
+     * captures [generation] — an effect-phase bind let the first frame read the
+     * previous identity's snapshot, and let a poll capture the pre-bind
+     * generation whose every put would then be silently refused.
      */
-    fun bindIdentity(server: String, user: String) {
+    fun bindIdentity(server: String, user: String): Int {
         val id = "$server|$user"
         if (id != identity) {
             identity = id
             generation++
             evictAll()
         }
+        return generation
     }
 
     /**
@@ -155,7 +173,12 @@ object FleetCache {
 
     fun putSessions(node: String, gen: Int, list: List<Session>) {
         if (gen != generation) return
-        sessionEntries[node] = Entry(list, gen, estimateSessions(list), ++tick)
+        val bytes = estimateSessions(list)
+        // HARD per-entry cap: an anomalous oversize response is never retained
+        // (the caller still renders its own local copy) — and the node's previous,
+        // now-stale entry is dropped rather than left masquerading as current.
+        if (bytes > MAX_SESSION_BYTES) { sessionEntries.remove(node); return }
+        sessionEntries[node] = Entry(list, gen, bytes, ++tick)
         enforce(sessionEntries, MAX_SESSION_NODES, MAX_SESSION_BYTES)
     }
 
@@ -166,7 +189,10 @@ object FleetCache {
 
     fun putHarness(node: String, gen: Int, st: HarnessState) {
         if (gen != generation) return
-        harnessEntries[node] = Entry(st, gen, estimateHarness(st), ++tick)
+        val bytes = estimateHarness(st)
+        // Same hard per-entry cap as sessions: oversize is refused, not retained.
+        if (bytes > MAX_HARNESS_BYTES) { harnessEntries.remove(node); return }
+        harnessEntries[node] = Entry(st, gen, bytes, ++tick)
         enforce(harnessEntries, MAX_HARNESS_NODES, MAX_HARNESS_BYTES)
     }
 
@@ -174,6 +200,44 @@ object FleetCache {
      *  (Save + apply / Install) so the pickers re-read fresh state. */
     fun invalidateHarness(node: String) {
         harnessEntries.remove(node)
+    }
+
+    // ---- shared request owner (single-flight per key) ----
+
+    // Concurrent same-key cache misses used to each download the full DTO
+    // (conversation picker, Start dialog and management status could all fetch
+    // one node's harness at once). All fetches for a key now go through ONE
+    // in-flight request whose result every concurrent caller shares; the flight
+    // itself stamps and publishes into the cache exactly once. Because at most
+    // one request per key is ever in flight, same-generation completions can no
+    // longer complete out of order and resurrect an older snapshot.
+    private val flights = SingleFlight()
+
+    /**
+     * fetchSessions is the shared session fetch for one node: cache-first unless
+     * [refresh], and single-flighted across every caller (list poll, Start
+     * dialog cwd derivation, quick switcher). Cancellation of one caller only
+     * detaches that caller — a joiner takes the flight over rather than losing it.
+     */
+    suspend fun fetchSessions(api: Api, node: String, refresh: Boolean = false): Result<List<Session>> {
+        if (!refresh) sessionsOf(node)?.let { return Result.success(it) }
+        return flights.run("s:$node") {
+            val gen = generation
+            api.sessions(node).also { putSessions(node, gen, it) }
+        }
+    }
+
+    /**
+     * fetchHarness is the shared harness fetch for one node: cache-first unless
+     * [refresh] (management reads pass refresh = true for a fresh DTO but still
+     * share their in-flight request with any concurrent picker/dialog miss).
+     */
+    suspend fun fetchHarness(api: Api, node: String, refresh: Boolean = false): Result<HarnessState> {
+        if (!refresh) harnessOf(node)?.let { return Result.success(it) }
+        return flights.run("h:$node") {
+            val gen = generation
+            api.harness(node).also { putHarness(node, gen, it) }
+        }
     }
 
     // ---- audit (keyed by fetch limit) ----
@@ -188,8 +252,10 @@ object FleetCache {
 
     private fun <T> enforce(map: MutableMap<String, Entry<T>>, maxCount: Int, maxBytes: Int) {
         while (map.size > maxCount) evictLru(map)
-        // Keep at least the freshest entry even if it alone exceeds the budget.
-        while (map.size > 1 && map.values.sumOf { it.bytes.toLong() } > maxBytes) evictLru(map)
+        // The byte budget is a HARD total cap — no "only one entry left" waiver.
+        // Every admitted entry is individually <= maxBytes (the putters refuse
+        // oversize ones), so this always terminates with the freshest entry kept.
+        while (map.isNotEmpty() && map.values.sumOf { it.bytes.toLong() } > maxBytes) evictLru(map)
     }
 
     private fun <T> evictLru(map: MutableMap<String, Entry<T>>) {
@@ -216,5 +282,59 @@ object FleetCache {
             for (e in c.effort_levels) n += 8 + e.length
         }
         return n
+    }
+}
+
+/**
+ * SingleFlight collapses concurrent same-key work into ONE in-flight execution
+ * whose [Result] every concurrent caller shares — success AND failure (a failed
+ * flight is delivered to everyone who joined it; the NEXT call re-executes).
+ *
+ * Cancellation is per caller, never per flight: a joiner cancelling only
+ * cancels its own await, and an OWNER cancelling publishes a takeover marker so
+ * an awake joiner re-runs the work under its own ownership instead of hanging
+ * on a dead flight or inheriting someone else's CancellationException.
+ */
+internal class SingleFlight {
+    private val lock = Mutex()
+    private val flights = HashMap<String, CompletableDeferred<Any?>>()
+
+    /** executions counts how many times a block ACTUALLY ran — the regression
+     *  counter behind "N concurrent callers, one download". */
+    var executions = 0
+        private set
+
+    private object OwnerCancelled
+
+    suspend fun <T> run(key: String, block: suspend () -> T): Result<T> {
+        while (true) {
+            var mine: CompletableDeferred<Any?>? = null
+            val flight = lock.withLock {
+                flights[key] ?: CompletableDeferred<Any?>().also { mine = it; flights[key] = it }
+            }
+            if (flight !== mine) {
+                // Joiner: share the in-flight result. await is cancellable by THIS
+                // caller only; an owner that got cancelled publishes the takeover
+                // marker and the loop re-runs the work as the new owner.
+                val out = flight.await()
+                if (out !== OwnerCancelled) {
+                    @Suppress("UNCHECKED_CAST")
+                    return out as Result<T>
+                }
+                continue
+            }
+            // Owner: run the block, then ALWAYS clear the slot and complete the
+            // flight — cancellation included (NonCancellable: a plain suspend lock
+            // in a cancelled coroutine would throw and strand every joiner).
+            var res: Result<T>? = null
+            try {
+                executions++
+                res = runCatchingCancellable { block() }
+            } finally {
+                withContext(NonCancellable) { lock.withLock { flights.remove(key) } }
+                flight.complete(res ?: OwnerCancelled)
+            }
+            return res!!
+        }
     }
 }

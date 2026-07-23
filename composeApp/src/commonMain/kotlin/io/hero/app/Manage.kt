@@ -485,10 +485,11 @@ private fun NodeInspector(
     var harness by remember(n.node_id) { mutableStateOf<HarnessState?>(null) }
     LaunchedEffect(n.node_id, n.connected) {
         if (n.connected && n.scope == "admin") {
-            val gen = FleetCache.generation
-            // A management-fresh read backfills the shared cache the pickers use.
-            runCatchingCancellable { api.harness(n.node_id) }
-                .onSuccess { harness = it; FleetCache.putHarness(n.node_id, gen, it) }
+            // A management-fresh read (refresh = true skips the warm cache) that
+            // still SHARES its in-flight request with any concurrent picker or
+            // dialog fetch for this node, and backfills the shared cache once.
+            FleetCache.fetchHarness(api, n.node_id, refresh = true)
+                .onSuccess { harness = it }
                 .onFailure { status = it.message ?: "harness load failed" }
         }
     }
@@ -589,9 +590,10 @@ private fun HarnessConfigPanel(api: Api, nodeId: String, backend: String, onBack
     var status by remember(nodeId, backend) { mutableStateOf<String?>(null) }
     var reload by remember(nodeId, backend) { mutableStateOf(0) }
     LaunchedEffect(nodeId, backend, reload) {
-        val gen = FleetCache.generation
-        runCatchingCancellable { api.harness(nodeId) }
-            .onSuccess { st = it; FleetCache.putHarness(nodeId, gen, it) }
+        // Fresh on entry/reload, but single-flighted: a concurrent inspector or
+        // picker fetch for the same node shares this request.
+        FleetCache.fetchHarness(api, nodeId, refresh = true)
+            .onSuccess { st = it }
             .onFailure { status = it.message ?: "harness load failed" }
     }
     Column(
@@ -1431,11 +1433,12 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
     LaunchedEffect(node, catalogReload) {
         catalogLoaded = false
         catalogError = null
-        val gen = FleetCache.generation
-        val hs = FleetCache.harnessOf(node)
-            ?: runCatchingCancellable { api.harness(node) }
-                .onFailure { catalogError = it.message ?: "couldn't load the harness catalog" }
-                .getOrNull()?.also { FleetCache.putHarness(node, gen, it) }
+        // Cache-first with a single-flighted miss: a dialog opened while the
+        // conversation picker or a management read is already downloading this
+        // node's harness joins that request instead of issuing a duplicate.
+        val hs = FleetCache.fetchHarness(api, node)
+            .onFailure { catalogError = it.message ?: "couldn't load the harness catalog" }
+            .getOrNull()
         // Only enabled harnesses are offerable — a disabled backend in the DTO is
         // management surface (install/enable it in Nodes), not a launch target.
         val bs = hs?.backends.orEmpty().filter { it.enabled }
@@ -1446,10 +1449,9 @@ internal fun StartSessionDialog(api: Api, node: String, onDismiss: () -> Unit, o
         catalogLoaded = hs != null
         // Recent working directories from this node's existing sessions — a derived
         // pick-list, not a filesystem browse (HERO never browses the machine). Free
-        // text still works for a brand-new path. A cold fetch is written back to
-        // the shared cache so it isn't re-downloaded by SessionsScreen's own poll.
-        val sess = FleetCache.sessionsOf(node)
-            ?: (runCatchingCancellable { api.sessions(node) }.getOrNull()?.also { FleetCache.putSessions(node, gen, it) }.orEmpty())
+        // text still works for a brand-new path. A cold fetch is shared with (and
+        // written back for) SessionsScreen's own poll via the single-flight owner.
+        val sess = FleetCache.fetchSessions(api, node).getOrNull().orEmpty()
         cwds = sess.map { it.cwd }.filter { it.isNotBlank() }.distinct().sorted()
     }
     val models = modelsByBackend[backend].orEmpty()

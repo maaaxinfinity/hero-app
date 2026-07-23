@@ -285,12 +285,12 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
         catModels = emptyList(); catEffortLevels = emptyList()
         val n = sel.node
         if (n != null && backend.isNotEmpty()) {
-            val gen = FleetCache.generation
-            // Cache-first so opening a session is instant. The cache is refilled
-            // by the Nodes inspector and invalidated on Save+apply/Install; a hit
-            // here deliberately skips the heavy status RPC.
-            val hs = FleetCache.harnessOf(n)
-                ?: runCatchingCancellable { api.harness(n) }.getOrNull()?.also { FleetCache.putHarness(n, gen, it) }
+            // Cache-first so opening a session is instant (a hit deliberately
+            // skips the heavy status RPC); a miss goes through the cache's shared
+            // single-flight fetch, so a picker opened while the Start dialog or a
+            // management read is already downloading this node's harness JOINS
+            // that request instead of issuing a duplicate.
+            val hs = FleetCache.fetchHarness(api, n).getOrNull()
             hs?.backends?.firstOrNull { it.backend == backend }?.catalog?.let { c ->
                 catModels = c.models.filter { !it.hidden }
                 catEffortLevels = c.effort_levels

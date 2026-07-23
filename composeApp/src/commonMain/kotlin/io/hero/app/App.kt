@@ -449,8 +449,17 @@ private fun MainScreen(
     // which clears the saved server, can't spuriously reset it); a server switch
     // or re-login remounts MainScreen and re-binds, invalidating the cache by
     // generation instead of relying on a clear() being threaded everywhere.
+    //
+    // Bound SYNCHRONOUSLY in composition (remember, not LaunchedEffect): the
+    // identity/generation boundary must exist BEFORE any child composes or any
+    // effect captures FleetCache.generation. The old effect-phase bind let the
+    // whole first frame render the previous identity's snapshot, and let any
+    // poll that launched first capture the pre-bind generation — after which
+    // every one of its puts was silently refused for the rest of its effect
+    // lifetime. bindIdentity is idempotent for the same identity, so a retried
+    // or discarded composition at worst re-clears an already-cleared cache.
     val cacheServer = remember { settings.getString(Keys.ServerUrl).orEmpty() }
-    LaunchedEffect(cacheServer, me.user) { FleetCache.bindIdentity(cacheServer, me.user) }
+    remember(cacheServer, me.user) { FleetCache.bindIdentity(cacheServer, me.user) }
     // Register for remote push once per app open (Android via UnifiedPush, so a
     // permission prompt reaches the device even when the app is closed). A no-op
     // where unsupported (desktop) or when no distributor is installed.
