@@ -67,6 +67,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -1290,8 +1291,39 @@ private fun LimitPicker(limit: Int, onLimit: (Int) -> Unit) {
 
 // ============================================================================
 // Control plane (admin) — the HERO CONTROL-PLANE binary. Nodes/harnesses are
-// managed elsewhere; this updates the control plane itself (manual + auto).
+// managed elsewhere; this updates the control plane itself (manual + policy).
+// Speaks BOTH server contracts: split-policy (independent control/node bits +
+// generation CAS + operation-id update receipts) and legacy (one auto_update
+// bit), discriminated by HeroFleet.hasSplitPolicy. No token is requested or
+// shown — the split-policy status carries none, and the legacy status's token
+// field was never decoded.
 // ============================================================================
+
+/** PendingControlUpdate is the receipt of one launched control self-update:
+ *  the operation id the in-progress state is presented under (the server's
+ *  persistent id when it returned one, else the X-Hero-Op the client sent) and
+ *  the target the restart converges on. */
+internal data class PendingControlUpdate(
+    val opId: String,
+    val targetGeneration: Long?,
+    val targetVersion: String,
+)
+
+/** controlUpdateConverged: does [f] (a fresh fleetHero read) show the CP
+ *  running [p]'s target? Decided on the generation when the receipt carried
+ *  one (the release identity — a same-version rebuild is a different
+ *  generation); a legacy receipt falls back to the version string. Pure. */
+internal fun controlUpdateConverged(p: PendingControlUpdate, f: HeroFleet): Boolean =
+    if (p.targetGeneration != null) f.running_generation == p.targetGeneration
+    else f.running.isNotEmpty() && f.running == p.targetVersion
+
+/** policyErrorText renders one policy-PUT failure. The 409 posture: the caller
+ *  refreshes the view and the user re-decides against it — never a blind
+ *  resubmit of the losing toggle. */
+private fun policyErrorText(scopeName: String, t: Throwable): String =
+    if (isStaleConflict(t)) "$scopeName policy changed on the server — view refreshed, please retry."
+    else t.message ?: "policy change failed"
+
 @Composable
 internal fun ControlScreen(api: Api) {
     val scope = rememberCoroutineScope()
@@ -1299,15 +1331,41 @@ internal fun ControlScreen(api: Api) {
     var loading by remember { mutableStateOf(true) }
     var reload by remember { mutableStateOf(0) }
     var status by remember { mutableStateOf<String?>(null) }
-    // One owner for the control-plane surface: Update and the auto-update
-    // toggle are single-flighted together (each is a real control-plane
-    // mutation), refetching only after a SUCCESSFUL mutation.
+    // The launched self-update's receipt, presented as the in-progress state
+    // (op id + target) until a refetch shows the CP running the target.
+    var pendingUpdate by remember { mutableStateOf<PendingControlUpdate?>(null) }
+    // One owner for the control-plane surface: Update and the policy toggles
+    // are single-flighted together (each is a real control-plane mutation),
+    // refetching only after a SUCCESSFUL mutation.
     val owner = remember { MutationOwner() }
 
     LaunchedEffect(reload) {
         loading = true
-        runCatchingCancellable { fleet = api.fleetHero() }.onFailure { status = it.message }
+        runCatchingCancellable { api.fleetHero() }
+            .onSuccess { f ->
+                fleet = f
+                // The launched update converged: the CP came back on the target.
+                pendingUpdate?.let { if (controlUpdateConverged(it, f)) pendingUpdate = null }
+            }
+            .onFailure {
+                // While the CP restarts for OUR update a refused read is the
+                // expected window, not an alarm — the poll below keeps asking.
+                if (pendingUpdate == null) status = it.message
+            }
         loading = false
+    }
+    // The restart window is polled — bound to this screen's composition, so
+    // leaving Control cancels it (no timer seizing a later view) — and BOUNDED:
+    // after ~2 minutes without convergence the claim is handed back to the user
+    // instead of presenting "in progress" forever for an update that may have
+    // died. The owner never invents a terminal state for it.
+    LaunchedEffect(pendingUpdate) {
+        val p = pendingUpdate ?: return@LaunchedEffect
+        repeat(30) { delay(4_000); reload++ }
+        if (pendingUpdate == p) {
+            pendingUpdate = null
+            status = "Update (op ${p.opId}) still unconfirmed — refresh to re-check, then retry if needed."
+        }
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -1322,11 +1380,13 @@ internal fun ControlScreen(api: Api) {
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             status?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             Spacer(Modifier.height(10.dp))
-            if (loading) PaneLoader()
+            // The stale card keeps rendering through background refetches (the
+            // in-flight-update poll would otherwise flash the loader every 4s).
+            if (fleet == null) { if (loading) PaneLoader() else HintText("No update info.") }
             else fleet?.let { f ->
                 val running = f.running.ifEmpty { "unknown" }
                 val target = f.version
-                val upToDate = f.defined && target == running
+                val upToDate = f.upToDate
                 OutlinedCard(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(14.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1338,38 +1398,91 @@ internal fun ControlScreen(api: Api) {
                         }
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            if (f.defined) "Published target: $target" else "Nothing published yet — run `hero control-publish`.",
+                            if (f.defined) "Published target: $target" + (f.generation?.let { " (generation $it)" } ?: "")
+                            else "Nothing published yet — run `hero control-publish`.",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Spacer(Modifier.height(12.dp))
+                        pendingUpdate?.let { p ->
+                            Text(
+                                "Update in progress (op ${p.opId}) — waiting for the control plane to come back on the target release…",
+                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+                            )
+                            Spacer(Modifier.height(8.dp))
+                        }
                         OutlinedButton(
-                            enabled = f.defined && !upToDate && !owner.busy,
+                            enabled = f.defined && !upToDate && !owner.busy && pendingUpdate == null,
                             onClick = {
                                 scope.launchManaged(
-                                    owner, "self-update:${f.version}",
-                                    action = { op -> api.controlSelfUpdate(operationId = op.id) },
+                                    owner, "self-update:${f.generation ?: f.version}",
+                                    // The receipt is judged under the op we sent: keep its id
+                                    // so a legacy server's bare message still has an identity.
+                                    action = { op -> op.id to api.controlSelfUpdate(operationId = op.id) },
                                     onFailure = { status = it.message ?: "update failed" },
-                                    // it drains + restarts; the success-only
-                                    // refetch shows the new running version.
-                                    onSuccess = { status = it; reload++ },
+                                    // It drains + restarts; present the in-progress state under
+                                    // the server's operation id (ours when it returned none)
+                                    // until a refetch shows the target running.
+                                    onSuccess = { (sentOp, r) ->
+                                        pendingUpdate = PendingControlUpdate(r.operation_id ?: sentOp, r.generation, f.version)
+                                        status = null
+                                        reload++
+                                    },
                                 )
                             },
-                        ) { Text(if (owner.busy) "Updating…" else "Update control plane") }
+                        ) { Text(if (pendingUpdate != null) "Updating…" else "Update control plane") }
                         Spacer(Modifier.height(12.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(
-                                checked = f.auto_update,
+                        if (f.hasSplitPolicy) {
+                            // Split-policy server: two INDEPENDENT switches — one governs
+                            // THIS control plane's binary, the other the node fleet;
+                            // flipping one never moves the other. Each PUT carries the
+                            // generation this view was read at; a 409 (a racing toggle or
+                            // a republish won) refreshes the view and asks for an explicit
+                            // re-decision instead of silently clobbering the winner.
+                            PolicyToggle(
+                                label = "Auto-update the control plane when a new version is published",
+                                detail = "Only this control plane's own binary restarts; nodes are unaffected.",
+                                checked = f.control_auto_update == true,
                                 enabled = f.defined && !owner.busy,
-                                onCheckedChange = { want ->
-                                    scope.launchManaged(
-                                        owner, "auto-update:$want",
-                                        action = { op -> api.setFleetHeroAuto(want, operationId = op.id) },
-                                        onFailure = { status = it.message ?: "auto-update change failed" },
-                                        onSuccess = { reload++ },
-                                    )
-                                },
-                            )
-                            Text("Auto-update the control plane when a new version is published", style = MaterialTheme.typography.bodyMedium)
+                            ) { want ->
+                                scope.launchManaged(
+                                    owner, "control-auto:$want@${f.generation}",
+                                    action = { op -> api.setFleetHeroPolicy(control = want, expectedGeneration = f.generation, operationId = op.id) },
+                                    onFailure = { status = policyErrorText("Control-plane", it); if (isStaleConflict(it)) reload++ },
+                                    onSuccess = { status = null; reload++ },
+                                )
+                            }
+                            Spacer(Modifier.height(6.dp))
+                            PolicyToggle(
+                                label = "Auto-update the node fleet when a new version is published",
+                                detail = "Nodes with a fleet feed self-update on their next poll; the control plane is unaffected.",
+                                checked = f.node_auto_update == true,
+                                enabled = f.defined && !owner.busy,
+                            ) { want ->
+                                scope.launchManaged(
+                                    owner, "node-auto:$want@${f.generation}",
+                                    action = { op -> api.setFleetHeroPolicy(node = want, expectedGeneration = f.generation, operationId = op.id) },
+                                    onFailure = { status = policyErrorText("Node-fleet", it); if (isStaleConflict(it)) reload++ },
+                                    onSuccess = { status = null; reload++ },
+                                )
+                            }
+                        } else {
+                            // Legacy server (pre-split): ONE signed bit drives the control
+                            // plane AND every eligible node — degrade to that single switch
+                            // rather than promising an independence the server can't keep.
+                            // A payload with neither shape renders it read-only.
+                            PolicyToggle(
+                                label = "Auto-update when a new version is published",
+                                detail = "This server predates split policies: one switch drives the control plane AND every eligible node.",
+                                checked = f.auto_update == true,
+                                enabled = f.defined && f.auto_update != null && !owner.busy,
+                            ) { want ->
+                                scope.launchManaged(
+                                    owner, "auto-update:$want",
+                                    action = { op -> api.setFleetHeroAutoLegacy(want, operationId = op.id) },
+                                    onFailure = { status = it.message ?: "auto-update change failed" },
+                                    onSuccess = { status = null; reload++ },
+                                )
+                            }
                         }
                         if (f.platforms.isNotEmpty()) {
                             Spacer(Modifier.height(10.dp))
@@ -1387,7 +1500,43 @@ internal fun ControlScreen(api: Api) {
                         }
                     }
                 }
-            } ?: HintText("No update info.")
+            }
+        }
+    }
+}
+
+/** PolicyToggle is one rollout-policy switch under ConfirmButton's
+ *  two-deliberate-clicks contract: the first click ARMS the opposite value —
+ *  the box previews it and an error-colored Confirm appears — and only Confirm
+ *  commits; clicking the box again, 3s untouched, or the server state changing
+ *  under it (a refresh) disarms. [checked] is always the SERVER's committed
+ *  bit: the preview never pretends the change happened, and in-flight
+ *  disabling ([enabled]=false while the surface's owner is busy) blocks both
+ *  arm and commit. */
+@Composable
+private fun PolicyToggle(
+    label: String,
+    detail: String,
+    checked: Boolean,
+    enabled: Boolean,
+    onCommit: (Boolean) -> Unit,
+) {
+    var armed by remember(checked) { mutableStateOf(false) }
+    LaunchedEffect(armed) { if (armed) { delay(3000); armed = false } }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(
+            checked = if (armed) !checked else checked,
+            enabled = enabled,
+            onCheckedChange = { armed = !armed },
+        )
+        Column(Modifier.weight(1f)) {
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (armed) {
+            TextButton(enabled = enabled, onClick = { armed = false; onCommit(!checked) }) {
+                Text("Confirm — turn ${if (checked) "off" else "on"}", color = MaterialTheme.colorScheme.error)
+            }
         }
     }
 }

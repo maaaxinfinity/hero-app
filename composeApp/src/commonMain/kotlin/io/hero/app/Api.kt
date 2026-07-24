@@ -399,17 +399,42 @@ class Api(
         client.get("$baseUrl/api/fleet/hero").orThrow("fleet hero").body()
     }
 
-    /** setFleetHeroAuto toggles fleet-wide auto-update (re-signs the manifest); returns the new state. */
-    suspend fun setFleetHeroAuto(auto: Boolean, operationId: String = newOperationId()): Boolean =
+    /** setFleetHeroPolicy flips the split rollout-policy bits (the server
+     *  re-signs the manifest in place): a null bit is omitted from the wire and
+     *  leaves that policy unchanged, so the control and node toggles never move
+     *  each other. [expectedGeneration] is the CAS base — a stale view is
+     *  refused with 409 ([isStaleConflict]) and must reload-then-redecide
+     *  instead of silently clobbering the toggle that won the race. */
+    suspend fun setFleetHeroPolicy(
+        control: Boolean? = null,
+        node: Boolean? = null,
+        expectedGeneration: Long? = null,
+        operationId: String = newOperationId(),
+    ): AutoUpdateResp =
         client.put("$baseUrl/api/fleet/hero") {
             operation(operationId)
-            contentType(ContentType.Application.Json); setBody(AutoUpdateReq(auto))
-        }.orThrow("set auto-update", operationId).body<AutoUpdateResp>().auto_update
+            contentType(ContentType.Application.Json)
+            setBody(AutoUpdateReq(control, node, expectedGeneration))
+        }.orThrow("set update policy", operationId).body()
 
-    /** controlSelfUpdate updates the control plane to the published target; it drains + restarts. */
-    suspend fun controlSelfUpdate(operationId: String = newOperationId()): String =
+    /** setFleetHeroAutoLegacy drives a legacy (pre-split) server's single
+     *  auto_update bit — the degraded mode ControlScreen falls back to when
+     *  fleetHero() carried no split-policy fields. Never sent to a split-policy
+     *  server (it would 400 on the missing per-scope bits). */
+    suspend fun setFleetHeroAutoLegacy(auto: Boolean, operationId: String = newOperationId()): AutoUpdateResp =
+        client.put("$baseUrl/api/fleet/hero") {
+            operation(operationId)
+            contentType(ContentType.Application.Json); setBody(LegacyAutoUpdateReq(auto))
+        }.orThrow("set auto-update", operationId).body()
+
+    /** controlSelfUpdate updates the control plane to the published target; it
+     *  drains + restarts. The receipt carries the server's persistent operation
+     *  id + target generation on a split-policy server — the identity the
+     *  in-progress presentation converges on — and only message (nulls) on a
+     *  legacy one. */
+    suspend fun controlSelfUpdate(operationId: String = newOperationId()): ControlUpdateResp =
         client.post("$baseUrl/api/control/self-update") { operation(operationId) }
-            .orThrow("control self-update", operationId).body<MessageResult>().message
+            .orThrow("control self-update", operationId).body()
 
     /** events streams the node's raw+grouped SSE feed (all sessions). */
     fun events(node: String): Flow<Event> = sseFrames("$baseUrl/api/nodes/${node.enc()}/events")
@@ -598,6 +623,15 @@ internal fun isTransientReadError(t: Throwable): Boolean = when (t) {
     is SerializationException -> false
     else -> true
 }
+
+/** isStaleConflict classifies one mutation failure as the server's
+ *  optimistic-concurrency refusal (HTTP 409 on the policy PUT: the
+ *  expected_generation no longer matches what is published — a racing toggle
+ *  or a republish won). The fix is reload-then-redecide against the fresh
+ *  view; a blind resubmit would do exactly the silent clobbering the CAS
+ *  exists to prevent. Pure; the discriminator callers branch on. */
+internal fun isStaleConflict(t: Throwable): Boolean =
+    t is ApiHttpException && t.status == 409
 
 /** StreamAuthException: the live stream was refused with 401/403 — the session
  *  cookie is gone or insufficient. Permanent: reconnecting cannot fix it, the

@@ -314,21 +314,88 @@ data class PushSub(
 )
 
 // ---- control-plane self-update (the CP binary itself; nodes/harnesses are
-// managed separately). Mirrors GET/PUT /api/fleet/hero. ----
+// managed separately). Mirrors GET/PUT /api/fleet/hero across BOTH contract
+// generations: the split-policy server (independent control_auto_update /
+// node_auto_update bits + a monotonic release generation as the CAS base; the
+// status deliberately carries NO token/pull_url — the Updates surface never
+// needs a pull credential) and the legacy server (one auto_update bit, which
+// also shipped the fleet token; ignoreUnknownKeys drops it on the floor).
+// Every discriminating field is nullable: null = the server never sent it,
+// which is how the UI picks split-policy mode vs the degraded legacy mode. ----
 @Serializable
 data class HeroFleet(
     val version: String = "",                        // published target version
     val running: String = "",                        // the control plane's own running version
-    val auto_update: Boolean = false,
     val defined: Boolean = false,                    // something has been published
     val platforms: Map<String, HeroBinEntry> = emptyMap(),
-)
+    // Split-policy contract: two independently signed rollout bits — one
+    // governs only the control plane's own binary, the other only the node
+    // fleet — plus the release generation (the identity "up to date" is
+    // decided on, and the base the policy PUT's expected_generation CAS uses).
+    val control_auto_update: Boolean? = null,
+    val node_auto_update: Boolean? = null,
+    val generation: Long? = null,                    // published release generation
+    val running_generation: Long? = null,            // the generation this CP runs
+    val published_at: Long? = null,                  // unix seconds; informational
+    // Legacy contract: the single bit that drove control plane AND node fleet.
+    val auto_update: Boolean? = null,
+) {
+    /** hasSplitPolicy: the server speaks the split-policy contract (it sent the
+     *  per-scope bits). A legacy server sent only auto_update → false. */
+    val hasSplitPolicy: Boolean get() = control_auto_update != null || node_auto_update != null
+
+    /** upToDate is decided on the release GENERATION when the server publishes
+     *  one — a rebuild with the same version string is a distinct generation,
+     *  so the version string alone can claim "up to date" falsely — falling
+     *  back to the version comparison for a legacy server. */
+    val upToDate: Boolean get() = when {
+        !defined -> false
+        generation != null -> generation > 0 && generation == running_generation
+        else -> version == running
+    }
+}
 
 @Serializable
 data class HeroBinEntry(val sha256: String = "", val size: Long = 0)
 
+// AutoUpdateReq is the split-policy PUT body: each policy bit is optional —
+// null (omitted on the wire; encodeDefaults is off) leaves that policy
+// unchanged, so flipping one scope never writes the other. expected_generation
+// is the optimistic-concurrency guard: when set, the toggle applies only while
+// it still matches the published generation; a stale view gets 409
+// (isStaleConflict) and must reload-then-redecide, never blind-resubmit.
 @Serializable
-data class AutoUpdateReq(val auto_update: Boolean)
+data class AutoUpdateReq(
+    val control_auto_update: Boolean? = null,
+    val node_auto_update: Boolean? = null,
+    val expected_generation: Long? = null,
+)
 
+/** LegacyAutoUpdateReq drives a legacy server's single auto_update bit — the
+ *  degraded-mode PUT body (a legacy server would decode the split body into
+ *  its one bool's absence and silently turn auto-update OFF). */
 @Serializable
-data class AutoUpdateResp(val auto_update: Boolean = false, val version: String = "")
+data class LegacyAutoUpdateReq(val auto_update: Boolean)
+
+// AutoUpdateResp decodes the policy PUT's answer from either contract: a
+// split-policy server returns both bits + the generation (the caller's next
+// CAS base), a legacy server returns the single bit. Unsent fields stay null.
+@Serializable
+data class AutoUpdateResp(
+    val control_auto_update: Boolean? = null,
+    val node_auto_update: Boolean? = null,
+    val generation: Long? = null,
+    val auto_update: Boolean? = null,                // legacy single-bit server
+    val version: String = "",
+)
+
+/** ControlUpdateResp is the async control self-update's receipt: a split-policy
+ *  server returns a persistent operation_id + the target generation so the
+ *  in-progress state can be presented and tracked across the restart window;
+ *  a legacy server returns only message (both ids stay null). */
+@Serializable
+data class ControlUpdateResp(
+    val message: String = "",
+    val operation_id: String? = null,
+    val generation: Long? = null,
+)
