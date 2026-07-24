@@ -40,6 +40,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -157,6 +158,17 @@ class Api(
 
     suspend fun sessions(node: String): List<Session> = read("sessions") {
         client.get("$baseUrl/api/nodes/${node.enc()}/sessions").orThrow("sessions").body()
+    }
+
+    /** nodeModels loads the node's LIGHTWEIGHT model/effort picker snapshot (read
+     *  scope — open to every granted user, unlike the admin-only harness DTO that
+     *  403s a shared user into an empty picker). An old node without the capability
+     *  answers HTTP 501; orThrow surfaces it as an ApiHttpException whose [code] is
+     *  "model_catalog_unsupported", which the picker maps to a graceful "no switch"
+     *  degradation. A 501 is deterministic (a capability gap, not a hiccup), so the
+     *  read layer does NOT retry it (see isTransientReadError). */
+    suspend fun nodeModels(node: String): ModelCatalogSnapshot = read("models") {
+        client.get("$baseUrl/api/nodes/${node.enc()}/models").orThrow("models").body()
     }
 
     suspend fun send(
@@ -548,8 +560,11 @@ internal fun newOperationId(): String {
 private val HEX = "0123456789abcdef".toCharArray()
 
 /** ApiHttpException is the typed non-2xx result of one call: the HTTP status,
- *  the logical operation name, the client operation id (mutations), and a
- *  bounded, display-capped detail from the error body. Everything a caller
+ *  the logical operation name, the client operation id (mutations), a bounded,
+ *  display-capped detail from the error body, and — when the control plane
+ *  answered a typed {error, code} envelope — the discriminable [code] (e.g.
+ *  "model_switch_unsupported" / "model_catalog_unsupported") a caller branches on
+ *  to tell a capability gap apart from a generic failure. Everything a caller
  *  needs to decide retryability and show a message — without ever having read
  *  more than MAX_ERROR_BODY_BYTES of the failure. */
 class ApiHttpException(
@@ -557,13 +572,42 @@ class ApiHttpException(
     val operation: String,
     val operationId: String? = null,
     detail: String? = null,
-) : IllegalStateException(httpErrorMessage(status, operation, detail))
+) : IllegalStateException(httpErrorMessage(status, operation, detail)) {
+    /** The control plane's typed error code when the body was a {error, code}
+     *  envelope (additive; null for a plain-text error or a bodyless failure). */
+    val code: String? = errorCode(detail)
+}
 
-/** httpErrorMessage renders a typed HTTP failure for humans: the (already
- *  byte-bounded) body detail display-capped to ERROR_DISPLAY_CHARS, or a
- *  "<operation> failed (HTTP <status>)" fallback. Pure; unit-tested. */
+/** ErrorEnvelope is the control plane's typed error body: a human [error] and a
+ *  machine [code] (writeJSON({error, code}) on the negotiated-capability 501s).
+ *  Most errors are still plain text (http.Error), so parsing is best-effort. */
+@Serializable
+private data class ErrorEnvelope(val error: String = "", val code: String = "")
+
+private val ERROR_ENVELOPE_JSON = Json { ignoreUnknownKeys = true }
+
+/** parseErrorEnvelope decodes a {error, code} body, best-effort: null for a
+ *  plain-text error, a body that doesn't start with '{', or one truncated at the
+ *  MAX_ERROR_BODY_BYTES ceiling (an incomplete JSON just fails to decode). Never
+ *  throws. Pure. */
+private fun parseErrorEnvelope(detail: String?): ErrorEnvelope? {
+    val d = detail?.trim() ?: return null
+    if (!d.startsWith("{")) return null
+    return runCatching { ERROR_ENVELOPE_JSON.decodeFromString(ErrorEnvelope.serializer(), d) }.getOrNull()
+}
+
+/** errorCode extracts the typed control-plane error code from a failure body, or
+ *  null when the body carried none. Pure; unit-tested. */
+internal fun errorCode(detail: String?): String? = parseErrorEnvelope(detail)?.code?.ifBlank { null }
+
+/** httpErrorMessage renders a typed HTTP failure for humans: the typed envelope's
+ *  [error] message when the body was one (so a status line shows "node does not
+ *  support …" instead of raw JSON), else the (already byte-bounded) body detail,
+ *  display-capped to ERROR_DISPLAY_CHARS — or a "<operation> failed (HTTP
+ *  <status>)" fallback. Pure; unit-tested. */
 internal fun httpErrorMessage(status: Int, operation: String, detail: String?): String {
-    val d = detail?.trim()?.take(ERROR_DISPLAY_CHARS)?.ifBlank { null }
+    val friendly = parseErrorEnvelope(detail)?.error?.ifBlank { null } ?: detail
+    val d = friendly?.trim()?.take(ERROR_DISPLAY_CHARS)?.ifBlank { null }
     return d ?: "$operation failed (HTTP $status)"
 }
 
@@ -618,7 +662,10 @@ internal fun readRetryDelayMs(
  *  4xx, malformed-body decode failures, and cancellation are not. Pure. */
 internal fun isTransientReadError(t: Throwable): Boolean = when (t) {
     is CancellationException -> false
-    is ApiHttpException -> t.status >= 500 || t.status == 408 || t.status == 429
+    // 501 (Not Implemented) is a DETERMINISTIC capability gap — an old node that
+    // lacks the model catalog / mid-turn switch — not a transient server fault, so
+    // it fails fast (the picker/send map its typed code instead of re-asking).
+    is ApiHttpException -> (t.status >= 500 && t.status != 501) || t.status == 408 || t.status == 429
     is ContentConvertException -> false
     is SerializationException -> false
     else -> true

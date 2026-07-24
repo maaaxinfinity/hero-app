@@ -79,6 +79,10 @@ object FleetCache {
     // value via sessionsOf / harnessOf.
     private val sessionEntries = mutableStateMapOf<String, Entry<List<Session>>>()
     private val harnessEntries = mutableStateMapOf<String, Entry<HarnessState>>()
+    // The read-scope model/effort picker snapshot per node (GET .../models) — the
+    // composer picker's data source, cache-first-no-refresh like harness so
+    // re-opening a session on a warm node renders the switcher instantly.
+    private val modelsEntries = mutableStateMapOf<String, Entry<ModelCatalogSnapshot>>()
     private var tick: Long = 0L
 
     private class Entry<T>(val value: T, val gen: Int, val bytes: Int, var tick: Long)
@@ -89,6 +93,8 @@ object FleetCache {
     private const val MAX_SESSION_BYTES = 4 * 1024 * 1024
     private const val MAX_HARNESS_NODES = 12
     private const val MAX_HARNESS_BYTES = 2 * 1024 * 1024
+    private const val MAX_MODELS_NODES = 12
+    private const val MAX_MODELS_BYTES = 1 * 1024 * 1024
 
     /**
      * bindIdentity scopes the cache to the current {server, user}. On a change it
@@ -131,6 +137,7 @@ object FleetCache {
         auditByLimit.clear()
         sessionEntries.clear()
         harnessEntries.clear()
+        modelsEntries.clear()
     }
 
     // ---- whole-fleet slots (generation-guarded writers) ----
@@ -149,8 +156,10 @@ object FleetCache {
         // Reclaim nodes that dropped out of the fleet entirely.
         (sessionEntries.keys - live).forEach { sessionEntries.remove(it) }
         (harnessEntries.keys - live).forEach { harnessEntries.remove(it) }
-        // Drop harness for a node whose volatile facts changed (reconnect / scope
-        // grant / version upgrade) — its cached admin DTO is now suspect.
+        (modelsEntries.keys - live).forEach { modelsEntries.remove(it) }
+        // Drop harness AND the picker catalog for a node whose volatile facts
+        // changed (reconnect / scope grant / version upgrade) — both cached DTOs
+        // are now suspect (a version upgrade can change the model catalog).
         if (prev != null) {
             val prevById = prev.associateBy { it.node_id }
             for (n in list) {
@@ -159,6 +168,7 @@ object FleetCache {
                     p.version != n.version || p.connected_at != n.connected_at
                 ) {
                     harnessEntries.remove(n.node_id)
+                    modelsEntries.remove(n.node_id)
                 }
             }
         }
@@ -204,9 +214,24 @@ object FleetCache {
     }
 
     /** invalidateHarness drops one node's harness entry after a mutation
-     *  (Save + apply / Install) so the pickers re-read fresh state. */
+     *  (Save + apply / Install) so the pickers re-read fresh state. Also drops the
+     *  picker catalog, which the same mutation can change. */
     fun invalidateHarness(node: String) {
         harnessEntries.remove(node)
+        modelsEntries.remove(node)
+    }
+
+    // ---- per-node model catalog (cache-first-no-refresh, weighted LRU) ----
+
+    fun modelsOf(node: String): ModelCatalogSnapshot? =
+        modelsEntries[node]?.takeIf { it.gen == generation }?.value
+
+    fun putModels(node: String, gen: Int, snap: ModelCatalogSnapshot) {
+        if (gen != generation) return
+        val bytes = estimateModels(snap)
+        if (bytes > MAX_MODELS_BYTES) { modelsEntries.remove(node); return }
+        modelsEntries[node] = Entry(snap, gen, bytes, ++tick)
+        enforce(modelsEntries, MAX_MODELS_NODES, MAX_MODELS_BYTES)
     }
 
     // ---- shared request owner (single-flight per key) ----
@@ -244,6 +269,21 @@ object FleetCache {
         return flights.run("h:$node") {
             val gen = generation
             api.harness(node).also { putHarness(node, gen, it) }
+        }
+    }
+
+    /**
+     * fetchModels is the shared model-catalog fetch for one node: cache-first
+     * unless [refresh], single-flighted across every caller (the composer picker,
+     * a future quick-switch). A failure (including the old-node 501 the picker
+     * degrades on) is returned as Result.failure and NOT cached, so a node that
+     * later gains the capability is picked up on the next open.
+     */
+    suspend fun fetchModels(api: Api, node: String, refresh: Boolean = false): Result<ModelCatalogSnapshot> {
+        if (!refresh) modelsOf(node)?.let { return Result.success(it) }
+        return flights.run("m:$node") {
+            val gen = generation
+            api.nodeModels(node).also { putModels(node, gen, it) }
         }
     }
 
@@ -287,6 +327,16 @@ object FleetCache {
             n += 32 + c.default.length + c.provider_name.length + c.base_url.length + c.live_error.length
             for (m in c.models) n += 24 + m.slug.length + m.label.length + m.default_effort.length
             for (e in c.effort_levels) n += 8 + e.length
+        }
+        return n
+    }
+
+    private fun estimateModels(snap: ModelCatalogSnapshot): Int {
+        var n = 16
+        for (b in snap.backends) {
+            n += 48 + b.backend.length + b.default.length + b.default_effort.length + b.catalog_error.length
+            for (m in b.models) n += 24 + m.slug.length + m.label.length + m.default_effort.length
+            for (e in b.effort_levels) n += 8 + e.length
         }
         return n
     }

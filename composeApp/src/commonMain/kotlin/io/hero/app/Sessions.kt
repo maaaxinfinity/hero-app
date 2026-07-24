@@ -22,6 +22,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -32,6 +34,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
@@ -323,26 +326,44 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
     val active = sel.active
     val readonly = sel.readonly
 
-    // Mid-conversation model/effort switcher: this session's backend catalog and
-    // the current selection (reset when the open session changes; "" = keep current).
+    // Mid-conversation model/effort switcher. The PENDING selection ("" = keep the
+    // node's current) resets when the open session changes; the picker's ACTUAL
+    // baseline is convo.runtime, not this. switchSupported turns false once THIS
+    // node proves it can't switch (a send-time 501), so a resend falls back to a
+    // plain send (which every node runs) instead of re-hitting the capability gap.
     var switchModel by remember(sel.session) { mutableStateOf("") }
     var switchEffort by remember(sel.session) { mutableStateOf("") }
+    var switchSupported by remember(sel.session) { mutableStateOf(true) }
     var catModels by remember { mutableStateOf<List<HarnessModel>>(emptyList()) }
     var catEffortLevels by remember { mutableStateOf<List<String>>(emptyList()) }
+    var pickerNote by remember(sel.node, backend) { mutableStateOf<String?>(null) }
     LaunchedEffect(sel.node, backend) {
-        catModels = emptyList(); catEffortLevels = emptyList()
+        catModels = emptyList(); catEffortLevels = emptyList(); pickerNote = null
         val n = sel.node
         if (n != null && backend.isNotEmpty()) {
-            // Cache-first so opening a session is instant (a hit deliberately
-            // skips the heavy status RPC); a miss goes through the cache's shared
-            // single-flight fetch, so a picker opened while the Start dialog or a
-            // management read is already downloading this node's harness JOINS
-            // that request instead of issuing a duplicate.
-            val hs = FleetCache.fetchHarness(api, n).getOrNull()
-            hs?.backends?.firstOrNull { it.backend == backend }?.catalog?.let { c ->
-                catModels = c.models.filter { !it.hidden }
-                catEffortLevels = c.effort_levels
-            }
+            // The read-scope /models snapshot — open to shared users, unlike the
+            // admin harness DTO that 403'd a shared user's picker into silence.
+            // Cache-first + single-flight, so re-opening a session on a warm node
+            // renders the switcher instantly and concurrent opens share one fetch.
+            FleetCache.fetchModels(api, n)
+                .onSuccess { snap ->
+                    snap.backends.firstOrNull { it.backend == backend }?.let { cb ->
+                        catModels = cb.models.filter { !it.hidden }
+                        catEffortLevels = cb.effort_levels
+                        // Surface a non-secret degradation note (fallback catalog)
+                        // instead of presenting the fallback as authoritative.
+                        pickerNote = cb.catalog_error.takeIf { it.isNotEmpty() }
+                            ?.let { "Model list unavailable — showing fallback." }
+                    }
+                }
+                .onFailure {
+                    // Old node without the read-scope catalog: degrade to no picker
+                    // (a plain send still runs on every node version). A transient
+                    // failure just leaves an empty picker for this cycle.
+                    if (it is ApiHttpException && it.code == "model_catalog_unsupported") {
+                        switchSupported = false
+                    }
+                }
         }
     }
 
@@ -399,8 +420,13 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
             fetchPage = { api.transcript(n, s, TRANSCRIPT_PAGE) },
             apply = { page -> convo = convo.truthUp(page.turns, page.total, page.start) },
         )
+        // Seed the conversation's ACTUAL runtime from the session snapshot so an
+        // idle session shows its model/effort/context the instant it opens, before
+        // any live frame — the snapshot the sessions list already holds, not the
+        // last assistant turn's model (which describes only that output).
+        val seedRt = sessions.firstOrNull { it.id == s }?.runtime?.toRuntimeState() ?: RuntimeState()
         runCatchingCancellable { api.transcript(n, s, TRANSCRIPT_PAGE) }.getOrNull()?.let { page ->
-            convo = ConvoState(turns = page.turns, cursor = Cursor(page.total, page.start, TRANSCRIPT_PAGE))
+            convo = ConvoState(turns = page.turns, cursor = Cursor(page.total, page.start, TRANSCRIPT_PAGE), runtime = seedRt)
             sync.seed(page.streamSeq)
         }
         // Whether a drilled-in subagent still needs the live tail is the
@@ -439,6 +465,20 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
             delay(pollDelayMillis(3000))
         }
         pend = emptyList()
+    }
+    // Bridge the session snapshot's node-authoritative runtime into the OPEN root
+    // conversation while it is IDLE. During a turn the live session.runtime frame
+    // owns the truth, so we never clobber it mid-stream; when idle, the snapshot is
+    // the truth-up — this covers a cold open (the poll lands the runtime after the
+    // transcript seed) and a reconnect / foreign turn that finished off-screen.
+    // Keyed on the snapshot runtime, so it fires only when that value changes, not
+    // on every equal poll tick. Drill-ins are read-only and rely on live frames.
+    LaunchedEffect(rootSession?.runtime, active, readonly) {
+        if (readonly) return@LaunchedEffect
+        val rt = rootSession?.runtime ?: return@LaunchedEffect
+        if (convo.open == null && convo.status == null) {
+            convo = convo.withActual(rt.toRuntimeState())
+        }
     }
 
     if (showStart && sel.node != null) {
@@ -519,6 +559,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
             },
             input = input, onInput = { input = it; drafts.put(sel.node, sel.session, it) },
             switchModels = catModels, effortLevels = catEffortLevels,
+            switchSupported = switchSupported, pickerNote = pickerNote,
             model = switchModel, onModel = { switchModel = it },
             effort = switchEffort, onEffort = { switchEffort = it },
             onSend = {
@@ -527,7 +568,12 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                     input = ""
                     drafts.clear(n, s)
                     convo = convo.optimisticUser(t)
-                    val m = switchModel; val e = if (catEffortLevels.isNotEmpty()) switchEffort else ""
+                    // Ride the model/effort override only while this node is known
+                    // to support the mid-turn switch; after a typed 501 we send
+                    // plainly (which every node runs) rather than re-triggering the
+                    // capability error. An empty override is a plain send anyway.
+                    val m = if (switchSupported) switchModel else ""
+                    val e = if (switchSupported && catEffortLevels.isNotEmpty()) switchEffort else ""
                     scope.launch {
                         // The optimistic echo must not mask a failed send — but a
                         // failure that returns after switching conversations must
@@ -536,7 +582,18 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
                             .onFailure {
                                 val now = currentSel.value
                                 if (now.node == n && now.active == s) {
-                                    convo = convo.reduce(LiveFrame.ErrorFrame("send failed: ${it.message ?: "error"}"))
+                                    if (it is ApiHttpException && it.code == "model_switch_unsupported") {
+                                        // Discriminable capability gap: this node can't
+                                        // switch model/effort mid-conversation. Stop
+                                        // overriding so a resend goes through as a plain
+                                        // send, and say so instead of dropping silently.
+                                        switchSupported = false
+                                        convo = convo.reduce(LiveFrame.ErrorFrame(
+                                            "This node can't switch model/effort mid-conversation — update it. Message not sent; resend to keep the current model.",
+                                        ))
+                                    } else {
+                                        convo = convo.reduce(LiveFrame.ErrorFrame("send failed: ${it.message ?: "error"}"))
+                                    }
                                 }
                             }
                     }
@@ -570,7 +627,7 @@ internal fun SessionsScreen(api: Api, settings: Settings, sel: SessionSel, onSel
             panel = {
                 SessionInspector(
                     session = rootSession, sessionId = sel.session.orEmpty(),
-                    model = convo.runtimeModel, pend = pend, children = convo.children,
+                    runtime = convo.runtime, pend = pend, children = convo.children,
                     onRespond = { p, behavior ->
                         val n = sel.node; val s = sel.active
                         if (n != null) scope.launch {
@@ -646,7 +703,7 @@ internal class PendingPartition {
 // here rescans the transcript on part frames.
 @Composable
 private fun SessionInspector(
-    session: Session?, sessionId: String, model: String?,
+    session: Session?, sessionId: String, runtime: RuntimeState,
     pend: List<Pending>, children: List<Pair<String, String>>,
     onRespond: (Pending, String) -> Unit,
     onOpenChild: (String) -> Unit,
@@ -671,7 +728,9 @@ private fun SessionInspector(
             Spacer(Modifier.height(6.dp))
             KeyValueRow("Id", sessionId)
             session?.backend?.takeIf { it.isNotEmpty() }?.let { KeyValueRow("Harness", it) }
-            model?.let { KeyValueRow("Model", it) }
+            runtime.model?.takeIf { it.isNotEmpty() }?.let { KeyValueRow("Model", it) }
+            runtime.effort?.takeIf { it.isNotEmpty() }?.let { KeyValueRow("Effort", it) }
+            contextUsage(runtime.contextTokens, runtime.contextWindow)?.let { KeyValueRow("Context", it) }
             session?.cwd?.takeIf { it.isNotEmpty() }?.let { KeyValueRow("Cwd", it) }
             session?.status?.takeIf { it.isNotEmpty() }?.let { KeyValueRow("Status", it) }
             Spacer(Modifier.height(4.dp))
@@ -918,6 +977,7 @@ private fun ConversationPane(
     onLoadEarlier: suspend () -> EarlierPage?,
     input: String, onInput: (String) -> Unit, onSend: () -> Unit,
     switchModels: List<HarnessModel> = emptyList(), effortLevels: List<String> = emptyList(),
+    switchSupported: Boolean = true, pickerNote: String? = null,
     model: String = "", onModel: (String) -> Unit = {},
     effort: String = "", onEffort: (String) -> Unit = {},
     onRespond: (Pending, String) -> Unit,
@@ -931,7 +991,7 @@ private fun ConversationPane(
     // carry node A's scroll/loading/row state onto node B's same-id session.
     val paneKey = "$node\u0000$sessionId"
     Column(modifier) {
-        ConversationHeader(title, convo.runtimeModel, backend, showBack, onBack, onToggleInspector)
+        ConversationHeader(title, convo.runtime, backend, showBack, onBack, onToggleInspector)
         if (readonly) SubagentBar(onBack)
         // Scroll state is per conversation (keyed), not shared across switches.
         val listState = remember(paneKey) { LazyListState() }
@@ -1082,7 +1142,12 @@ private fun ConversationPane(
             pend.filter { it.session_id == sessionId }.forEach { p ->
                 PendingBar(p) { behavior -> onRespond(p, behavior) }
             }
-            InputBar(input, onInput, onSend, switchModels, effortLevels, model, onModel, effort, onEffort, backend)
+            InputBar(
+                input, onInput, onSend, switchModels, effortLevels,
+                model, onModel, effort, onEffort,
+                actualModel = convo.runtime.model, actualEffort = convo.runtime.effort,
+                switchSupported = switchSupported, note = pickerNote, backend = backend,
+            )
         }
     }
 }
@@ -1153,7 +1218,7 @@ private fun ThinkingRow(status: String) {
 // button toggles the session inspector (Ctrl/Cmd+I).
 @Composable
 private fun ConversationHeader(
-    title: String, model: String?, backend: String,
+    title: String, runtime: RuntimeState, backend: String,
     showBack: Boolean, onBack: () -> Unit, onToggleInspector: () -> Unit,
 ) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
@@ -1174,9 +1239,11 @@ private fun ConversationHeader(
                     style = MaterialTheme.typography.titleSmall,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
-                model?.let {
+                // The node-authoritative ACTUAL runtime: model · effort · context
+                // usage (each shown only when reported; slug already render-capped).
+                runtimeSummary(runtime)?.let {
                     Text(
-                        capDisplay(it), // node-reported free text — same render budget as turn labels
+                        it,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -1342,32 +1409,58 @@ private fun EmptyState() {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun InputBar(
     value: String, onChange: (String) -> Unit, onSend: () -> Unit,
     switchModels: List<HarnessModel> = emptyList(), effortLevels: List<String> = emptyList(),
     model: String = "", onModel: (String) -> Unit = {},
     effort: String = "", onEffort: (String) -> Unit = {},
+    actualModel: String? = null, actualEffort: String? = null,
+    switchSupported: Boolean = true, note: String? = null,
     backend: String = "",
 ) {
     Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+            // A degradation note (fallback catalog, or "node can't switch") sits
+            // above the composer instead of a silent empty/misleading picker.
+            note?.let {
+                Text(
+                    it, style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                    maxLines = 2, overflow = TextOverflow.Ellipsis,
+                )
+            }
             // Mid-conversation switcher: pick a model (same backend, with its logo)
             // and, for a backend with a reasoning knob, an effort (its OWN levels) —
-            // applied to the next message.
-            if (switchModels.isNotEmpty()) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    PickerChip(
-                        "model: " + model.ifEmpty { "current" },
-                        listOf("" to "current") + switchModels.map { it.slug to it.label.ifEmpty { it.slug } },
-                        onModel,
-                        backend = backend,
-                    )
+            // applied to the next message. Hidden once the node proves it can't
+            // switch (a send-time 501); the chip shows the node's ACTUAL current
+            // value and highlights a PENDING target that isn't yet in effect.
+            //
+            // Phone-width owner: the chips live in a FlowRow, so a narrow composer
+            // WRAPS them to a second line instead of overflowing/clipping (the same
+            // "reflow, don't clip" posture as the 0.5.16 Dock). Each chip caps its
+            // own width and ellipsizes a long model label, so a runaway gateway slug
+            // can neither push the second chip off-screen nor inflate the toolbar's
+            // minimum width.
+            if (switchSupported && (switchModels.isNotEmpty() || effortLevels.isNotEmpty())) {
+                FlowRow(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    if (switchModels.isNotEmpty()) {
+                        PickerChip(
+                            prefix = "model", actual = actualModel, pending = model,
+                            options = switchModels.map { it.slug to it.label.ifEmpty { it.slug } },
+                            onSelect = onModel, backend = backend,
+                        )
+                    }
                     if (effortLevels.isNotEmpty()) {
                         PickerChip(
-                            "effort: " + effort.ifEmpty { "current" },
-                            listOf("" to "current") + effortLevels.map { it to it },
-                            onEffort,
+                            prefix = "effort", actual = actualEffort, pending = effort,
+                            options = effortLevels.map { it to it }, onSelect = onEffort,
                         )
                     }
                 }
@@ -1383,31 +1476,79 @@ private fun InputBar(
     }
 }
 
-// PickerChip is a compact label + dropdown for the composer's model/effort switch.
-// When backend is set, each option (and the chip) is prefixed with that backend's
-// logo — the "Claude/Codex logo on the left" of the model picker.
+/** pickerShown is the chip's rendered value: the PENDING target the user queued,
+ *  else the node's ACTUAL current value, else a "current" placeholder. Pure — the
+ *  actual/pending display contract, unit-tested. */
+internal fun pickerShown(actual: String?, pending: String): String = when {
+    pending.isNotEmpty() -> pending
+    !actual.isNullOrEmpty() -> actual
+    else -> "current"
+}
+
+/** pickerHasPending is true when the user queued a target that DIFFERS from the
+ *  node's actual current value — the chip highlights it as "not yet in effect",
+ *  since a successful send does not promote pending to actual (only the node's
+ *  runtime projection does). Pure. */
+internal fun pickerHasPending(actual: String?, pending: String): Boolean =
+    pending.isNotEmpty() && pending != actual
+
+// PickerChip is a compact "actual, with an optional pending target" control for
+// the composer's model/effort switch. It shows the node's ACTUAL current value
+// until the user queues a PENDING target (then that, highlighted, until the
+// node's runtime confirms it). When backend is set, the chip and each option
+// carry that backend's logo. Width-capped + ellipsized so a long slug can't own
+// the toolbar's minimum width.
 @Composable
-private fun PickerChip(label: String, options: List<Pair<String, String>>, onSelect: (String) -> Unit, backend: String = "") {
+private fun PickerChip(
+    prefix: String, actual: String?, pending: String,
+    options: List<Pair<String, String>>, onSelect: (String) -> Unit, backend: String = "",
+) {
     var open by remember { mutableStateOf(false) }
+    val hasPending = pickerHasPending(actual, pending)
+    val shown = pickerShown(actual, pending)
     Box {
-        TextButton(onClick = { open = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)) {
+        TextButton(
+            onClick = { open = true },
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+            modifier = Modifier.widthIn(max = 240.dp),
+        ) {
             if (backend.isNotEmpty()) {
                 BackendMark(backend, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(Modifier.width(4.dp))
             }
-            Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+            Text(
+                "$prefix: ", style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
+            )
+            Text(
+                shown, style = MaterialTheme.typography.labelSmall,
+                color = if (hasPending) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                fontWeight = if (hasPending) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
             Icon(Icons.Filled.ArrowDropDown, contentDescription = null, modifier = Modifier.size(16.dp))
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            // "keep current" resolves to the node's ACTUAL value, so the picker
+            // never claims a target it hasn't confirmed is live.
+            DropdownMenuItem(
+                text = { Text(actual?.takeIf { it.isNotEmpty() }?.let { "keep current ($it)" } ?: "keep current") },
+                onClick = { onSelect(""); open = false },
+            )
             options.forEach { (v, l) ->
                 DropdownMenuItem(
                     text = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (backend.isNotEmpty() && v.isNotEmpty()) {
+                            if (backend.isNotEmpty()) {
                                 BackendMark(backend, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Spacer(Modifier.width(6.dp))
                             }
-                            Text(l)
+                            Text(l, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            if (v == actual) {
+                                Spacer(Modifier.width(6.dp))
+                                Text("• now", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
                         }
                     },
                     onClick = { onSelect(v); open = false },

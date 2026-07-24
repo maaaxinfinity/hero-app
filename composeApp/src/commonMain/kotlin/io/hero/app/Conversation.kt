@@ -93,7 +93,12 @@ data class ConvoState(
     val openKey: Any?,
     val cursor: Cursor?,
     val status: String?,         // transient "thinking"/"stalled"
-    val runtimeModel: String?,
+    // The node-authoritative ACTUAL runtime (model / effort / live context),
+    // field-level: seeded from the session snapshot on open, truthed-up while
+    // idle, and patched by live session.runtime frames. Distinct from the picker's
+    // PENDING target (the composer's switch selection) — a successful send does
+    // NOT promote pending to actual; only a runtime projection here does.
+    val runtime: RuntimeState,
     val children: List<Pair<String, String>>,
     val childIds: Set<String>,
     val nextLocalId: Long,
@@ -114,6 +119,9 @@ data class ConvoState(
         i == historyKeys.size -> openKey
         else -> null
     }
+
+    /** The node-reported ACTUAL model (convenience for the header/inspector). */
+    val runtimeModel: String? get() = runtime.model
 }
 
 /** ConvoState factory: folds a plain turn list (a transcript page seed, a test
@@ -125,7 +133,7 @@ fun ConvoState(
     openAssistant: Boolean = false,
     cursor: Cursor? = null,
     status: String? = null,
-    runtimeModel: String? = null,
+    runtime: RuntimeState = RuntimeState(),
 ): ConvoState {
     val (keys, next) = assignUiKeys(turns, HashSet(), 0L)
     val opensLast = openAssistant && turns.lastOrNull()?.role == "assistant"
@@ -135,7 +143,7 @@ fun ConvoState(
         historyKeys = if (opensLast) keys.dropLast(1) else keys,
         open = if (opensLast) turns.last() else null,
         openKey = if (opensLast) keys.last() else null,
-        cursor = cursor, status = status, runtimeModel = runtimeModel,
+        cursor = cursor, status = status, runtime = runtime,
         children = kids, childIds = kidIds,
         nextLocalId = next,
     )
@@ -266,7 +274,9 @@ fun ConvoState.reduce(f: LiveFrame): ConvoState = when (f) {
     // Exit only stamps the canonical uuid and settles — the UI id is untouched,
     // so the row is not rebuilt when a live turn goes terminal.
     is LiveFrame.Exit -> settle(uuid = f.assistantUuid).copy(status = null)
-    is LiveFrame.Runtime -> copy(runtimeModel = f.model ?: runtimeModel)
+    // Field-level: a partial runtime patch (only the model, only the window, …)
+    // overlays the current actual without blanking the fields it doesn't carry.
+    is LiveFrame.Runtime -> copy(runtime = runtime.merge(f.patch))
     is LiveFrame.ErrorFrame -> settle().appendSettled(Turn(role = "error", content = f.message)).copy(status = null)
     LiveFrame.TurnActive -> copy(status = status ?: "thinking")
     LiveFrame.TurnIdle -> settle().copy(status = null)
@@ -277,6 +287,41 @@ fun ConvoState.reduce(f: LiveFrame): ConvoState = when (f) {
  *  turn.user that follows is deduped by reduce. */
 fun ConvoState.optimisticUser(text: String): ConvoState =
     settle().appendSettled(Turn(role = "user", content = text))
+
+/** withActual folds a session-snapshot runtime (the node-authoritative truth from
+ *  the sessions list) into the conversation's actual, field-level — the idle-open
+ *  and reconnect/foreign-turn path that a live session.runtime frame covers during
+ *  a turn. Pure, like reduce. */
+fun ConvoState.withActual(snapshot: RuntimeState): ConvoState = copy(runtime = runtime.merge(snapshot))
+
+/** runtimeSummary is the header's one-line "what am I talking to": the ACTUAL
+ *  model, its reasoning effort, and live context usage — each shown only when the
+ *  node reported it. null when nothing is known yet (an old node, or a session
+ *  opened before its first runtime snapshot). Pure; unit-tested. */
+internal fun runtimeSummary(rt: RuntimeState): String? {
+    val parts = buildList {
+        rt.model?.takeIf { it.isNotEmpty() }?.let { add(capDisplay(it)) }
+        rt.effort?.takeIf { it.isNotEmpty() }?.let { add(it) }
+        contextUsage(rt.contextTokens, rt.contextWindow)?.let { add(it) }
+    }
+    return parts.joinToString("  ·  ").ifEmpty { null }
+}
+
+/** contextUsage renders live context as "used/window" (e.g. "45k/200k") when the
+ *  node reported a window; null otherwise. Pure; unit-tested. */
+internal fun contextUsage(tokens: Long?, window: Long?): String? {
+    val w = window ?: return null
+    if (w <= 0) return null
+    return "${fmtTokens(tokens ?: 0)}/${fmtTokens(w)}"
+}
+
+/** fmtTokens renders a token count compactly (203_000 -> "203k") without
+ *  String.format (absent from the common stdlib). */
+private fun fmtTokens(n: Long): String = when {
+    n >= 1_000_000 -> "${n / 1_000_000}.${(n / 100_000) % 10}M"
+    n >= 1_000 -> "${n / 1_000}k"
+    else -> n.toString()
+}
 
 /** prepend inserts an earlier transcript page before the current window and
  *  advances the cursor. Page turns get their own UI ids (uuid or fresh local);

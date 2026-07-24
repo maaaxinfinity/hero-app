@@ -37,6 +37,58 @@ data class Session(
     val backend: String = "",
     val cwd: String = "",
     val status: String = "",
+    // The node-authoritative runtime (model / reasoning effort / live context) for
+    // THIS session — the picker's "actual" baseline and the header's truth. Older
+    // nodes that predate the runtime projection omit it (ignoreUnknownKeys drops
+    // nothing here, it just decodes to an all-unknown SessionRuntime), so the
+    // picker shows "current" until a live session.runtime frame or a newer
+    // snapshot fills it. Mirrors core.Session.Runtime.
+    val runtime: SessionRuntime = SessionRuntime(),
+)
+
+// SessionRuntime mirrors core.SessionRuntime on the wire: a session's latest
+// model configuration and active context. Every field is omitempty upstream, so
+// an absent field decodes to its zero — indistinguishable from "not reported",
+// which toRuntimeState() collapses to null (unknown) so a full snapshot and a
+// partial live patch fold through the SAME RuntimeState.merge.
+@Serializable
+data class SessionRuntime(
+    val model: String = "",
+    val effort: String = "",
+    val context_tokens: Long = 0,
+    val context_window: Long = 0,
+)
+
+/** RuntimeState is the app's field-level projection of a session's runtime: every
+ *  field NULL when unknown, so a partial update (a live session.runtime patch that
+ *  carries only the window, or only the model) overlays without blanking what it
+ *  doesn't mention. The picker's ACTUAL current value and the header both read
+ *  this; [merge] is the field-level fold shared by the snapshot seed and the live
+ *  patch — the "consume the full runtime, field-level" contract. */
+data class RuntimeState(
+    val model: String? = null,
+    val effort: String? = null,
+    val contextTokens: Long? = null,
+    val contextWindow: Long? = null,
+) {
+    /** merge overlays [other]'s KNOWN (non-null) fields onto this one, leaving the
+     *  rest — an absent field in a patch or a snapshot must never erase a value the
+     *  other source already established. */
+    fun merge(other: RuntimeState) = RuntimeState(
+        model = other.model ?: model,
+        effort = other.effort ?: effort,
+        contextTokens = other.contextTokens ?: contextTokens,
+        contextWindow = other.contextWindow ?: contextWindow,
+    )
+}
+
+/** toRuntimeState collapses a wire SessionRuntime to the nullable projection: an
+ *  empty string or a zero count reads as "not reported" (null). */
+fun SessionRuntime.toRuntimeState() = RuntimeState(
+    model = model.ifEmpty { null },
+    effort = effort.ifEmpty { null },
+    contextTokens = context_tokens.takeIf { it > 0 },
+    contextWindow = context_window.takeIf { it > 0 },
 )
 
 @Serializable
@@ -96,7 +148,7 @@ sealed interface LiveFrame {
     data class Delta(val text: String) : LiveFrame
     data class Status(val status: String) : LiveFrame
     data class Exit(val reason: String?, val assistantUuid: String?, val assistantTs: String?) : LiveFrame
-    data class Runtime(val model: String?, val contextWindow: Int?) : LiveFrame
+    data class Runtime(val patch: RuntimeState) : LiveFrame
     data class ErrorFrame(val message: String) : LiveFrame
     data object TurnActive : LiveFrame
     data object TurnIdle : LiveFrame
@@ -110,7 +162,6 @@ sealed interface LiveFrame {
 @Serializable private data class DeltaBody(val delta: String = "")
 @Serializable private data class StatusBody(val status: String = "")
 @Serializable private data class ExitBody(val reason: String? = null, val assistant_uuid: String? = null, val assistant_ts: String? = null)
-@Serializable private data class RuntimeBody(val model: String? = null, val context_window: Int? = null)
 @Serializable private data class ErrorBody(val message: String = "")
 
 /**
@@ -131,8 +182,13 @@ internal fun decodeLiveFrame(ev: Event, json: Json): LiveFrame? {
             "turn.status" -> raw?.let { LiveFrame.Status(json.decodeFromJsonElement(StatusBody.serializer(), it).status) }
             "subprocess.exit" -> (raw?.let { json.decodeFromJsonElement(ExitBody.serializer(), it) } ?: ExitBody())
                 .let { LiveFrame.Exit(it.reason, it.assistant_uuid, it.assistant_ts) }
-            "session.runtime" -> raw?.let { json.decodeFromJsonElement(RuntimeBody.serializer(), it) }
-                ?.let { LiveFrame.Runtime(it.model, it.context_window) }
+            // session.runtime is a FIELD-LEVEL patch (the node emits only the
+            // fields a turn result actually established — model without a window,
+            // or a window without a model), so it decodes through the same
+            // SessionRuntime shape the node unmarshals into and folds via merge;
+            // an absent field stays null and never blanks the current value.
+            "session.runtime" -> raw?.let { json.decodeFromJsonElement(SessionRuntime.serializer(), it) }
+                ?.let { LiveFrame.Runtime(it.toRuntimeState()) }
             "error" -> LiveFrame.ErrorFrame(raw?.let { json.decodeFromJsonElement(ErrorBody.serializer(), it).message } ?: "error")
             "turn.active" -> LiveFrame.TurnActive
             "turn.idle" -> LiveFrame.TurnIdle
@@ -215,6 +271,39 @@ data class HarnessModel(
     val label: String = "",
     val default_effort: String = "",
     val hidden: Boolean = false,
+)
+
+// ---- lightweight model/effort picker snapshot (GET /api/nodes/{node}/models) ----
+// The read-scope picker capability EVERY granted user can load — unlike the
+// admin-only harness DTO, which 403s a shared user into an empty picker. It
+// carries only backend-preserving model refs, per-backend effort enums, defaults,
+// the free-form flag, a non-secret degradation note and the catalog generation:
+// no config body, version probe, install state or provider endpoints. An old node
+// without the capability answers HTTP 501 {code:"model_catalog_unsupported"}; the
+// app degrades to no picker (a plain send still runs on every node) rather than
+// rendering silence. Mirrors noderpc.ModelCatalogSnapshot.
+@Serializable
+data class ModelCatalogSnapshot(
+    val backends: List<CatalogBackend> = emptyList(),
+    // The harness catalog publish generation the snapshot was read at, so clients
+    // can order refreshes and detect staleness.
+    val generation: Long = 0,
+)
+
+@Serializable
+data class CatalogBackend(
+    val backend: String = "",
+    val models: List<HarnessModel> = emptyList(),
+    val default: String = "",
+    val default_effort: String = "",
+    val effort_levels: List<String> = emptyList(),
+    // free_form: the backend points at a custom provider and accepts slugs beyond
+    // the listed ones (the list is suggestions, not an allowlist).
+    val free_form: Boolean = false,
+    // catalog_error: a non-secret listing degradation note (models fell back to
+    // compiled defaults), so the picker can flag "fallback" instead of presenting
+    // the fallback as authoritative.
+    val catalog_error: String = "",
 )
 
 @Serializable
