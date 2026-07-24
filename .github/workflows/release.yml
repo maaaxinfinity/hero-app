@@ -215,7 +215,11 @@ jobs:
           echo "using $apksigner"
           certs=$("$apksigner" verify --print-certs "$apk")
           echo "$certs"
-          digest=$(printf '%s\n' "$certs" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1)
+          # apksigner prints the digest under differing prefixes across versions
+          # ("Signer #1 certificate SHA-256 digest:" and "V2 Signer: certificate
+          # SHA-256 digest:"); match the value after the common suffix so a newer
+          # apksigner doesn't read as "could not extract".
+          digest=$(printf '%s\n' "$certs" | sed -n 's/.*certificate SHA-256 digest: *//p' | head -1)
           if [ -z "$digest" ]; then
             echo "::error::could not extract the signer certificate SHA-256 digest"; exit 1
           fi

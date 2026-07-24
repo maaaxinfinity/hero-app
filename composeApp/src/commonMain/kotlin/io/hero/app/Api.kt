@@ -51,7 +51,12 @@ import kotlinx.serialization.json.JsonObject
 // saved session. followRedirects is off so login can read Set-Cookie off the 303.
 // clientBuilder exists so the contract tests can run every call against a
 // controlled engine (MockEngine); production always uses heroHttpClient.
-class Api(
+// @JvmOverloads so the release-artifact smoke (Java) can construct Api(baseUrl,
+// cookie) with the REAL default clientBuilder (::heroHttpClient) — Kotlin
+// otherwise exposes only the full-arity constructor to Java, and the smoke's
+// 2-arg call stopped compiling once clientBuilder was added (the desktop release
+// gate has failed to build since).
+class Api @JvmOverloads constructor(
     private val baseUrl: String,
     initialCookie: String? = null,
     clientBuilder: (HttpClientConfig<*>.() -> Unit) -> HttpClient = ::heroHttpClient,

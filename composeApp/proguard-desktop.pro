@@ -27,6 +27,11 @@
 # real call site and nothing else references the class — without this keep,
 # shrinking drops the jar's only machine-readable version identity.
 -keep class io.hero.app.VersionKt { *; }
+# The release-artifact smoke constructs Api(baseUrl, cookie) against this
+# minified jar. The Kotlin app only ever calls Api via its defaults-synthetic
+# constructor, so R8 strips the @JvmOverloads-generated 2-arg constructor the
+# Java smoke needs — keep all of Api's constructors so the smoke resolves.
+-keep class io.hero.app.Api { <init>(...); }
 -dontwarn org.conscrypt.**
 -dontwarn org.bouncycastle.**
 -dontwarn org.openjsse.**
