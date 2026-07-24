@@ -69,6 +69,12 @@ class Api(
         install(HttpTimeout) { requestTimeoutMillis = 30_000 }
         followRedirects = false
         defaultRequest {
+            // Native (non-browser) CSRF credential: the control-plane boundary
+            // admits a state-changing request that carries EITHER a same-origin
+            // Origin (browsers) OR this dedicated header (apps/plugins, which
+            // send no Origin). Set on every request — harmless on reads, and it
+            // guarantees no mutation added later can forget it and 403.
+            headers.append(HERO_CLIENT_HEADER, HERO_CLIENT_VALUE)
             sessionCookie?.let { headers.append(HttpHeaders.Cookie, "hero_cp_session=$it") }
         }
     }
@@ -530,6 +536,18 @@ private const val MAX_SSE_LINE = 16 * 1024 * 1024
  *  SAME id for an explicit retry of the SAME logical operation (StartSessionDialog,
  *  the management mutation runner) is the client half of that contract. */
 internal const val HERO_OP_HEADER = "X-Hero-Op"
+
+/** HERO_CLIENT_HEADER is the native-client CSRF credential the control-plane
+ *  boundary requires on every state-changing request. A browser proves same
+ *  origin with an Origin header it cannot forge cross-site; a native client
+ *  (this app) sends no Origin, so it instead carries the session cookie PLUS
+ *  this dedicated header — one a cross-site "simple request" cannot attach.
+ *  The server checks only that it is present (non-empty). */
+internal const val HERO_CLIENT_HEADER = "X-Hero-Client"
+
+/** The value sent for [HERO_CLIENT_HEADER]. The server checks presence, not the
+ *  value; a stable identifier aids its logs/telemetry. */
+internal const val HERO_CLIENT_VALUE = "hero-app"
 
 /** MAX_ERROR_BODY_BYTES is the hard pre-decode ceiling on how much of a FAILED
  *  response's body is ever read off the wire. bodyAsText() had no bound — the

@@ -224,6 +224,27 @@ class ApiContractTest {
         api.close()
     }
 
+    // Native-client CSRF credential: the control-plane boundary admits a
+    // state-changing request only with a same-origin Origin (browsers) or the
+    // dedicated X-Hero-Client header (apps, which send no Origin). Every request
+    // the app makes — the login POST, reads, and mutations — must carry it, so
+    // no boundary-gated call 403s and no future mutation can silently omit it.
+    @Test
+    fun everyRequestCarriesTheNativeClientHeader() = runTest {
+        val engine = MockEngine { respond("[]", HttpStatusCode.OK, jsonHeaders) }
+        val api = apiOver(engine)
+        api.login("alice", "pw")   // the login POST (boundary-gated; no cookie back here)
+        api.nodes()                // a read
+        api.send("n1", "s1", "hi") // a mutation
+        api.close()
+        assertEquals(3, engine.requestHistory.size)
+        assertTrue(
+            engine.requestHistory.all { it.headers[HERO_CLIENT_HEADER] == HERO_CLIENT_VALUE },
+            "every request must carry $HERO_CLIENT_HEADER=$HERO_CLIENT_VALUE, got " +
+                "${engine.requestHistory.map { it.method.value to it.headers[HERO_CLIENT_HEADER] }}",
+        )
+    }
+
     @Test
     fun operationIdsAreWellFormedAndUnique() {
         val ids = (1..200).map { newOperationId() }
