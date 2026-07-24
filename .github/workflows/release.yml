@@ -244,7 +244,11 @@ jobs:
           if [ -z "$aapt2" ]; then echo "::error::aapt2 not found in Android SDK"; exit 1; fi
           badging=$("$aapt2" dump badging "$apk" | head -1)
           echo "$badging"
-          pkg=$(printf '%s' "$badging" | sed -n "s/.*name='\([^']*\)'.*/\1/p")
+          # Anchor to the leading `package: name='…'`: a greedy `.*name='` matches
+          # the LAST name= on the line — `compileSdkVersionCodename='14'` — and read
+          # the package as "14". versionName/versionCode below have no such
+          # lowercase collision so they stay as-is.
+          pkg=$(printf '%s' "$badging" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
           vn=$(printf '%s' "$badging" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
           vc=$(printf '%s' "$badging" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
           if [ "$pkg" != "io.hero.app" ]; then
