@@ -159,6 +159,14 @@ jobs:
   android:
     needs: verify
     runs-on: ubuntu-latest
+    # Keystore-secret gating lives at the JOB level: the `secrets` context is NOT
+    # an allowed named-value in a step `if:` (GitHub allows only env/github/needs/
+    # etc.), so referencing it there made the whole workflow unparseable — a 0s
+    # "workflow file issue" that blocked every release since v0.5.8. Mapping the
+    # secret to a job env makes it visible to the step `if:` below (job env IS
+    # allowed in `if`) without leaking it.
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -178,15 +186,11 @@ jobs:
       # run can never publish an unupgradable debug-signed APK/AAB. A fork that
       # just wants a local build should use assembleDebug (or the strict opt-in
       # -PallowDebugSigningForRelease=true, which marks versionName).
-      # The condition reads the SECRETS context: a step's own `env` block is not
-      # visible in its own `if`, so the previous `env.KEYSTORE_BASE64 != ''`
-      # always evaluated empty and skipped materialization — every release run
-      # then died fail-closed at the signing gate even WITH the secret set. The
-      # gate below still protects a run whose secret is genuinely absent.
+      # The `if:` reads the JOB-level env set above (from the secret): a step's
+      # own `env` is not visible in its own `if`, and `secrets` is not allowed in
+      # `if` at all. The gate below still protects a run whose secret is absent.
       - name: Materialize keystore
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
         run: echo "$KEYSTORE_BASE64" | base64 -d > composeApp/keystore.jks
       - name: Build signed APK
         env:
